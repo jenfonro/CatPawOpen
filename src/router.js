@@ -26,24 +26,12 @@ function normalizeHttpBase(value) {
     }
 }
 
-function readPassthroughFromConfigRoot(root) {
+function readDirectLinkEnabledFromConfigRoot(root) {
     const cfg = root && typeof root === 'object' && !Array.isArray(root) ? root : {};
-    const panPassthrough =
-        cfg && cfg.panPassthrough && typeof cfg.panPassthrough === 'object' && !Array.isArray(cfg.panPassthrough)
-            ? cfg.panPassthrough
-            : null;
-    if (panPassthrough && Object.prototype.hasOwnProperty.call(panPassthrough, 'enabled')) {
-        return { enabled: !!panPassthrough.enabled };
-    }
-
-    // Backward-compat: map legacy per-pan switches to one global toggle.
-    const intercept =
-        cfg && cfg.interceptPans && typeof cfg.interceptPans === 'object' && !Array.isArray(cfg.interceptPans)
-            ? cfg.interceptPans
-            : null;
-    if (intercept) return { enabled: !!intercept.baidu || !!intercept.quark };
-
-    return { enabled: true };
+    const directLink =
+        cfg && cfg.directLink && typeof cfg.directLink === 'object' && !Array.isArray(cfg.directLink) ? cfg.directLink : null;
+    if (directLink && Object.prototype.hasOwnProperty.call(directLink, 'enabled')) return !!directLink.enabled;
+    return true;
 }
 
 function getConfigJsonPath() {
@@ -190,7 +178,7 @@ async function loadSpidersFromFiles(filePaths, options = {}) {
  * @return {Promise<void>} - A Promise that resolves when the router is initialized
  */
 export default async function router(fastify) {
-    // Load persisted settings (proxy / passthrough) from config.json on startup.
+    // Load persisted settings (proxy / directLink) from config.json on startup.
     try {
         const cfgPath = getConfigJsonPath();
         const root = readConfigJsonSafe(cfgPath);
@@ -459,30 +447,48 @@ export default async function router(fastify) {
         }
     });
 
-    fastify.get('/admin/passthrough', async function (_request, reply) {
+    // Unified admin settings endpoint so clients can persist proxy + direct-link mode with a single request.
+    fastify.get('/admin/settings', async function (_request, reply) {
         const cfgPath = getConfigJsonPath();
         const root = readConfigJsonSafe(cfgPath);
-        return reply.send({ success: true, passthrough: readPassthroughFromConfigRoot(root) });
+        return reply.send({
+            success: true,
+            settings: {
+                proxy: getGlobalProxy() || '',
+                directLinkEnabled: readDirectLinkEnabledFromConfigRoot(root),
+            },
+        });
     });
 
-    fastify.put('/admin/passthrough', async function (request, reply) {
+    fastify.put('/admin/settings', async function (request, reply) {
         const body = request && request.body && typeof request.body === 'object' ? request.body : {};
         const cfgPath = getConfigJsonPath();
         const prev = readConfigJsonSafe(cfgPath);
-        const prevPassthrough = readPassthroughFromConfigRoot(prev);
 
-        const hasEnabled = Object.prototype.hasOwnProperty.call(body, 'enabled');
-        const enabled = hasEnabled ? !!body.enabled : !!prevPassthrough.enabled;
+        const hasProxy = Object.prototype.hasOwnProperty.call(body, 'proxy');
+        const proxy = hasProxy && typeof body.proxy === 'string' ? body.proxy : getGlobalProxy() || '';
+        const hasDirect = Object.prototype.hasOwnProperty.call(body, 'directLinkEnabled');
+        const directLinkEnabled = hasDirect ? !!body.directLinkEnabled : readDirectLinkEnabledFromConfigRoot(prev);
+
+        let applied = proxy;
+        try {
+            applied = await setGlobalProxy(proxy);
+        } catch (e) {
+            const msg = e && e.message ? String(e.message) : 'proxy apply failed';
+            return reply.code(400).send({ success: false, message: msg });
+        }
 
         const next = {
             ...prev,
-            panPassthrough: {
-                ...(prev && prev.panPassthrough && typeof prev.panPassthrough === 'object' ? prev.panPassthrough : {}),
-                enabled,
+            proxy: applied || '',
+            directLink: {
+                ...(prev && prev.directLink && typeof prev.directLink === 'object' ? prev.directLink : {}),
+                enabled: !!directLinkEnabled,
             },
         };
-
+        // Drop deprecated keys.
         try {
+            delete next.panPassthrough;
             delete next.interceptPans;
             delete next.goProxy;
         } catch (_) {}
@@ -494,7 +500,10 @@ export default async function router(fastify) {
             return reply.code(500).send({ success: false, message: msg });
         }
 
-        return reply.send({ success: true, passthrough: { enabled } });
+        return reply.send({
+            success: true,
+            settings: { proxy: applied || '', directLinkEnabled: !!directLinkEnabled },
+        });
     });
 
     const spiders = mergeSpiders(effectiveBaseSpiders, customSpiders);

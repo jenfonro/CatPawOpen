@@ -1,6 +1,6 @@
 {
   "proxy": "",
-  "panPassthrough": {
+  "directLink": {
     "enabled": true
   }
 }

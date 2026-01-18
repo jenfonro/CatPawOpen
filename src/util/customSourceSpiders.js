@@ -34,7 +34,7 @@ let dbJsonCache = {
     path: '',
 };
 
-const passthroughConfigState = {
+const directLinkConfigState = {
     ts: 0,
     config: null,
 };
@@ -64,36 +64,32 @@ function normalizeHttpBase(value) {
     }
 }
 
-function getPassthroughConfig() {
+function getDirectLinkConfig() {
     const now = Date.now();
-    if (passthroughConfigState.config && now - passthroughConfigState.ts < 1000) return passthroughConfigState.config;
+    if (directLinkConfigState.config && now - directLinkConfigState.ts < 1000) return directLinkConfigState.config;
 
     // CatPawOpen/src/util/customSourceSpiders.js -> CatPawOpen/config.json
     const here = path.dirname(fileURLToPath(import.meta.url));
     const cfgPath = path.resolve(here, '..', '..', 'config.json');
 
-    let cfg = { passthroughEnabled: true, rewriteBase: '' };
+    let cfg = { directLinkEnabled: true, rewriteBase: '' };
     try {
         if (fs.existsSync(cfgPath)) {
             const raw = fs.readFileSync(cfgPath, 'utf8');
             const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
             const root = parsed && typeof parsed === 'object' ? parsed : null;
-            const panPassthrough =
-                root && root.panPassthrough && typeof root.panPassthrough === 'object' ? root.panPassthrough : null;
-            const interceptRaw =
-                root && root.interceptPans && typeof root.interceptPans === 'object' ? root.interceptPans : null;
-            const passthroughEnabled = panPassthrough && Object.prototype.hasOwnProperty.call(panPassthrough, 'enabled')
-                ? !!panPassthrough.enabled
-                : interceptRaw
-                  ? !!interceptRaw.baidu || !!interceptRaw.quark
-                  : true;
-
-            cfg = { passthroughEnabled, rewriteBase: normalizeHttpBase(root && root.rewriteBase) };
+            const directLink =
+                root && root.directLink && typeof root.directLink === 'object' && !Array.isArray(root.directLink)
+                    ? root.directLink
+                    : null;
+            const directLinkEnabled =
+                directLink && Object.prototype.hasOwnProperty.call(directLink, 'enabled') ? !!directLink.enabled : true;
+            cfg = { directLinkEnabled, rewriteBase: normalizeHttpBase(root && root.rewriteBase) };
         }
     } catch (_) {}
 
-    passthroughConfigState.ts = now;
-    passthroughConfigState.config = cfg;
+    directLinkConfigState.ts = now;
+    directLinkConfigState.config = cfg;
     return cfg;
 }
 
@@ -2855,10 +2851,10 @@ async function loadOneFile(filePath) {
 	                                const rawHeader = data.header && typeof data.header === 'object' ? data.header : null;
 	                                const ua = rawHeader && rawHeader['User-Agent'] ? String(rawHeader['User-Agent']) : '';
 
-	                                const cfg = getPassthroughConfig();
-	                                const passthroughEnabled = !!(cfg && cfg.passthroughEnabled);
-	                                const needsBaiduRewrite = hasBaidu && passthroughEnabled;
-	                                const needsQuarkDirect = hasQuark && !passthroughEnabled;
+	                                const cfg = getDirectLinkConfig();
+	                                const directLinkEnabled = !!(cfg && cfg.directLinkEnabled);
+	                                const needsBaiduRewrite = hasBaidu && !directLinkEnabled;
+	                                const needsQuarkDirect = hasQuark && directLinkEnabled;
 	                                if (!needsBaiduRewrite && !needsQuarkDirect) return payload;
 
 	                                const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http');
