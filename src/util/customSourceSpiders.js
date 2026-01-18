@@ -4,6 +4,7 @@ import vm from 'vm';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
+import zlib from 'node:zlib';
 import { createRequire } from 'module';
 import { fileURLToPath } from 'url';
 import { getCurrentTvUser, sanitizeTvUsername } from './tvUserContext.js';
@@ -30,6 +31,7 @@ let pansCache = {
 let dbJsonCache = {
     ts: 0,
     data: null,
+    path: '',
 };
 
 const interceptConfigState = {
@@ -1131,29 +1133,50 @@ function getPansListCached() {
 }
 
 function getDbJsonPath() {
-    const raw = process.env.CATPAW_DB_JSON_PATH || process.env.NODE_PATH || '.';
-    // If CATPAW_DB_JSON_PATH points to a file, use it; otherwise treat as directory containing db.json.
-    const guess = String(raw || '.').trim();
-    if (!guess) return path.resolve('.', 'db.json');
-    if (guess.endsWith('.json')) return path.resolve(guess);
-    return path.resolve(guess, 'db.json');
+    const resolvePathFromRaw = (raw) => {
+        const guess = String(raw || '').trim();
+        if (!guess) return '';
+        if (guess.endsWith('.json')) return path.resolve(guess);
+        return path.resolve(guess, 'db.json');
+    };
+
+    const candidates = [];
+    if (process.env.CATPAW_DB_JSON_PATH) candidates.push(resolvePathFromRaw(process.env.CATPAW_DB_JSON_PATH));
+    if (process.env.NODE_PATH) candidates.push(resolvePathFromRaw(process.env.NODE_PATH));
+    candidates.push(path.resolve(process.cwd(), 'db.json'));
+    candidates.push(path.resolve(process.cwd(), '..', 'db.json'));
+
+    // Try relative to current module (works for both src/ and dist/ layouts).
+    try {
+        const here = path.dirname(fileURLToPath(import.meta.url));
+        candidates.push(path.resolve(here, '..', '..', 'db.json'));
+        candidates.push(path.resolve(here, '..', '..', '..', 'db.json'));
+    } catch (_) {}
+
+    for (const p of candidates) {
+        try {
+            if (p && fs.existsSync(p)) return p;
+        } catch (_) {}
+    }
+    // Default fallback (keeps previous behavior).
+    return resolvePathFromRaw(process.env.NODE_PATH || '.') || path.resolve(process.cwd(), 'db.json');
 }
 
 function readDbJsonSafeCached() {
     const now = Date.now();
-    if (dbJsonCache.data && now - dbJsonCache.ts < 1000) return dbJsonCache.data;
     const dbPath = getDbJsonPath();
+    if (dbJsonCache.data && dbJsonCache.path === dbPath && now - dbJsonCache.ts < 1000) return dbJsonCache.data;
     try {
         if (!fs.existsSync(dbPath)) {
-            dbJsonCache = { ts: now, data: null };
+            dbJsonCache = { ts: now, data: null, path: dbPath };
             return null;
         }
         const raw = fs.readFileSync(dbPath, 'utf8');
         const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
-        dbJsonCache = { ts: now, data: parsed && typeof parsed === 'object' ? parsed : null };
+        dbJsonCache = { ts: now, data: parsed && typeof parsed === 'object' ? parsed : null, path: dbPath };
         return dbJsonCache.data;
     } catch (_) {
-        dbJsonCache = { ts: now, data: null };
+        dbJsonCache = { ts: now, data: null, path: dbPath };
         return null;
     }
 }
@@ -1179,11 +1202,21 @@ function findPanCookieInDbJson(panKey) {
     if (cookie) return cookie;
     cookie = tryGet(root, [pan, 'cookie']);
     if (cookie) return cookie;
+    cookie = tryGet(root, [panKey, 'ck']);
+    if (cookie) return cookie;
+    cookie = tryGet(root, [pan, 'ck']);
+    if (cookie) return cookie;
     cookie = tryGet(root, ['pans', pan, 'cookie']);
+    if (cookie) return cookie;
+    cookie = tryGet(root, ['pans', pan, 'ck']);
     if (cookie) return cookie;
     cookie = tryGet(root, ['pan', pan, 'cookie']);
     if (cookie) return cookie;
+    cookie = tryGet(root, ['pan', pan, 'ck']);
+    if (cookie) return cookie;
     cookie = tryGet(root, ['config', pan, 'cookie']);
+    if (cookie) return cookie;
+    cookie = tryGet(root, ['config', pan, 'ck']);
     if (cookie) return cookie;
 
     // pans.list = [{key, cookie, ...}]
@@ -1200,7 +1233,7 @@ function findPanCookieInDbJson(panKey) {
         }
     } catch (_) {}
 
-    // Best-effort: search for any cookie under a quark-like subtree and pick the longest.
+    // Best-effort: search for any cookie-like field and pick the most plausible one.
     const queue = [{ obj: root, path: 'root', depth: 0 }];
     const seen = new Set();
     const maxNodes = 8000;
@@ -1220,22 +1253,35 @@ function findPanCookieInDbJson(panKey) {
         for (const [k, v] of Object.entries(obj)) {
             const key = String(k || '').toLowerCase();
             const nextPath = `${cur.path}.${key}`;
-            if (key === 'cookie' && typeof v === 'string') {
+            if (typeof v === 'string') {
                 const c = v.trim();
                 if (c) {
-                    const score =
-                        (nextPath.includes(`.${pan}.`) || nextPath.endsWith(`.${pan}.cookie`) ? 5 : 0) +
-                        (cur.path.toLowerCase().includes(pan) ? 2 : 0) +
-                        (c.length > 50 ? 1 : 0);
-                    if (score > best.score || (score === best.score && c.length > best.len)) {
-                        best = { score, len: c.length, cookie: c };
+                    const looksLikeBaiduCookie = pan === 'baidu' && (c.includes('BDUSS=') || c.includes('BDUSS_BFESS=') || c.includes('STOKEN='));
+                    const isCookieField = key === 'cookie' || key === 'ck' || key === 'cookies';
+                    if (isCookieField || looksLikeBaiduCookie) {
+                        const score =
+                            (nextPath.includes(`.${pan}.`) ? 5 : 0) +
+                            (nextPath.endsWith(`.${pan}.cookie`) || nextPath.endsWith(`.${pan}.ck`) ? 3 : 0) +
+                            (cur.path.toLowerCase().includes(pan) ? 2 : 0) +
+                            (looksLikeBaiduCookie ? 3 : 0) +
+                            (c.length > 50 ? 1 : 0);
+                        if (score > best.score || (score === best.score && c.length > best.len)) {
+                            best = { score, len: c.length, cookie: c };
+                        }
                     }
                 }
             }
             if (v && typeof v === 'object' && cur.depth < 10) queue.push({ obj: v, path: nextPath, depth: cur.depth + 1 });
         }
     }
-    return best.cookie || '';
+    const picked = best.cookie || '';
+    // Avoid returning a cookie from the wrong pan when the db.json layout is unknown.
+    if (pan === 'baidu') {
+        const s = picked;
+        const ok = typeof s === 'string' && (s.includes('BDUSS=') || s.includes('BDUSS_BFESS=') || s.includes('STOKEN=') || s.includes('BAIDUID='));
+        return ok ? s : '';
+    }
+    return picked;
 }
 
 export function getCustomSourceStatus() {
@@ -1785,7 +1831,377 @@ function collectFileStats(filePaths) {
 
 async function loadOneFile(filePath) {
     const code = fs.readFileSync(filePath, 'utf8');
-    const requireFunc = createRequire(filePath);
+    const baseRequire = createRequire(filePath);
+
+    const BAIDU_DEBUG = process.env.CATPAW_BAIDU_DEBUG === '1' || process.env.CATPAW_DEBUG === '1';
+    const baiduLog = (...args) => {
+        if (!BAIDU_DEBUG) return;
+        // eslint-disable-next-line no-console
+        console.log('[baidu]', ...args);
+    };
+    const baiduDebugState = { ts: 0 };
+
+    const buildHttpProxy = (mod, scheme) => {
+        const normalizeOpts = (opts) => {
+            const o = opts && typeof opts === 'object' ? opts : {};
+            const headers = (o.headers && typeof o.headers === 'object' ? o.headers : {});
+
+            const getHeader = (name) => {
+                const lower = String(name || '').toLowerCase();
+                for (const [k, v] of Object.entries(headers)) {
+                    if (String(k || '').toLowerCase() === lower) return v;
+                }
+                return undefined;
+            };
+            const deleteHeader = (name) => {
+                const lower = String(name || '').toLowerCase();
+                for (const k of Object.keys(headers)) {
+                    if (String(k || '').toLowerCase() === lower) delete headers[k];
+                }
+            };
+            const hasCookie = () => {
+                const v = getHeader('cookie');
+                return typeof v === 'string' && !!v.trim();
+            };
+            const setHeaderIfMissing = (name, value) => {
+                if (!value) return;
+                const cur = getHeader(name);
+                if (typeof cur === 'string' && cur.trim()) return;
+                headers[name] = value;
+            };
+
+            const host =
+                (typeof o.hostname === 'string' && o.hostname) ||
+                (typeof o.host === 'string' && o.host) ||
+                (typeof o.servername === 'string' && o.servername) ||
+                '';
+            const hostname = String(host).split(':')[0].trim().toLowerCase();
+            const isBaidu = hostname === 'pan.baidu.com' || hostname.endsWith('.pan.baidu.com');
+            const isBaiduPcs = hostname === 'pcs.baidu.com' || hostname.endsWith('.pcs.baidu.com');
+
+            const parseCookie = (cookieStr) => {
+                const out = {};
+                const raw = String(cookieStr || '').trim();
+                if (!raw) return out;
+                for (const part of raw.split(';')) {
+                    const s = String(part || '').trim();
+                    if (!s) continue;
+                    const idx = s.indexOf('=');
+                    if (idx <= 0) continue;
+                    const k = s.slice(0, idx).trim();
+                    const v = s.slice(idx + 1).trim();
+                    if (!k) continue;
+                    out[k] = v;
+                }
+                return out;
+            };
+            const stringifyCookie = (cookieObj) => {
+                if (!cookieObj || typeof cookieObj !== 'object') return '';
+                const parts = [];
+                for (const [k, v] of Object.entries(cookieObj)) {
+                    const key = String(k || '').trim();
+                    if (!key) continue;
+                    parts.push(`${key}=${String(v ?? '').trim()}`);
+                }
+                return parts.join('; ');
+            };
+            const mergeCookiePreferDb = (existingCookie, dbCookie) => {
+                const existingMap = parseCookie(existingCookie);
+                const dbMap = parseCookie(dbCookie);
+                const preferDbKeys = new Set([
+                    'BDUSS',
+                    'STOKEN',
+                    'BAIDUID',
+                    'PSTM',
+                    'PANWEB',
+                    'HOSUPPORT',
+                    'USERID',
+                    'UID',
+                    'BDUSS_BFESS',
+                ]);
+                const merged = { ...existingMap };
+                for (const [k, v] of Object.entries(dbMap)) {
+                    if (!k) continue;
+                    if (preferDbKeys.has(k) || !(k in merged)) merged[k] = v;
+                }
+                return stringifyCookie(merged);
+            };
+
+            if (isBaidu || isBaiduPcs) {
+                // Ensure Baidu account cookie exists (BDUSS/STOKEN). Also preserve share-session cookies (e.g. BDCLND).
+                const cookieFromDb = findPanCookieInDbJson('baidu');
+                if (cookieFromDb) {
+                    const existingCookie = getHeader('cookie');
+                    const mergedCookie = mergeCookiePreferDb(existingCookie, cookieFromDb);
+                    if (mergedCookie) {
+                        deleteHeader('cookie');
+                        headers.Cookie = mergedCookie;
+                    }
+                }
+                if (BAIDU_DEBUG) {
+                    const now = Date.now();
+                    if (now - baiduDebugState.ts > 60_000) {
+                        baiduDebugState.ts = now;
+                        const dbPath = getDbJsonPath();
+                        const dbExists = (() => {
+                            try {
+                                return !!(dbPath && fs.existsSync(dbPath));
+                            } catch (_) {
+                                return false;
+                            }
+                        })();
+                        const curCookie = getHeader('cookie') || headers.Cookie || '';
+                        baiduLog('cookie', {
+                            dbPath,
+                            dbExists,
+                            hasDbCookie: !!cookieFromDb,
+                            dbHasBduss: /(?:^|;\\s*)BDUSS=/.test(cookieFromDb),
+                            dbHasStoken: /(?:^|;\\s*)STOKEN=/.test(cookieFromDb),
+                            mergedHasBduss: /(?:^|;\\s*)BDUSS=/.test(String(curCookie || '')),
+                            mergedHasStoken: /(?:^|;\\s*)STOKEN=/.test(String(curCookie || '')),
+                        });
+                    }
+                }
+
+                // Baidu often checks Referer/Origin + UA.
+                if (isBaidu) {
+                    setHeaderIfMissing('Referer', 'https://pan.baidu.com/disk/main');
+                    setHeaderIfMissing('Origin', 'https://pan.baidu.com');
+                    setHeaderIfMissing('X-Requested-With', 'XMLHttpRequest');
+                }
+                setHeaderIfMissing(
+                    'User-Agent',
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                );
+                setHeaderIfMissing('Accept', 'application/json, text/plain, */*');
+            }
+
+            // Some Baidu endpoints rely on common query params; add them when missing.
+            try {
+                if (isBaidu && typeof o.path === 'string' && o.path) {
+                    const [pathname, query] = o.path.split('?');
+                    const p = String(pathname || '');
+                    // Force loginStatus to use params that typically return `bdstoken`.
+                    if (p === '/api/loginStatus') {
+                        const params = new URLSearchParams(query || '');
+                        params.set('web', '1');
+                        params.set('clienttype', '0');
+                        params.set('channel', 'chunlei');
+                        if (!params.has('version')) params.set('version', '0');
+                        const qs = params.toString();
+                        o.path = qs ? `${p}?${qs}` : p;
+                    } else if (p.includes('/api/') || p.includes('/share/') || p.includes('/rest/') || p.includes('/xpan/')) {
+                        const params = new URLSearchParams(query || '');
+                        if (!params.has('web')) params.set('web', '1');
+                        if (!params.has('clienttype')) params.set('clienttype', '0');
+                        if (!params.has('channel')) params.set('channel', 'chunlei');
+                        const qs = params.toString();
+                        o.path = qs ? `${p}?${qs}` : p;
+                    }
+                }
+            } catch (_) {}
+
+            o.headers = headers;
+            return o;
+        };
+
+        const normalizeArgs = (args) => {
+            const list = Array.from(args || []);
+            let cb = null;
+            if (list.length && typeof list[list.length - 1] === 'function') cb = list.pop();
+
+            let url = null;
+            let opts = null;
+            if (list.length && (typeof list[0] === 'string' || list[0] instanceof URL)) {
+                url = list.shift();
+            }
+            if (list.length && list[0] && typeof list[0] === 'object') opts = list.shift();
+
+            // Remaining args are ignored (node supports more forms, but axios uses opts+cb).
+            return { url, opts, cb };
+        };
+
+        const request = (...args) => {
+            const { url, opts, cb } = normalizeArgs(args);
+            let finalOpts = opts && typeof opts === 'object' ? { ...opts } : {};
+            try {
+                if (url) {
+                    const u = url instanceof URL ? url : new URL(String(url));
+                    finalOpts = {
+                        ...finalOpts,
+                        protocol: finalOpts.protocol || u.protocol,
+                        hostname: finalOpts.hostname || u.hostname,
+                        port: finalOpts.port || (u.port || undefined),
+                        path: finalOpts.path || `${u.pathname || ''}${u.search || ''}`,
+                    };
+                }
+            } catch (_) {}
+            if (!finalOpts.protocol) finalOpts.protocol = `${scheme}:`;
+
+            const patched = normalizeOpts(finalOpts);
+
+            if (BAIDU_DEBUG) {
+                const host = String(patched.hostname || patched.host || '').split(':')[0];
+                if (host.endsWith('baidu.com')) {
+                    const headers = patched.headers && typeof patched.headers === 'object' ? patched.headers : {};
+                    const cookieStr = Object.keys(headers)
+                        .filter((k) => String(k).toLowerCase() === 'cookie')
+                        .map((k) => String(headers[k] || ''))
+                        .join('; ');
+                    const hasCookie = !!cookieStr.trim();
+                    const hasBduss = /(?:^|;\\s*)BDUSS=/.test(cookieStr);
+                    const hasStoken = /(?:^|;\\s*)STOKEN=/.test(cookieStr);
+                    baiduLog('request', {
+                        method: String(patched.method || 'GET').toUpperCase(),
+                        host,
+                        path: String(patched.path || ''),
+                        hasCookie,
+                        hasBduss,
+                        hasStoken,
+                    });
+                }
+            }
+
+            const req = cb ? mod.request(patched, cb) : mod.request(patched);
+            try {
+                if (BAIDU_DEBUG) {
+                    req.on('response', (res) => {
+                        try {
+                            const host = String(patched.hostname || patched.host || '').split(':')[0];
+                            if (!host.endsWith('baidu.com')) return;
+                            baiduLog('response', {
+                                host,
+                                path: String(patched.path || ''),
+                                statusCode: res && res.statusCode,
+                            });
+                            // Best-effort JSON errno logging for debugging token/transfer issues.
+                            try {
+                                const p = String(patched.path || '');
+                                const shouldLogBody =
+                                    p.startsWith('/api/loginStatus') ||
+                                    p.startsWith('/share/transfer') ||
+                                    p.startsWith('/api/gettemplatevariable') ||
+                                    p.startsWith('/api/share') ||
+                                    p.startsWith('/api/mediainfo');
+                                if (!shouldLogBody) return;
+                                const chunks = [];
+                                let total = 0;
+                                let truncated = false;
+                                const LIMIT = 128 * 1024;
+                                res.on('data', (c) => {
+                                    try {
+                                        if (!c) return;
+                                        const buf = Buffer.isBuffer(c) ? c : Buffer.from(String(c));
+                                        total += buf.length;
+                                        if (total > LIMIT) {
+                                            truncated = true;
+                                            return;
+                                        }
+                                        chunks.push(buf);
+                                    } catch (_) {}
+                                });
+                                res.on('end', () => {
+                                    try {
+                                        if (truncated) return;
+                                        if (!chunks.length) return;
+                                        const enc = String((res && res.headers && (res.headers['content-encoding'] || res.headers['Content-Encoding'])) || '')
+                                            .trim()
+                                            .toLowerCase();
+                                        const buf = Buffer.concat(chunks);
+                                        let rawBuf = buf;
+                                        try {
+                                            if (enc === 'gzip') rawBuf = zlib.gunzipSync(buf);
+                                            else if (enc === 'deflate') rawBuf = zlib.inflateSync(buf);
+                                            else if (enc === 'br') rawBuf = zlib.brotliDecompressSync(buf);
+                                        } catch (_) {
+                                            rawBuf = buf;
+                                        }
+                                        const raw = rawBuf.toString('utf8');
+                                        const trimmed = raw.trim();
+                                        if (!trimmed) return;
+                                        let json = null;
+                                        try {
+                                            json = JSON.parse(trimmed);
+                                        } catch (_) {
+                                            return;
+                                        }
+                                        const errno = json && (json.errno ?? json.error_code ?? json.error);
+                                        const msg = json && (json.msg ?? json.message ?? json.error_msg);
+                                        const hasBdstoken = !!(json && (json.bdstoken || (json.data && json.data.bdstoken)));
+                                        baiduLog('json', {
+                                            path: p,
+                                            errno: typeof errno === 'number' || typeof errno === 'string' ? errno : undefined,
+                                            msg: typeof msg === 'string' ? msg : undefined,
+                                            hasBdstoken,
+                                        });
+                                    } catch (_) {}
+                                });
+                            } catch (_) {}
+                        } catch (_) {}
+                    });
+                }
+            } catch (_) {}
+            return req;
+        };
+
+        const get = (...args) => {
+            const req = request(...args);
+            try {
+                req.end();
+            } catch (_) {}
+            return req;
+        };
+
+        return new Proxy(mod, {
+            get(target, prop, receiver) {
+                if (prop === 'request') return request;
+                if (prop === 'get') return get;
+                return Reflect.get(target, prop, receiver);
+            },
+        });
+    };
+
+    let wrappedHttp = null;
+    let wrappedHttps = null;
+    try {
+        const httpMod = baseRequire('node:http');
+        wrappedHttp = buildHttpProxy(httpMod, 'http');
+    } catch (_) {
+        try {
+            const httpMod = baseRequire('http');
+            wrappedHttp = buildHttpProxy(httpMod, 'http');
+        } catch (_) {
+            wrappedHttp = null;
+        }
+    }
+    try {
+        const httpsMod = baseRequire('node:https');
+        wrappedHttps = buildHttpProxy(httpsMod, 'https');
+    } catch (_) {
+        try {
+            const httpsMod = baseRequire('https');
+            wrappedHttps = buildHttpProxy(httpsMod, 'https');
+        } catch (_) {
+            wrappedHttps = null;
+        }
+    }
+
+    const requireFunc = (() => {
+        const fn = (id) => {
+            const key = String(id || '');
+            if (wrappedHttp && (key === 'http' || key === 'node:http')) return wrappedHttp;
+            if (wrappedHttps && (key === 'https' || key === 'node:https')) return wrappedHttps;
+            return baseRequire(id);
+        };
+        // Preserve common require properties for compatibility.
+        try {
+            fn.resolve = baseRequire.resolve;
+            fn.main = baseRequire.main;
+            fn.extensions = baseRequire.extensions;
+            fn.cache = baseRequire.cache;
+        } catch (_) {}
+        return fn;
+    })();
     const context = buildVmContext(requireFunc, filePath);
     const quarkStateByUser = new Map();
     let quarkActiveUser = '';
