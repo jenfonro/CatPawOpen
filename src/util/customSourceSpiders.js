@@ -2889,16 +2889,27 @@ async function loadOneFile(filePath) {
                                         rewritten.push(item);
                                         continue;
                                     }
-                                    let parsed;
-                                    try {
-                                        parsed = new URL(item);
-                                    } catch (_) {
-                                        rewritten.push(item);
-                                        continue;
-	                                    }
-	                                    const hn = String(parsed.hostname || '').toLowerCase();
-	                                    const isBaidu = hn && (hn.endsWith('.baidupcs.com') || hn === 'baidupcs.com');
-	                                    const isQuarkProxy = parsed.pathname && parsed.pathname.includes('/proxy/quark/');
+	                                    let parsed;
+	                                    let absItem = item;
+	                                    try {
+	                                        parsed = new URL(item);
+	                                    } catch (_) {
+	                                        if (baseFromReq) {
+	                                            try {
+	                                                parsed = new URL(item, `${baseFromReq}/`);
+	                                                absItem = parsed.toString();
+	                                            } catch (_e2) {
+	                                                rewritten.push(item);
+	                                                continue;
+	                                            }
+	                                        } else {
+	                                            rewritten.push(item);
+	                                            continue;
+	                                        }
+		                                    }
+		                                    const hn = String(parsed.hostname || '').toLowerCase();
+		                                    const isBaidu = hn && (hn.endsWith('.baidupcs.com') || hn === 'baidupcs.com');
+		                                    const isQuarkProxy = parsed.pathname && parsed.pathname.includes('/proxy/quark/');
 	                                    if (isBaidu && needsBaiduRewrite) {
 	                                        const token = putBaiduProxyEntry(
 	                                            item,
@@ -2913,22 +2924,26 @@ async function loadOneFile(filePath) {
 	                                        continue;
 	                                    }
 
-	                                    if (isQuarkProxy && needsQuarkDirect) {
+		                                    if (isQuarkProxy && needsQuarkDirect) {
 	                                        // Only rewrite the first (default) playback URL to avoid triggering
 	                                        // multiple expensive resolves for "quality" variants that are typically unused.
-                                            const firstUrlIdx = isPairFormat
-                                                ? 1
-                                                : data.url.findIndex((v) => typeof v === 'string' && isHttpUrlStr(v));
-	                                        if (idx !== firstUrlIdx) {
-	                                            rewritten.push(item);
-	                                            continue;
-	                                        }
+	                                            const firstUrlIdx = isPairFormat
+	                                                ? 1
+	                                                : (() => {
+	                                                    const httpIdx = data.url.findIndex((v) => typeof v === 'string' && isHttpUrlStr(v));
+	                                                    if (httpIdx >= 0) return httpIdx;
+	                                                    return data.url.findIndex((v) => typeof v === 'string' && v.includes('/proxy/quark/'));
+	                                                })();
+		                                        if (idx !== firstUrlIdx) {
+		                                            rewritten.push(item);
+		                                            continue;
+		                                        }
 
                                         try {
                                             const runtimeCtx = quarkRuntime.ctx || context;
 
-                                            const parsedDown = parseQuarkProxyDownUrl(item);
-                                            if (!parsedDown) throw new Error('unrecognized quark proxy url');
+	                                            const parsedDown = parseQuarkProxyDownUrl(absItem);
+	                                            if (!parsedDown) throw new Error('unrecognized quark proxy url');
                                             // Do not force Quark init here; it can trigger noisy/slow API calls.
                                             // Only bind per-user variables; the resolver uses explicit API calls below.
                                             let effectiveHeader = null;

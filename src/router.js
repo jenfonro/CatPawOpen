@@ -426,27 +426,6 @@ export default async function router(fastify) {
         }
     }
 
-    fastify.get('/admin/proxy', async function (request, reply) {
-        return reply.send({ success: true, proxy: getGlobalProxy() || '' });
-    });
-
-    fastify.put('/admin/proxy', async function (request, reply) {
-        const body = request && request.body && typeof request.body === 'object' ? request.body : {};
-        const proxy = typeof body.proxy === 'string' ? body.proxy : '';
-        try {
-            const applied = await setGlobalProxy(proxy);
-            try {
-                const cfgPath = getConfigJsonPath();
-                const prev = readConfigJsonSafe(cfgPath);
-                writeConfigJsonSafe(cfgPath, { ...prev, proxy: applied || '' });
-            } catch (_) {}
-            return reply.send({ success: true, proxy: applied || '' });
-        } catch (e) {
-            const msg = e && e.message ? String(e.message) : 'proxy apply failed';
-            return reply.code(400).send({ success: false, message: msg });
-        }
-    });
-
     // Unified admin settings endpoint so clients can persist proxy + direct-link mode with a single request.
     fastify.get('/admin/settings', async function (_request, reply) {
         const cfgPath = getConfigJsonPath();
