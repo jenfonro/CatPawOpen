@@ -3075,27 +3075,23 @@ async function loadOneFile(filePath) {
 
 		                                return JSON.stringify(next);
 		                            } catch (e) {
+		                                const statusRaw =
+		                                    (e && typeof e.status === 'number' && e.status) ||
+		                                    (e && e.response && typeof e.response.status === 'number' && e.response.status) ||
+		                                    (e && e.response && e.response.data && typeof e.response.data.status === 'number' && e.response.data.status) ||
+		                                    0;
+		                                const status = Number.isFinite(Number(statusRaw)) ? Number(statusRaw) : 0;
+		                                const outStatus = status && status >= 400 && status <= 599 ? status : 424;
 		                                try {
-		                                    const statusRaw =
-		                                        (e && typeof e.status === 'number' && e.status) ||
-		                                        (e && e.response && typeof e.response.status === 'number' && e.response.status) ||
-		                                        (e && e.response && e.response.data && typeof e.response.data.status === 'number' && e.response.data.status) ||
-		                                        0;
-		                                    const status = Number.isFinite(Number(statusRaw)) ? Number(statusRaw) : 0;
-		                                    reply.code(status && status >= 400 && status <= 599 ? status : 502);
-	                                } catch (_) {}
-	                                const statusRaw =
-	                                    (e && typeof e.status === 'number' && e.status) ||
-	                                    (e && e.response && typeof e.response.status === 'number' && e.response.status) ||
-	                                    (e && e.response && e.response.data && typeof e.response.data.status === 'number' && e.response.data.status) ||
-	                                    0;
-	                                const status = Number.isFinite(Number(statusRaw)) ? Number(statusRaw) : 0;
-	                                const outStatus = status && status >= 400 && status <= 599 ? status : 424;
-	                                const msg = e && e.message ? String(e.message) : '获取播放地址失败';
-	                                const error =
-	                                    outStatus === 401 ? 'Unauthorized' : outStatus >= 500 ? 'Bad Gateway' : 'Failed Dependency';
-	                                return JSON.stringify({ statusCode: outStatus, error, message: msg.slice(0, 400) });
-	                            }
+		                                    reply.code(outStatus);
+		                                } catch (_) {}
+
+		                                let msg = e && e.message ? String(e.message) : '获取播放地址失败';
+		                                if (outStatus === 401 && msg === '夸克登录失效') msg = '夸克登录失效，错误码401';
+		                                const error =
+		                                    outStatus === 401 ? 'Unauthorized' : outStatus >= 500 ? 'Bad Gateway' : 'Failed Dependency';
+		                                return JSON.stringify({ statusCode: outStatus, error, message: msg.slice(0, 400) });
+		                            }
                         });
                     }
 
