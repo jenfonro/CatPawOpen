@@ -42,7 +42,7 @@ Build `npm run build`
 播放流程（重要）：
 - 客户端请求 `CatPawOpen` 获取播放地址（以及 `header` 等必要参数）
 - 客户端请求 `GoProxy` 注册 `{url, headers}`（`POST /register`）
-- 客户端使用 `GoProxy` 返回的 token 地址播放（`GET /token/<token>`）
+- 客户端使用 `GoProxy` 返回的 token 地址播放（`GET /<token>`）
 
 说明：
 - `CatPawOpen` 不会与 `GoProxy` 通信；是否使用 `GoProxy` 由 `TV_Server` 前端决定。
