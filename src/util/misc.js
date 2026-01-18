@@ -59,9 +59,11 @@ export function formatPlayUrl(src, name) {
     if (src.trim() == name.trim()) {
         return name;
     }
+    const escapedSrc = String(src || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const srcRe = escapedSrc ? new RegExp(escapedSrc, 'g') : null;
     return name
         .trim()
-        .replaceAll(src, '')
+        .replace(srcRe || /$^/, '')
         .replace(/<|>|《|》/g, '')
         .replace(/\$|#/g, ' ')
         .trim();

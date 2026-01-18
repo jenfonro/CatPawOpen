@@ -175,7 +175,9 @@ async function dir(inReq, _outResp) {
         const isVideo = drives.isVideo(item);
         if (!drives.showAll && !drives.isFolder(item) && !isVideo) return;
         const file = {
-            name: item.name.replaceAll('$', '_').replaceAll('#', '_'),
+            name: String(item.name || '')
+                .replace(/\$/g, '_')
+                .replace(/#/g, '_'),
             path: id + item.name + (drives.isFolder(item) ? '/' : ''),
             thumb: drives.getPic(item),
             type: drives.getType(item),

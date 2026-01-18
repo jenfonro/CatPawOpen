@@ -5,6 +5,45 @@ import axios from 'axios';
 
 let server = null;
 
+function ensureFetchPolyfill() {
+    if (typeof globalThis.fetch === 'function') return;
+    globalThis.fetch = async (input, init = {}) => {
+        const url = typeof input === 'string' ? input : input && typeof input.url === 'string' ? input.url : String(input);
+        const method = init && init.method ? String(init.method).toUpperCase() : 'GET';
+        const headers = (init && init.headers) || {};
+        const body = init && Object.prototype.hasOwnProperty.call(init, 'body') ? init.body : undefined;
+        const redirect = init && init.redirect ? String(init.redirect) : 'follow';
+
+        const resp = await axios.request({
+            url,
+            method,
+            headers,
+            data: body,
+            responseType: 'text',
+            transformResponse: [(v) => v],
+            maxRedirects: redirect === 'manual' ? 0 : 5,
+            validateStatus: () => true,
+        });
+
+        const dataText =
+            typeof resp.data === 'string' ? resp.data : Buffer.isBuffer(resp.data) ? resp.data.toString('utf8') : JSON.stringify(resp.data);
+        return {
+            ok: resp.status >= 200 && resp.status < 300,
+            status: resp.status,
+            url: url,
+            text: async () => dataText,
+            headers: {
+                get: (key) => {
+                    if (!key) return null;
+                    const k = String(key).toLowerCase();
+                    const v = resp.headers ? resp.headers[k] : undefined;
+                    return typeof v === 'string' ? v : Array.isArray(v) ? v.join(', ') : v != null ? String(v) : null;
+                },
+            },
+        };
+    };
+}
+
 function ensureConfigDefaults(config) {
     if (!config || typeof config !== 'object') return {};
 
@@ -50,6 +89,7 @@ function ensureConfigDefaults(config) {
  * @return {void}
  */
 export async function start(config) {
+    ensureFetchPolyfill();
     /**
      * @type {import('fastify').FastifyInstance}
      */
@@ -92,12 +132,15 @@ export async function start(config) {
     server.db = new JsonDB(new Config((process.env['NODE_PATH'] || '.') + '/db.json', true, true, '/', true));
     server.register(router);
     // 注意 一定要监听ipv4地址 build后 app中使用时 端口使用0让系统自动分配可用端口
+    const isStandalone = !!(process && process.pkg) || process.env['CATPAW_STANDALONE'] === '1';
+
     const envPortRaw = process.env['DEV_HTTP_PORT'] || process.env['PORT'] || '';
-    const parsedPort = envPortRaw === '' ? 0 : Number(envPortRaw);
-    const port = Number.isFinite(parsedPort) ? parsedPort : 0;
+    const defaultPort = isStandalone ? 3006 : 0;
+    const parsedPort = envPortRaw === '' ? defaultPort : Number(envPortRaw);
+    const port = Number.isFinite(parsedPort) ? parsedPort : defaultPort;
 
     const hostRaw = typeof process.env['HOST'] === 'string' ? process.env['HOST'].trim() : '';
-    const host = hostRaw || '127.0.0.1';
+    const host = hostRaw || (isStandalone ? '0.0.0.0' : '127.0.0.1');
 
     server.listen({ port, host });
 }

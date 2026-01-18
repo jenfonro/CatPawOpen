@@ -11,7 +11,7 @@ esbuild.build({
     charset: 'utf8',
     format: 'cjs',
     platform: 'node',
-    target: 'node18',
+    target: 'node14',
     sourcemap: process.env.NODE_ENV === 'development' ? 'inline' : false,
     plugins: [genMd5()],
 });

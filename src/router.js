@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { pathToFileURL } from 'url';
 import {
     getCustomSourceStatus,
     getCustomSourceWebPlugins,
@@ -12,6 +12,27 @@ import { getGlobalProxy, setGlobalProxy } from './util/proxy.js';
 import { getTvUserFromRequest, hasExplicitTvUser, tvUserStorage } from './util/tvUserContext.js';
 
 const spiderPrefix = '/spider';
+
+function getEmbeddedRootDir() {
+    // When bundled by esbuild (cjs), `__dirname` points to `dist/`.
+    // When packaged by pkg, `__dirname` points into `/snapshot/.../dist`.
+    // In dev (esm), fall back to `process.cwd()`.
+    try {
+        // eslint-disable-next-line no-undef
+        if (typeof __dirname !== 'undefined') return path.resolve(__dirname, '..');
+    } catch (_) {}
+    return process.cwd();
+}
+
+function getExternalRootDir() {
+    // For pkg executables, read/write config from the executable directory.
+    try {
+        if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
+            return path.dirname(process.execPath);
+        }
+    } catch (_) {}
+    return '';
+}
 
 function normalizeHttpBase(value) {
     if (typeof value !== 'string') return '';
@@ -26,24 +47,18 @@ function normalizeHttpBase(value) {
     }
 }
 
-function normalizeGoProxyServers(value) {
-    const list = Array.isArray(value) ? value : [];
-    const out = [];
-    const seen = new Set();
-    for (const it of list) {
-        const base = normalizeHttpBase(it && typeof it.base === 'string' ? it.base : '');
-        if (!base || seen.has(base)) continue;
-        const pans = it && typeof it.pans === 'object' && it.pans ? it.pans : {};
-        out.push({ base, pans: { baidu: !!pans.baidu, quark: !!pans.quark } });
-        seen.add(base);
-    }
-    return out;
+function readDirectLinkEnabledFromConfigRoot(root) {
+    const cfg = root && typeof root === 'object' && !Array.isArray(root) ? root : {};
+    const directLink =
+        cfg && cfg.directLink && typeof cfg.directLink === 'object' && !Array.isArray(cfg.directLink) ? cfg.directLink : null;
+    if (directLink && Object.prototype.hasOwnProperty.call(directLink, 'enabled')) return !!directLink.enabled;
+    return true;
 }
 
 function getConfigJsonPath() {
-    // CatPawOpen/src/router.js -> CatPawOpen/config.json
-    const here = path.dirname(fileURLToPath(import.meta.url));
-    return path.resolve(here, '..', 'config.json');
+    const external = getExternalRootDir();
+    if (external) return path.resolve(external, 'config.json');
+    return path.resolve(getEmbeddedRootDir(), 'config.json');
 }
 
 function readConfigJsonSafe(configPath) {
@@ -125,9 +140,20 @@ function mergeSpiders(baseSpiders, extraSpiders) {
 }
 
 function resolveSpiderRootDir() {
-    // CatPawOpen/src/router.js -> CatPawOpen/src/spider
-    const here = path.dirname(fileURLToPath(import.meta.url));
-    return path.join(here, 'spider');
+    const embedded = path.resolve(getEmbeddedRootDir(), 'src', 'spider');
+    // When packaged by pkg, always prefer embedded spiders inside the executable snapshot.
+    // This avoids accidentally loading a partial on-disk source tree (missing deps / wrong module type),
+    // and makes the standalone binary self-contained.
+    try {
+        if (process && process.pkg) return embedded;
+    } catch (_) {}
+
+    const externalRoot = getExternalRootDir();
+    const external = externalRoot ? path.resolve(externalRoot, 'src', 'spider') : '';
+    try {
+        if (external && fs.existsSync(external)) return external;
+    } catch (_) {}
+    return embedded;
 }
 
 function listSpiderJsFiles(rootDir) {
@@ -172,6 +198,12 @@ async function loadSpidersFromFiles(filePaths, options = {}) {
             const msg = err && err.message ? err.message : String(err);
             // eslint-disable-next-line no-console
             console.error(`${logPrefix} load failed: file=${filePath} error=${msg}`);
+            try {
+                if (process.env.CATPAW_DEBUG === '1' && err && err.stack) {
+                    // eslint-disable-next-line no-console
+                    console.error(err.stack);
+                }
+            } catch (_) {}
         }
     }
     return spiders;
@@ -184,7 +216,7 @@ async function loadSpidersFromFiles(filePaths, options = {}) {
  * @return {Promise<void>} - A Promise that resolves when the router is initialized
  */
 export default async function router(fastify) {
-    // Load persisted settings (proxy / goproxy) from config.json on startup.
+    // Load persisted settings (proxy / directLink) from config.json on startup.
     try {
         const cfgPath = getConfigJsonPath();
         const root = readConfigJsonSafe(cfgPath);
@@ -432,77 +464,51 @@ export default async function router(fastify) {
         }
     }
 
-    fastify.get('/admin/proxy', async function (request, reply) {
-        return reply.send({ success: true, proxy: getGlobalProxy() || '' });
+    // Unified admin settings endpoint so clients can persist proxy + direct-link mode with a single request.
+    fastify.get('/admin/settings', async function (_request, reply) {
+        const cfgPath = getConfigJsonPath();
+        const root = readConfigJsonSafe(cfgPath);
+        return reply.send({
+            success: true,
+            settings: {
+                proxy: getGlobalProxy() || '',
+                directLinkEnabled: readDirectLinkEnabledFromConfigRoot(root),
+            },
+        });
     });
 
-    fastify.put('/admin/proxy', async function (request, reply) {
+    fastify.put('/admin/settings', async function (request, reply) {
         const body = request && request.body && typeof request.body === 'object' ? request.body : {};
-        const proxy = typeof body.proxy === 'string' ? body.proxy : '';
+        const cfgPath = getConfigJsonPath();
+        const prev = readConfigJsonSafe(cfgPath);
+
+        const hasProxy = Object.prototype.hasOwnProperty.call(body, 'proxy');
+        const proxy = hasProxy && typeof body.proxy === 'string' ? body.proxy : getGlobalProxy() || '';
+        const hasDirect = Object.prototype.hasOwnProperty.call(body, 'directLinkEnabled');
+        const directLinkEnabled = hasDirect ? !!body.directLinkEnabled : readDirectLinkEnabledFromConfigRoot(prev);
+
+        let applied = proxy;
         try {
-            const applied = await setGlobalProxy(proxy);
-            try {
-                const cfgPath = getConfigJsonPath();
-                const prev = readConfigJsonSafe(cfgPath);
-                writeConfigJsonSafe(cfgPath, { ...prev, proxy: applied || '' });
-            } catch (_) {}
-            return reply.send({ success: true, proxy: applied || '' });
+            applied = await setGlobalProxy(proxy);
         } catch (e) {
             const msg = e && e.message ? String(e.message) : 'proxy apply failed';
             return reply.code(400).send({ success: false, message: msg });
         }
-    });
-
-    // GoProxy settings are synced from TV_Server dashboard by the browser client, and persisted here
-    // only to avoid config drift when switching CatPawOpen instances.
-    // IMPORTANT: CatPawOpen never communicates with go_proxy.
-    fastify.get('/admin/goproxy', async function (_request, reply) {
-        const cfgPath = getConfigJsonPath();
-        const root = readConfigJsonSafe(cfgPath);
-        const goProxy = root && root.goProxy && typeof root.goProxy === 'object' ? root.goProxy : {};
-        const servers = normalizeGoProxyServers(goProxy && goProxy.servers);
-        const interceptRaw = root && root.interceptPans && typeof root.interceptPans === 'object' ? root.interceptPans : {};
-        return reply.send({
-            success: true,
-            goProxy: {
-                enabled: !!(goProxy && goProxy.enabled),
-                autoSelect: !!(goProxy && goProxy.autoSelect),
-                servers,
-            },
-            interceptPans: { baidu: !!interceptRaw.baidu, quark: !!interceptRaw.quark },
-        });
-    });
-
-    fastify.put('/admin/goproxy', async function (request, reply) {
-        const body = request && request.body && typeof request.body === 'object' ? request.body : {};
-        const cfgPath = getConfigJsonPath();
-        const prev = readConfigJsonSafe(cfgPath);
-        const prevGoProxy = prev && prev.goProxy && typeof prev.goProxy === 'object' ? prev.goProxy : {};
-        const prevIntercept =
-            prev && prev.interceptPans && typeof prev.interceptPans === 'object' ? prev.interceptPans : {};
-
-        const hasEnabled = Object.prototype.hasOwnProperty.call(body, 'enabled');
-        const hasAutoSelect = Object.prototype.hasOwnProperty.call(body, 'autoSelect');
-        const hasServers = Object.prototype.hasOwnProperty.call(body, 'servers');
-        const enabled = hasEnabled ? !!body.enabled : !!prevGoProxy.enabled;
-        const autoSelect = hasAutoSelect ? !!body.autoSelect : !!prevGoProxy.autoSelect;
-        const servers = hasServers ? normalizeGoProxyServers(body.servers) : normalizeGoProxyServers(prevGoProxy.servers);
-        const interceptFromBody =
-            body && typeof body.interceptPans === 'object' && body.interceptPans ? body.interceptPans : null;
-        const interceptPans = interceptFromBody
-            ? { baidu: !!interceptFromBody.baidu, quark: !!interceptFromBody.quark }
-            : { baidu: !!prevIntercept.baidu, quark: !!prevIntercept.quark };
 
         const next = {
             ...prev,
-            goProxy: {
-                ...(prevGoProxy && typeof prevGoProxy === 'object' ? prevGoProxy : {}),
-                enabled,
-                autoSelect,
-                servers,
+            proxy: applied || '',
+            directLink: {
+                ...(prev && prev.directLink && typeof prev.directLink === 'object' ? prev.directLink : {}),
+                enabled: !!directLinkEnabled,
             },
-            interceptPans,
         };
+        // Drop deprecated keys.
+        try {
+            delete next.panPassthrough;
+            delete next.interceptPans;
+            delete next.goProxy;
+        } catch (_) {}
 
         try {
             writeConfigJsonSafe(cfgPath, next);
@@ -513,8 +519,7 @@ export default async function router(fastify) {
 
         return reply.send({
             success: true,
-            goProxy: { enabled, autoSelect, servers },
-            interceptPans,
+            settings: { proxy: applied || '', directLinkEnabled: !!directLinkEnabled },
         });
     });
 

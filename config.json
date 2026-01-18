@@ -1,12 +1,6 @@
 {
   "proxy": "",
-  "interceptPans": {
-    "baidu": true,
-    "quark": false
-  },
-  "goProxy": {
-    "enabled": false,
-    "autoSelect": false,
-    "servers": []
+  "directLink": {
+    "enabled": true
   }
 }

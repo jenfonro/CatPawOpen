@@ -41,11 +41,12 @@ Build `npm run build`
 
 播放流程（重要）：
 - 客户端请求 `CatPawOpen` 获取播放地址（以及 `header` 等必要参数）
-- 客户端请求 `GoProxy` 注册 `{url, headers}`（如 `POST /api/baidu/register`）
-- 客户端使用 `GoProxy` 返回的透传地址播放（如 `/spider/proxy/baidu/<token>`）
+- 客户端请求 `GoProxy` 注册 `{url, headers}`（`POST /register`）
+- 客户端使用 `GoProxy` 返回的 token 地址播放（`GET /<token>`）
 
 说明：
-- `CatPawOpen` 不会与 `GoProxy` 通信，也不会改写播放地址。
+- `CatPawOpen` 不会与 `GoProxy` 通信；是否使用 `GoProxy` 由 `TV_Server` 前端决定。
+- `CatPawOpen` 的“直链模式”会影响播放地址：开启后尽量返回直链；关闭后会返回 `CatPawOpen` 内置 proxy 地址。
 - Quark 的 `download_url` 仍由 `CatPawOpen` 解析后返回给客户端；解析过程可能会等待一段时间（最长约 60 秒）。
 
 ## Nginx反代配置
