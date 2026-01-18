@@ -93,7 +93,7 @@ function getDirectLinkConfig() {
     return cfg;
 }
 
-async function quarkResolveDownloadUrlViaApi({ shareId, stoken, fid, fidToken, toPdirFid, rawHeader, scriptContext }) {
+async function quarkResolveDownloadUrlViaApi({ shareId, stoken, fid, fidToken, toPdirFid, rawHeader, scriptContext, want }) {
     const fetchImpl = globalThis.fetch;
     if (typeof fetchImpl !== 'function') throw new Error('fetch is not available');
     const QUARK_DEBUG = process.env.CATPAW_QUARK_DEBUG === '1' || process.env.CATPAW_DEBUG === '1';
@@ -114,6 +114,7 @@ async function quarkResolveDownloadUrlViaApi({ shareId, stoken, fid, fidToken, t
     const fId = String(fid || '').trim();
     const fToken = String(fidToken || '').trim();
     const toPdir = String(toPdirFid || '').trim() || '0';
+    const wantMode = String(want || 'download_url').trim() || 'download_url';
     if (!pwdId || !sToken || !fId || !fToken) throw new Error('missing quark share parameters');
     if (toPdir === '0') throw new Error('quark to_pdir_fid is 0 (destination folder not initialized)');
     const ctxHasWKt = !!(scriptContext && typeof scriptContext.WKt === 'function');
@@ -520,6 +521,8 @@ async function quarkResolveDownloadUrlViaApi({ shareId, stoken, fid, fidToken, t
 
     log('task ok', { savedFid: mask(savedFid), savedFidToken: mask(savedFidToken) });
 
+    if (wantMode === 'saved_fid') return savedFid;
+
     let wktFailureHint = '';
     let wktTokenCandidate = '';
 
@@ -795,13 +798,16 @@ async function resolveQuarkDirectUrlCached({
     toPdirFid,
     rawHeader,
     scriptContext,
+    want,
 }) {
     pruneQuarkDirectUrlCache();
 
     const authKey = getQuarkAuthKey(rawHeader);
     const fromFile = quarkRuntime.fromFile || '';
+    const wantMode = String(want || 'download_url').trim() || 'download_url';
     const key = [
         'quark',
+        wantMode,
         String(shareId || ''),
         String(stoken || ''),
         String(fid || ''),
@@ -829,6 +835,7 @@ async function resolveQuarkDirectUrlCached({
                 toPdirFid,
                 rawHeader,
                 scriptContext,
+                want: wantMode,
             });
             quarkDirectUrlCache.map.set(key, { ts: Date.now(), url: String(url || ''), promise: null });
             return url;
@@ -2853,16 +2860,20 @@ async function loadOneFile(filePath) {
 	                                if (!data || typeof data !== 'object' || !Array.isArray(data.url)) return payload;
 
 	                                const rawHeader = data.header && typeof data.header === 'object' ? data.header : null;
-	                                const ua = rawHeader && rawHeader['User-Agent'] ? String(rawHeader['User-Agent']) : '';
+		                                const ua = rawHeader && rawHeader['User-Agent'] ? String(rawHeader['User-Agent']) : '';
 
-	                                const cfg = getDirectLinkConfig();
-	                                const directLinkEnabled = !!(cfg && cfg.directLinkEnabled);
-	                                const needsBaiduRewrite = hasBaidu && !directLinkEnabled;
-	                                const needsQuarkDirect = hasQuark && directLinkEnabled;
-	                                // In proxy mode (directLinkEnabled=false), we should still rewrite proxy URLs to a
-	                                // client-accessible base (avoid returning 0.0.0.0:3006 / localhost).
-	                                const needsProxyBaseRewrite = !directLinkEnabled && (needsBaiduRewrite || hasQuark);
-	                                if (!needsBaiduRewrite && !needsQuarkDirect && !needsProxyBaseRewrite) return payload;
+		                                const cfg = getDirectLinkConfig();
+		                                const directLinkEnabled = !!(cfg && cfg.directLinkEnabled);
+		                                const needsBaiduRewrite = hasBaidu && !directLinkEnabled;
+		                                const q = req && req.query && typeof req.query === 'object' ? req.query : null;
+		                                const hasQuarkTv =
+		                                    !!(q && (Object.prototype.hasOwnProperty.call(q, 'quark_tv') || Object.prototype.hasOwnProperty.call(q, 'quarkTv')));
+		                                const needsQuarkDirect = hasQuark && directLinkEnabled && !hasQuarkTv;
+		                                const needsQuarkSaveOnly = hasQuark && hasQuarkTv;
+		                                // In proxy mode (directLinkEnabled=false), we should still rewrite proxy URLs to a
+		                                // client-accessible base (avoid returning 0.0.0.0:3006 / localhost).
+		                                const needsProxyBaseRewrite = (hasQuark && (!directLinkEnabled || needsQuarkSaveOnly)) || needsBaiduRewrite;
+		                                if (!needsBaiduRewrite && !needsQuarkDirect && !needsQuarkSaveOnly && !needsProxyBaseRewrite) return payload;
 
 	                                const firstHeaderVal = (v) => String(v || '').split(',')[0].trim();
 	                                const proto = firstHeaderVal(req.headers['x-forwarded-proto']) || String(req.protocol || 'http');
@@ -2960,15 +2971,94 @@ async function loadOneFile(filePath) {
 		                                        continue;
 		                                    }
 
-		                                    if (isQuarkProxy && !directLinkEnabled) {
-		                                        // Proxy mode: ensure Quark proxy URL is client-accessible.
-		                                        rewritten.push(rewriteUrlToBase(absItem));
-		                                        continue;
-		                                    }
+			                                    if (isQuarkProxy && !directLinkEnabled && !needsQuarkSaveOnly) {
+			                                        // Proxy mode: ensure Quark proxy URL is client-accessible.
+			                                        rewritten.push(rewriteUrlToBase(absItem));
+			                                        continue;
+			                                    }
 
-		                                    if (isQuarkProxy && needsQuarkDirect) {
-		                                        // Only rewrite the first (default) playback URL to avoid triggering
-		                                        // multiple expensive resolves for "quality" variants that are typically unused.
+			                                    if (isQuarkProxy && needsQuarkSaveOnly) {
+			                                        // Quark TV mode: trigger Quark "save" (and any required init/cleanup) but keep
+			                                        // the original play payload URL (do not resolve download_url here).
+			                                        const firstUrlIdx = isPairFormat
+			                                            ? 1
+			                                            : (() => {
+			                                                  const httpIdx = data.url.findIndex((v) => typeof v === 'string' && isHttpUrlStr(v));
+			                                                  if (httpIdx >= 0) return httpIdx;
+			                                                  return data.url.findIndex((v) => typeof v === 'string' && v.includes('/proxy/quark/'));
+			                                              })();
+			                                        if (idx === firstUrlIdx) {
+			                                            try {
+			                                                const runtimeCtx = quarkRuntime.ctx || context;
+			                                                const parsedDown = parseQuarkProxyDownUrl(absItem);
+			                                                if (!parsedDown) throw new Error('unrecognized quark proxy url');
+
+			                                                let effectiveHeader = null;
+			                                                try {
+			                                                    const cookieFromDb = findPanCookieInDbJson('quark');
+			                                                    effectiveHeader =
+			                                                        rawHeader && typeof rawHeader === 'object'
+			                                                            ? rawHeader
+			                                                            : cookieFromDb
+			                                                              ? { Cookie: cookieFromDb }
+			                                                              : null;
+			                                                    if (effectiveHeader && cookieFromDb && !effectiveHeader.Cookie && !effectiveHeader.cookie) {
+			                                                        effectiveHeader.Cookie = cookieFromDb;
+			                                                    }
+			                                                    syncCookieFromRawHeader(effectiveHeader);
+			                                                    await maybeInitQuarkDestForCurrentUser(effectiveHeader);
+			                                                    syncQuarkVarsForCurrentUser();
+			                                                    ensureQuarkDestForCurrentUser();
+			                                                } catch (_) {}
+
+			                                                await resolveQuarkDirectUrlCached({
+			                                                    shareId: parsedDown.shareId,
+			                                                    stoken: parsedDown.stoken,
+			                                                    fid: parsedDown.fid,
+			                                                    fidToken: parsedDown.fidToken,
+			                                                    toPdirFid:
+			                                                        context && context.UW && String(context.UW) !== '0'
+			                                                            ? String(context.UW)
+			                                                            : context && context.s8 && String(context.s8) !== '0'
+			                                                              ? String(context.s8)
+			                                                              : runtimeCtx && runtimeCtx.UW && String(runtimeCtx.UW) !== '0'
+			                                                                ? String(runtimeCtx.UW)
+			                                                                : runtimeCtx && runtimeCtx.s8 && String(runtimeCtx.s8) !== '0'
+			                                                                  ? String(runtimeCtx.s8)
+			                                                                  : '0',
+			                                                    rawHeader: effectiveHeader,
+			                                                    scriptContext: runtimeCtx,
+			                                                    want: 'saved_fid',
+			                                                });
+			                                            } catch (e) {
+			                                                const statusRaw =
+			                                                    (e && typeof e.status === 'number' && e.status) ||
+			                                                    (e && e.response && typeof e.response.status === 'number' && e.response.status) ||
+			                                                    (e &&
+			                                                        e.response &&
+			                                                        e.response.data &&
+			                                                        typeof e.response.data.status === 'number' &&
+			                                                        e.response.data.status) ||
+			                                                    0;
+			                                                const status = Number.isFinite(Number(statusRaw)) ? Number(statusRaw) : 0;
+			                                                if (status === 401) {
+			                                                    const err = new Error('夸克登录失效');
+			                                                    err.status = 401;
+			                                                    throw err;
+			                                                }
+			                                                const err = new Error('获取播放地址失败');
+			                                                err.status = status && status >= 400 && status <= 599 ? status : 424;
+			                                                throw err;
+			                                            }
+			                                        }
+
+			                                        rewritten.push(rewriteUrlToBase(absItem));
+			                                        continue;
+			                                    }
+
+			                                    if (isQuarkProxy && needsQuarkDirect) {
+			                                        // Only rewrite the first (default) playback URL to avoid triggering
+			                                        // multiple expensive resolves for "quality" variants that are typically unused.
 	                                            const firstUrlIdx = isPairFormat
 	                                                ? 1
 	                                                : (() => {
