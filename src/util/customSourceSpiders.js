@@ -146,7 +146,9 @@ async function quarkResolveDownloadUrlViaApi({ shareId, stoken, fid, fidToken, t
         }
         if (!res.ok) {
             const msg = (data && (data.message || data.msg)) || text || `status=${res.status}`;
-            throw new Error(`quark http ${res.status}: ${String(msg).slice(0, 300)}`);
+            const err = new Error(`quark http ${res.status}: ${String(msg).slice(0, 300)}`);
+            err.status = res.status;
+            throw err;
         }
         if (data && typeof data === 'object' && 'code' in data && Number(data.code) !== 0) {
             throw new Error(`quark api code=${data.code} message=${String(data.message || '').slice(0, 300)}`);
@@ -165,7 +167,9 @@ async function quarkResolveDownloadUrlViaApi({ shareId, stoken, fid, fidToken, t
         }
         if (!res.ok) {
             const msg = (data && (data.message || data.msg)) || text || `status=${res.status}`;
-            throw new Error(`quark http ${res.status}: ${String(msg).slice(0, 300)}`);
+            const err = new Error(`quark http ${res.status}: ${String(msg).slice(0, 300)}`);
+            err.status = res.status;
+            throw err;
         }
         if (data && typeof data === 'object' && 'code' in data && Number(data.code) !== 0) {
             throw new Error(`quark api code=${data.code} message=${String(data.message || '').slice(0, 300)}`);
@@ -2855,11 +2859,43 @@ async function loadOneFile(filePath) {
 	                                const directLinkEnabled = !!(cfg && cfg.directLinkEnabled);
 	                                const needsBaiduRewrite = hasBaidu && !directLinkEnabled;
 	                                const needsQuarkDirect = hasQuark && directLinkEnabled;
-	                                if (!needsBaiduRewrite && !needsQuarkDirect) return payload;
+	                                // In proxy mode (directLinkEnabled=false), we should still rewrite proxy URLs to a
+	                                // client-accessible base (avoid returning 0.0.0.0:3006 / localhost).
+	                                const needsProxyBaseRewrite = !directLinkEnabled && (needsBaiduRewrite || hasQuark);
+	                                if (!needsBaiduRewrite && !needsQuarkDirect && !needsProxyBaseRewrite) return payload;
 
-	                                const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http');
-	                                const host = String(req.headers['x-forwarded-host'] || req.headers.host || '');
+	                                const firstHeaderVal = (v) => String(v || '').split(',')[0].trim();
+	                                const proto = firstHeaderVal(req.headers['x-forwarded-proto']) || String(req.protocol || 'http');
+	                                const host =
+	                                    firstHeaderVal(req.headers['x-forwarded-host']) ||
+	                                    firstHeaderVal(req.headers['x-original-host']) ||
+	                                    firstHeaderVal(req.headers.host);
 	                                const baseFromReq = host ? `${proto}://${host}`.replace(/\/+$/g, '') : '';
+	                                const proxyBase = cfg && cfg.rewriteBase ? String(cfg.rewriteBase || '').trim() : '';
+	                                const baseForProxy = proxyBase || baseFromReq;
+	                                const isLocalHost = (hn) => {
+	                                    const h = String(hn || '').toLowerCase();
+	                                    return h === '0.0.0.0' || h === '127.0.0.1' || h === 'localhost' || h === '::1';
+	                                };
+	                                const rewriteUrlToBase = (urlStr) => {
+	                                    const base = baseForProxy;
+	                                    if (!base) return urlStr;
+	                                    const raw = typeof urlStr === 'string' ? urlStr.trim() : '';
+	                                    if (!raw) return urlStr;
+	                                    const isAbs = /^https?:\/\//i.test(raw);
+	                                    try {
+	                                        const u = isAbs ? new URL(raw) : new URL(raw.replace(/^\//, ''), `${base}/`);
+	                                        if (!isAbs) return u.toString();
+	                                        if (!isLocalHost(u.hostname)) return raw;
+	                                        const b = new URL(base);
+	                                        const next = new URL(String(u.pathname || '/').replace(/^\//, ''), `${b.toString().replace(/\/+$/g, '')}/`);
+	                                        next.search = u.search || '';
+	                                        next.hash = u.hash || '';
+	                                        return next.toString();
+	                                    } catch (_) {
+	                                        return urlStr;
+	                                    }
+	                                };
 
 	                                const next = { ...data };
 	                                const rewritten = [];
@@ -2910,23 +2946,29 @@ async function loadOneFile(filePath) {
 		                                    const hn = String(parsed.hostname || '').toLowerCase();
 		                                    const isBaidu = hn && (hn.endsWith('.baidupcs.com') || hn === 'baidupcs.com');
 		                                    const isQuarkProxy = parsed.pathname && parsed.pathname.includes('/proxy/quark/');
-	                                    if (isBaidu && needsBaiduRewrite) {
-	                                        const token = putBaiduProxyEntry(
-	                                            item,
-	                                            rawHeader && typeof rawHeader === 'object' ? rawHeader : ua ? { 'User-Agent': ua } : {}
-	                                        );
-	                                        const base = cfg.rewriteBase || baseFromReq;
-	                                        if (!base) {
-	                                            rewritten.push(item);
-	                                            continue;
-	                                        }
-	                                        rewritten.push(`${base}/spider/proxy/baidu/${token}`);
-	                                        continue;
-	                                    }
+		                                    if (isBaidu && needsBaiduRewrite) {
+		                                        const token = putBaiduProxyEntry(
+		                                            item,
+		                                            rawHeader && typeof rawHeader === 'object' ? rawHeader : ua ? { 'User-Agent': ua } : {}
+		                                        );
+		                                        const base = baseForProxy;
+		                                        if (!base) {
+		                                            rewritten.push(item);
+		                                            continue;
+		                                        }
+		                                        rewritten.push(`${base}/spider/proxy/baidu/${token}`);
+		                                        continue;
+		                                    }
+
+		                                    if (isQuarkProxy && !directLinkEnabled) {
+		                                        // Proxy mode: ensure Quark proxy URL is client-accessible.
+		                                        rewritten.push(rewriteUrlToBase(absItem));
+		                                        continue;
+		                                    }
 
 		                                    if (isQuarkProxy && needsQuarkDirect) {
-	                                        // Only rewrite the first (default) playback URL to avoid triggering
-	                                        // multiple expensive resolves for "quality" variants that are typically unused.
+		                                        // Only rewrite the first (default) playback URL to avoid triggering
+		                                        // multiple expensive resolves for "quality" variants that are typically unused.
 	                                            const firstUrlIdx = isPairFormat
 	                                                ? 1
 	                                                : (() => {
@@ -2973,11 +3015,11 @@ async function loadOneFile(filePath) {
                                                     isPairFormat,
                                                 });
                                             }
-                                            const directUrl = await resolveQuarkDirectUrlCached({
-                                                shareId: parsedDown.shareId,
-                                                stoken: parsedDown.stoken,
-                                                fid: parsedDown.fid,
-                                                fidToken: parsedDown.fidToken,
+	                                            const directUrl = await resolveQuarkDirectUrlCached({
+	                                                shareId: parsedDown.shareId,
+	                                                stoken: parsedDown.stoken,
+	                                                fid: parsedDown.fid,
+	                                                fidToken: parsedDown.fidToken,
                                                 toPdirFid:
                                                     context && context.UW && String(context.UW) !== '0'
                                                         ? String(context.UW)
@@ -2988,9 +3030,15 @@ async function loadOneFile(filePath) {
                                                             : runtimeCtx && runtimeCtx.s8 && String(runtimeCtx.s8) !== '0'
                                                               ? String(runtimeCtx.s8)
                                                               : '0',
-                                                rawHeader: effectiveHeader,
-                                                scriptContext: runtimeCtx,
-                                            });
+	                                                rawHeader: effectiveHeader,
+	                                                scriptContext: runtimeCtx,
+	                                            });
+	                                            if (!directUrl || !String(directUrl).trim()) {
+	                                                const err = new Error('获取播放地址失败');
+	                                                // Not a CatPawOpen service outage; usually cookie/login/params.
+	                                                err.status = 424;
+	                                                throw err;
+	                                            }
                                             if (QUARK_DEBUG) {
                                                 let host = '';
                                                 try {
@@ -3000,32 +3048,54 @@ async function loadOneFile(filePath) {
                                                 }
                                                 quarkLog('rewrite done', { host, ok: !!directUrl });
                                             }
-                                            rewritten.push(directUrl || item);
-                                            continue;
-                                        } catch (e) {
-                                            if (QUARK_DEBUG) quarkLog('rewrite failed', String((e && e.message) || e || 'unknown').slice(0, 300));
-                                            // Best-effort: if resolve fails, keep the original proxy URL so playback still works.
-	                                            rewritten.push(item);
+	                                            rewritten.push(String(directUrl).trim());
 	                                            continue;
-	                                        }
-	                                    }
+	                                        } catch (e) {
+	                                            if (QUARK_DEBUG) quarkLog('rewrite failed', String((e && e.message) || e || 'unknown').slice(0, 300));
+	                                            const statusRaw =
+	                                                (e && typeof e.status === 'number' && e.status) ||
+	                                                (e && e.response && typeof e.response.status === 'number' && e.response.status) ||
+	                                                (e && e.response && e.response.data && typeof e.response.data.status === 'number' && e.response.data.status) ||
+	                                                0;
+	                                            const status = Number.isFinite(Number(statusRaw)) ? Number(statusRaw) : 0;
+	                                            if (status === 401) {
+	                                                const err = new Error('夸克登录失效');
+	                                                err.status = 401;
+	                                                throw err;
+	                                            }
+	                                            const err = new Error('获取播放地址失败');
+	                                            err.status = status && status >= 400 && status <= 599 ? status : 424;
+	                                            throw err;
+		                                        }
+		                                    }
 
 	                                    rewritten.push(item);
 	                                }
 	                                next.url = rewritten;
 
-	                                return JSON.stringify(next);
-	                            } catch (e) {
-	                                try {
-	                                    reply.code(502);
-                                } catch (_) {}
-                                const msg = e && e.message ? String(e.message) : String(e || 'unknown');
-                                return JSON.stringify({
-                                    statusCode: 502,
-                                    error: 'Bad Gateway',
-                                    message: `Play rewrite failed: ${msg.slice(0, 400)}`,
-                                });
-                            }
+		                                return JSON.stringify(next);
+		                            } catch (e) {
+		                                try {
+		                                    const statusRaw =
+		                                        (e && typeof e.status === 'number' && e.status) ||
+		                                        (e && e.response && typeof e.response.status === 'number' && e.response.status) ||
+		                                        (e && e.response && e.response.data && typeof e.response.data.status === 'number' && e.response.data.status) ||
+		                                        0;
+		                                    const status = Number.isFinite(Number(statusRaw)) ? Number(statusRaw) : 0;
+		                                    reply.code(status && status >= 400 && status <= 599 ? status : 502);
+	                                } catch (_) {}
+	                                const statusRaw =
+	                                    (e && typeof e.status === 'number' && e.status) ||
+	                                    (e && e.response && typeof e.response.status === 'number' && e.response.status) ||
+	                                    (e && e.response && e.response.data && typeof e.response.data.status === 'number' && e.response.data.status) ||
+	                                    0;
+	                                const status = Number.isFinite(Number(statusRaw)) ? Number(statusRaw) : 0;
+	                                const outStatus = status && status >= 400 && status <= 599 ? status : 424;
+	                                const msg = e && e.message ? String(e.message) : '获取播放地址失败';
+	                                const error =
+	                                    outStatus === 401 ? 'Unauthorized' : outStatus >= 500 ? 'Bad Gateway' : 'Failed Dependency';
+	                                return JSON.stringify({ statusCode: outStatus, error, message: msg.slice(0, 400) });
+	                            }
                         });
                     }
 
