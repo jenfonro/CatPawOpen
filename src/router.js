@@ -26,18 +26,24 @@ function normalizeHttpBase(value) {
     }
 }
 
-function normalizeGoProxyServers(value) {
-    const list = Array.isArray(value) ? value : [];
-    const out = [];
-    const seen = new Set();
-    for (const it of list) {
-        const base = normalizeHttpBase(it && typeof it.base === 'string' ? it.base : '');
-        if (!base || seen.has(base)) continue;
-        const pans = it && typeof it.pans === 'object' && it.pans ? it.pans : {};
-        out.push({ base, pans: { baidu: !!pans.baidu, quark: !!pans.quark } });
-        seen.add(base);
+function readPassthroughFromConfigRoot(root) {
+    const cfg = root && typeof root === 'object' && !Array.isArray(root) ? root : {};
+    const panPassthrough =
+        cfg && cfg.panPassthrough && typeof cfg.panPassthrough === 'object' && !Array.isArray(cfg.panPassthrough)
+            ? cfg.panPassthrough
+            : null;
+    if (panPassthrough && Object.prototype.hasOwnProperty.call(panPassthrough, 'enabled')) {
+        return { enabled: !!panPassthrough.enabled };
     }
-    return out;
+
+    // Backward-compat: map legacy per-pan switches to one global toggle.
+    const intercept =
+        cfg && cfg.interceptPans && typeof cfg.interceptPans === 'object' && !Array.isArray(cfg.interceptPans)
+            ? cfg.interceptPans
+            : null;
+    if (intercept) return { enabled: !!intercept.baidu || !!intercept.quark };
+
+    return { enabled: true };
 }
 
 function getConfigJsonPath() {
@@ -184,7 +190,7 @@ async function loadSpidersFromFiles(filePaths, options = {}) {
  * @return {Promise<void>} - A Promise that resolves when the router is initialized
  */
 export default async function router(fastify) {
-    // Load persisted settings (proxy / goproxy) from config.json on startup.
+    // Load persisted settings (proxy / passthrough) from config.json on startup.
     try {
         const cfgPath = getConfigJsonPath();
         const root = readConfigJsonSafe(cfgPath);
@@ -453,56 +459,33 @@ export default async function router(fastify) {
         }
     });
 
-    // GoProxy settings are synced from TV_Server dashboard by the browser client, and persisted here
-    // only to avoid config drift when switching CatPawOpen instances.
-    // IMPORTANT: CatPawOpen never communicates with go_proxy.
-    fastify.get('/admin/goproxy', async function (_request, reply) {
+    fastify.get('/admin/passthrough', async function (_request, reply) {
         const cfgPath = getConfigJsonPath();
         const root = readConfigJsonSafe(cfgPath);
-        const goProxy = root && root.goProxy && typeof root.goProxy === 'object' ? root.goProxy : {};
-        const servers = normalizeGoProxyServers(goProxy && goProxy.servers);
-        const interceptRaw = root && root.interceptPans && typeof root.interceptPans === 'object' ? root.interceptPans : {};
-        return reply.send({
-            success: true,
-            goProxy: {
-                enabled: !!(goProxy && goProxy.enabled),
-                autoSelect: !!(goProxy && goProxy.autoSelect),
-                servers,
-            },
-            interceptPans: { baidu: !!interceptRaw.baidu, quark: !!interceptRaw.quark },
-        });
+        return reply.send({ success: true, passthrough: readPassthroughFromConfigRoot(root) });
     });
 
-    fastify.put('/admin/goproxy', async function (request, reply) {
+    fastify.put('/admin/passthrough', async function (request, reply) {
         const body = request && request.body && typeof request.body === 'object' ? request.body : {};
         const cfgPath = getConfigJsonPath();
         const prev = readConfigJsonSafe(cfgPath);
-        const prevGoProxy = prev && prev.goProxy && typeof prev.goProxy === 'object' ? prev.goProxy : {};
-        const prevIntercept =
-            prev && prev.interceptPans && typeof prev.interceptPans === 'object' ? prev.interceptPans : {};
+        const prevPassthrough = readPassthroughFromConfigRoot(prev);
 
         const hasEnabled = Object.prototype.hasOwnProperty.call(body, 'enabled');
-        const hasAutoSelect = Object.prototype.hasOwnProperty.call(body, 'autoSelect');
-        const hasServers = Object.prototype.hasOwnProperty.call(body, 'servers');
-        const enabled = hasEnabled ? !!body.enabled : !!prevGoProxy.enabled;
-        const autoSelect = hasAutoSelect ? !!body.autoSelect : !!prevGoProxy.autoSelect;
-        const servers = hasServers ? normalizeGoProxyServers(body.servers) : normalizeGoProxyServers(prevGoProxy.servers);
-        const interceptFromBody =
-            body && typeof body.interceptPans === 'object' && body.interceptPans ? body.interceptPans : null;
-        const interceptPans = interceptFromBody
-            ? { baidu: !!interceptFromBody.baidu, quark: !!interceptFromBody.quark }
-            : { baidu: !!prevIntercept.baidu, quark: !!prevIntercept.quark };
+        const enabled = hasEnabled ? !!body.enabled : !!prevPassthrough.enabled;
 
         const next = {
             ...prev,
-            goProxy: {
-                ...(prevGoProxy && typeof prevGoProxy === 'object' ? prevGoProxy : {}),
+            panPassthrough: {
+                ...(prev && prev.panPassthrough && typeof prev.panPassthrough === 'object' ? prev.panPassthrough : {}),
                 enabled,
-                autoSelect,
-                servers,
             },
-            interceptPans,
         };
+
+        try {
+            delete next.interceptPans;
+            delete next.goProxy;
+        } catch (_) {}
 
         try {
             writeConfigJsonSafe(cfgPath, next);
@@ -511,11 +494,7 @@ export default async function router(fastify) {
             return reply.code(500).send({ success: false, message: msg });
         }
 
-        return reply.send({
-            success: true,
-            goProxy: { enabled, autoSelect, servers },
-            interceptPans,
-        });
+        return reply.send({ success: true, passthrough: { enabled } });
     });
 
     const spiders = mergeSpiders(effectiveBaseSpiders, customSpiders);

@@ -34,7 +34,7 @@ let dbJsonCache = {
     path: '',
 };
 
-const interceptConfigState = {
+const passthroughConfigState = {
     ts: 0,
     config: null,
 };
@@ -64,37 +64,36 @@ function normalizeHttpBase(value) {
     }
 }
 
-function getInterceptConfig() {
+function getPassthroughConfig() {
     const now = Date.now();
-    if (interceptConfigState.config && now - interceptConfigState.ts < 1000) return interceptConfigState.config;
+    if (passthroughConfigState.config && now - passthroughConfigState.ts < 1000) return passthroughConfigState.config;
 
     // CatPawOpen/src/util/customSourceSpiders.js -> CatPawOpen/config.json
     const here = path.dirname(fileURLToPath(import.meta.url));
     const cfgPath = path.resolve(here, '..', '..', 'config.json');
 
-    let cfg = { goProxyEnabled: false, rewriteBase: '', interceptPans: { baidu: true, quark: false } };
+    let cfg = { passthroughEnabled: true, rewriteBase: '' };
     try {
         if (fs.existsSync(cfgPath)) {
             const raw = fs.readFileSync(cfgPath, 'utf8');
             const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
             const root = parsed && typeof parsed === 'object' ? parsed : null;
-            const goProxy = root && root.goProxy && typeof root.goProxy === 'object' ? root.goProxy : null;
+            const panPassthrough =
+                root && root.panPassthrough && typeof root.panPassthrough === 'object' ? root.panPassthrough : null;
             const interceptRaw =
                 root && root.interceptPans && typeof root.interceptPans === 'object' ? root.interceptPans : null;
+            const passthroughEnabled = panPassthrough && Object.prototype.hasOwnProperty.call(panPassthrough, 'enabled')
+                ? !!panPassthrough.enabled
+                : interceptRaw
+                  ? !!interceptRaw.baidu || !!interceptRaw.quark
+                  : true;
 
-            cfg = {
-                goProxyEnabled: !!(goProxy && goProxy.enabled),
-                rewriteBase: normalizeHttpBase(root && root.rewriteBase),
-                interceptPans: {
-                    baidu: interceptRaw ? !!interceptRaw.baidu : true,
-                    quark: interceptRaw ? !!interceptRaw.quark : false,
-                },
-            };
+            cfg = { passthroughEnabled, rewriteBase: normalizeHttpBase(root && root.rewriteBase) };
         }
     } catch (_) {}
 
-    interceptConfigState.ts = now;
-    interceptConfigState.config = cfg;
+    passthroughConfigState.ts = now;
+    passthroughConfigState.config = cfg;
     return cfg;
 }
 
@@ -2856,19 +2855,11 @@ async function loadOneFile(filePath) {
 	                                const rawHeader = data.header && typeof data.header === 'object' ? data.header : null;
 	                                const ua = rawHeader && rawHeader['User-Agent'] ? String(rawHeader['User-Agent']) : '';
 
-	                                const cfg = getInterceptConfig();
-	                                const shouldInterceptBaidu = !!(cfg && cfg.interceptPans && cfg.interceptPans.baidu);
-	                                const shouldInterceptQuark = !!(cfg && cfg.interceptPans && cfg.interceptPans.quark);
-	                                const needsBaiduRewrite = hasBaidu && shouldInterceptBaidu && !cfg.goProxyEnabled;
-	                                // For Quark:
-	                                // - intercept ON + goProxy ON  => return direct download_url for browser->go_proxy register (proxyHint=true)
-	                                // - intercept OFF             => return direct download_url (proxyHint missing)
-	                                // - intercept ON + goProxy OFF=> keep CatPawOpen proxy URL
-	                                const needsQuarkDirect = hasQuark && (cfg.goProxyEnabled || !shouldInterceptQuark);
-	                                const needsProxyHint =
-	                                    !!cfg.goProxyEnabled &&
-	                                    ((hasBaidu && shouldInterceptBaidu) || (hasQuark && shouldInterceptQuark));
-	                                if (!needsBaiduRewrite && !needsQuarkDirect && !needsProxyHint) return payload;
+	                                const cfg = getPassthroughConfig();
+	                                const passthroughEnabled = !!(cfg && cfg.passthroughEnabled);
+	                                const needsBaiduRewrite = hasBaidu && passthroughEnabled;
+	                                const needsQuarkDirect = hasQuark && !passthroughEnabled;
+	                                if (!needsBaiduRewrite && !needsQuarkDirect) return payload;
 
 	                                const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http');
 	                                const host = String(req.headers['x-forwarded-host'] || req.headers.host || '');
@@ -3011,7 +3002,6 @@ async function loadOneFile(filePath) {
 	                                    rewritten.push(item);
 	                                }
 	                                next.url = rewritten;
-	                                if (needsProxyHint) next.proxyHint = true;
 
 	                                return JSON.stringify(next);
 	                            } catch (e) {
