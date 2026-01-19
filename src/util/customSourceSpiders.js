@@ -2988,33 +2988,66 @@ async function loadOneFile(filePath) {
 			                                                  return data.url.findIndex((v) => typeof v === 'string' && v.includes('/proxy/quark/'));
 			                                              })();
 			                                        if (idx === firstUrlIdx) {
-			                                            try {
-			                                                const runtimeCtx = quarkRuntime.ctx || context;
-			                                                const parsedDown = parseQuarkProxyDownUrl(absItem);
-			                                                if (!parsedDown) throw new Error('unrecognized quark proxy url');
+				                                                try {
+				                                                    const runtimeCtx = quarkRuntime.ctx || context;
+				                                                    const parsedDown = parseQuarkProxyDownUrl(absItem);
+				                                                    if (!parsedDown) throw new Error('unrecognized quark proxy url');
 
-			                                                let effectiveHeader = null;
-			                                                try {
-			                                                    const cookieFromDb = findPanCookieInDbJson('quark');
-			                                                    effectiveHeader =
-			                                                        rawHeader && typeof rawHeader === 'object'
-			                                                            ? rawHeader
-			                                                            : cookieFromDb
-			                                                              ? { Cookie: cookieFromDb }
-			                                                              : null;
-			                                                    if (effectiveHeader && cookieFromDb && !effectiveHeader.Cookie && !effectiveHeader.cookie) {
-			                                                        effectiveHeader.Cookie = cookieFromDb;
-			                                                    }
-			                                                    syncCookieFromRawHeader(effectiveHeader);
-			                                                    await maybeInitQuarkDestForCurrentUser(effectiveHeader);
-			                                                    syncQuarkVarsForCurrentUser();
-			                                                    ensureQuarkDestForCurrentUser();
-			                                                } catch (_) {}
+				                                                    let effectiveHeader = null;
+				                                                    try {
+				                                                        const cookieFromDb = findPanCookieInDbJson('quark');
+				                                                        effectiveHeader =
+				                                                            rawHeader && typeof rawHeader === 'object'
+				                                                                ? rawHeader
+				                                                                : cookieFromDb
+				                                                                  ? { Cookie: cookieFromDb }
+				                                                                  : null;
+				                                                        if (effectiveHeader && cookieFromDb && !effectiveHeader.Cookie && !effectiveHeader.cookie) {
+				                                                            effectiveHeader.Cookie = cookieFromDb;
+				                                                        }
+				                                                        syncCookieFromRawHeader(effectiveHeader);
+				                                                        await maybeInitQuarkDestForCurrentUser(effectiveHeader);
+				                                                        syncQuarkVarsForCurrentUser();
+				                                                        ensureQuarkDestForCurrentUser();
+				                                                    } catch (_) {}
 
-			                                                await resolveQuarkDirectUrlCached({
-			                                                    shareId: parsedDown.shareId,
-			                                                    stoken: parsedDown.stoken,
-			                                                    fid: parsedDown.fid,
+				                                                    // Quark TV mode expects a "clear + save" flow. The bundled script's `MBe()`
+				                                                    // performs the self-check/refresh cleanup in the configured destination folder.
+				                                                    // We call it best-effort here (it is guarded to skip when s8 is missing/0).
+				                                                    try {
+				                                                        const initFn =
+				                                                            runtimeCtx && typeof runtimeCtx.fKt === 'function'
+				                                                                ? runtimeCtx.fKt
+				                                                                : context && typeof context.fKt === 'function'
+				                                                                  ? context.fKt
+				                                                                  : null;
+				                                                        if (initFn) {
+				                                                            await initFn();
+				                                                            try {
+				                                                                ensureQuarkDestForCurrentUser();
+				                                                            } catch (_) {}
+				                                                        }
+				                                                    } catch (_) {}
+
+				                                                    try {
+				                                                        const clearFn =
+				                                                            runtimeCtx && typeof runtimeCtx.MBe === 'function'
+				                                                                ? runtimeCtx.MBe
+				                                                                : context && typeof context.MBe === 'function'
+				                                                                  ? context.MBe
+				                                                                  : null;
+				                                                        if (clearFn) {
+				                                                            await clearFn();
+				                                                            try {
+				                                                                ensureQuarkDestForCurrentUser();
+				                                                            } catch (_) {}
+				                                                        }
+				                                                    } catch (_) {}
+
+				                                                    await resolveQuarkDirectUrlCached({
+				                                                        shareId: parsedDown.shareId,
+				                                                        stoken: parsedDown.stoken,
+				                                                        fid: parsedDown.fid,
 			                                                    fidToken: parsedDown.fidToken,
 			                                                    toPdirFid:
 			                                                        context && context.UW && String(context.UW) !== '0'
