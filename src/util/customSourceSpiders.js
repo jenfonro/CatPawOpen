@@ -546,6 +546,19 @@ async function quarkResolveDownloadUrlViaApi({ shareId, stoken, fid, fidToken, t
 
     log('task ok', { savedFid: mask(savedFid), savedFidToken: mask(savedFidToken) });
 
+    try {
+        rememberQuarkSavedFile({
+            shareId: pwdId,
+            stoken: sToken,
+            fid: fId,
+            fidToken: fToken,
+            toPdirFid: toPdir,
+            rawHeader,
+            savedFid,
+            savedFidToken,
+        });
+    } catch (_) {}
+
     if (wantMode === 'saved_fid') return savedFid;
 
     let wktFailureHint = '';
@@ -784,6 +797,12 @@ const quarkDirectUrlCache = {
     maxEntries: 200,
 };
 
+const quarkSavedFileCache = {
+    map: new Map(), // key -> { ts, fid, token }
+    maxEntries: 300,
+    ttlMs: 10 * 60 * 1000,
+};
+
 function pruneQuarkDirectUrlCache() {
     const now = Date.now();
     for (const [key, entry] of quarkDirectUrlCache.map.entries()) {
@@ -802,6 +821,24 @@ function pruneQuarkDirectUrlCache() {
     for (let i = 0; i < overflow; i += 1) quarkDirectUrlCache.map.delete(items[i][0]);
 }
 
+function pruneQuarkSavedFileCache() {
+    const now = Date.now();
+    for (const [key, entry] of quarkSavedFileCache.map.entries()) {
+        if (!entry || typeof entry !== 'object') {
+            quarkSavedFileCache.map.delete(key);
+            continue;
+        }
+        const ts = typeof entry.ts === 'number' ? entry.ts : 0;
+        if (!ts || now - ts > quarkSavedFileCache.ttlMs) quarkSavedFileCache.map.delete(key);
+    }
+    if (quarkSavedFileCache.map.size <= quarkSavedFileCache.maxEntries) return;
+    const items = Array.from(quarkSavedFileCache.map.entries()).sort(
+        (a, b) => (a[1] && a[1].ts ? a[1].ts : 0) - (b[1] && b[1].ts ? b[1].ts : 0)
+    );
+    const overflow = items.length - quarkSavedFileCache.maxEntries;
+    for (let i = 0; i < overflow; i += 1) quarkSavedFileCache.map.delete(items[i][0]);
+}
+
 function getQuarkAuthKey(rawHeader) {
     const raw = rawHeader && typeof rawHeader === 'object' ? rawHeader : {};
     const cookie = raw.Cookie || raw.cookie || '';
@@ -813,6 +850,226 @@ function getQuarkAuthKey(rawHeader) {
     } catch (_) {
         return '';
     }
+}
+
+function getQuarkSavedFileKey({ shareId, stoken, fid, fidToken, toPdirFid, rawHeader }) {
+    const authKey = getQuarkAuthKey(rawHeader);
+    const fromFile = quarkRuntime.fromFile || '';
+    return [
+        'quark_saved',
+        String(shareId || ''),
+        String(stoken || ''),
+        String(fid || ''),
+        String(fidToken || ''),
+        String(toPdirFid || ''),
+        authKey,
+        fromFile,
+    ].join('|');
+}
+
+function rememberQuarkSavedFile({ shareId, stoken, fid, fidToken, toPdirFid, rawHeader, savedFid, savedFidToken }) {
+    pruneQuarkSavedFileCache();
+    const sf = String(savedFid || '').trim();
+    if (!sf) return;
+    const key = getQuarkSavedFileKey({ shareId, stoken, fid, fidToken, toPdirFid, rawHeader });
+    quarkSavedFileCache.map.set(key, { ts: Date.now(), fid: sf, token: String(savedFidToken || '').trim() });
+}
+
+function getRememberedQuarkSavedFile({ shareId, stoken, fid, fidToken, toPdirFid, rawHeader }) {
+    pruneQuarkSavedFileCache();
+    const key = getQuarkSavedFileKey({ shareId, stoken, fid, fidToken, toPdirFid, rawHeader });
+    const entry = quarkSavedFileCache.map.get(key);
+    if (!entry || typeof entry !== 'object') return null;
+    const ts = typeof entry.ts === 'number' ? entry.ts : 0;
+    if (!ts || Date.now() - ts > quarkSavedFileCache.ttlMs) return null;
+    const savedFid = String(entry.fid || '').trim();
+    if (!savedFid) return null;
+    return { fid: savedFid, token: String(entry.token || '').trim() };
+}
+
+async function quarkDownloadUrlFromSavedFileViaApi({ savedFid, savedFidToken, rawHeader, scriptContext }) {
+    const fetchImpl = globalThis.fetch;
+    if (typeof fetchImpl !== 'function') throw new Error('fetch is not available');
+    const QUARK_DEBUG = process.env.CATPAW_QUARK_DEBUG === '1' || process.env.CATPAW_DEBUG === '1';
+    const mask = (v) => {
+        const s = String(v || '').trim();
+        if (!s) return '';
+        if (s.length <= 12) return s;
+        return `${s.slice(0, 6)}...${s.slice(-6)}`;
+    };
+    const log = (...args) => {
+        if (!QUARK_DEBUG) return;
+        // eslint-disable-next-line no-console
+        console.log('[quarkApi]', ...args);
+    };
+
+    const fid = String(savedFid || '').trim();
+    if (!fid) throw new Error('missing saved fid');
+    const token = String(savedFidToken || '').trim();
+
+    const headers = {
+        Accept: 'application/json, text/plain, */*',
+        'Content-Type': 'application/json',
+        Origin: 'https://pan.quark.cn',
+        Referer: 'https://pan.quark.cn',
+    };
+    if (rawHeader && typeof rawHeader === 'object') {
+        const ua = rawHeader['User-Agent'] || rawHeader['user-agent'];
+        const ref = rawHeader.Referer || rawHeader.referer;
+        const ck = rawHeader.Cookie || rawHeader.cookie;
+        const auth = rawHeader.Authorization || rawHeader.authorization;
+        if (typeof ua === 'string' && ua.trim()) headers['User-Agent'] = ua.trim();
+        if (typeof ref === 'string' && ref.trim()) headers.Referer = ref.trim();
+        if (typeof ck === 'string' && ck.trim()) headers.Cookie = ck.trim();
+        if (typeof auth === 'string' && auth.trim()) headers.Authorization = auth.trim();
+    }
+
+    const dlUrl = 'https://drive.quark.cn/1/clouddrive/file/download?pr=ucpro&fr=pc';
+
+    const fetchJsonWithText = async (url, init) => {
+        const res = await fetchImpl(url, { redirect: 'manual', ...init });
+        const text = await res.text();
+        let data;
+        try {
+            data = text && text.trim() ? JSON.parse(text) : null;
+        } catch (_) {
+            data = null;
+        }
+        if (!res.ok) {
+            const msg = (data && (data.message || data.msg)) || text || `status=${res.status}`;
+            const err = new Error(`quark http ${res.status}: ${String(msg).slice(0, 300)}`);
+            err.status = res.status;
+            throw err;
+        }
+        if (data && typeof data === 'object' && 'code' in data && Number(data.code) !== 0) {
+            throw new Error(`quark api code=${data.code} message=${String(data.message || '').slice(0, 300)}`);
+        }
+        return { data, text };
+    };
+
+    const extractDownloadUrl = (root, rawText) => {
+        const isHttpUrl = (s) => {
+            if (typeof s !== 'string') return false;
+            const t = s.trim();
+            if (!t) return false;
+            if (t.startsWith('//')) return true;
+            return /^https?:\/\//i.test(t);
+        };
+        const queue = [root];
+        const seen = new Set();
+        const maxNodes = 5000;
+        let nodes = 0;
+        while (queue.length && nodes < maxNodes) {
+            const v = queue.shift();
+            nodes += 1;
+            if (!v) continue;
+            if (typeof v === 'string') continue;
+            if (typeof v !== 'object') continue;
+            if (seen.has(v)) continue;
+            seen.add(v);
+            if (Array.isArray(v)) {
+                for (const item of v) queue.push(item);
+                continue;
+            }
+            for (const [k, val] of Object.entries(v)) {
+                const key = String(k || '').toLowerCase();
+                if ((key === 'download_url' || key === 'downloadurl' || key.endsWith('_download_url')) && isHttpUrl(val)) {
+                    const t = String(val).trim();
+                    return t.startsWith('//') ? `https:${t}` : t;
+                }
+                if (key.includes('download_url') && isHttpUrl(val)) {
+                    const t = String(val).trim();
+                    return t.startsWith('//') ? `https:${t}` : t;
+                }
+                if (typeof val === 'object' && val) queue.push(val);
+                else if (typeof val === 'string' && key.includes('download_url') && isHttpUrl(val)) {
+                    const t = val.trim();
+                    return t.startsWith('//') ? `https:${t}` : t;
+                }
+            }
+        }
+        if (typeof rawText === 'string' && rawText.includes('download_url')) {
+            const m = rawText.match(/"download_url"\s*:\s*"([^"]+)"/);
+            if (m && isHttpUrl(m[1])) {
+                const t = m[1].trim();
+                return t.startsWith('//') ? `https:${t}` : t;
+            }
+        }
+        return '';
+    };
+
+    const ctxHasWKt = !!(scriptContext && typeof scriptContext.WKt === 'function');
+    const tryWktFallback = async () => {
+        if (!ctxHasWKt) return { url: '', tokenCandidate: '', hint: '' };
+        if (!scriptContext || typeof scriptContext.WKt !== 'function') return { url: '', tokenCandidate: '', hint: '' };
+        const args = [token].map((x) => String(x || '').trim()).filter(Boolean);
+        let lastNonUrl = '';
+        let lastType = '';
+        for (const arg of args) {
+            try {
+                const u = await scriptContext.WKt(arg);
+                lastType = typeof u;
+                if (typeof u === 'string') {
+                    const trimmed = u.trim();
+                    if (trimmed.startsWith('//')) return { url: `https:${trimmed}`, tokenCandidate: '', hint: '' };
+                    if (/^https?:\/\//i.test(trimmed)) return { url: trimmed, tokenCandidate: '', hint: '' };
+                    if (trimmed) lastNonUrl = trimmed;
+                }
+            } catch (e) {
+                lastType = typeof e;
+                lastNonUrl = String((e && e.message) || e || '').slice(0, 120);
+            }
+        }
+        const hint = lastNonUrl ? `WKt returned non-url (${lastType}): ${lastNonUrl}` : '';
+        return { url: '', tokenCandidate: lastNonUrl, hint };
+    };
+
+    const tokenCandidates = [];
+    if (token) tokenCandidates.push(token);
+    tokenCandidates.push('');
+
+    const tryDownloadOnce = async (tkn) => {
+        log('download(saved) try', { fid: mask(fid), token: mask(tkn || '') });
+        const body = { fids: [fid] };
+        if (tkn) {
+            body.file_tokens = [tkn];
+            body.fid_token_list = [tkn];
+        }
+        const { data: dlResp, text } = await fetchJsonWithText(dlUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body),
+        });
+        const url = extractDownloadUrl(dlResp && typeof dlResp === 'object' ? dlResp.data : dlResp, text) || extractDownloadUrl(dlResp, text);
+        if (url) return url;
+        return '';
+    };
+
+    for (const tkn of tokenCandidates) {
+        const url = await tryDownloadOnce(tkn);
+        if (url) return url;
+    }
+
+    const deadline = Date.now() + 8000;
+    let attempt = 0;
+    while (Date.now() < deadline) {
+        const tkn = tokenCandidates[attempt % tokenCandidates.length];
+        attempt += 1;
+        const url = await tryDownloadOnce(tkn);
+        if (url) return url;
+        await new Promise((r) => setTimeout(r, 300));
+    }
+
+    if (ctxHasWKt) {
+        const { url, tokenCandidate } = await tryWktFallback();
+        if (url) return url;
+        if (tokenCandidate) {
+            const url2 = await tryDownloadOnce(tokenCandidate);
+            if (url2) return url2;
+        }
+    }
+
+    throw new Error(`quark download(saved): download_url not found (fid=${fid})`);
 }
 
 async function resolveQuarkDirectUrlCached({
@@ -2882,20 +3139,41 @@ async function loadOneFile(filePath) {
 	                                const data = JSON.parse(raw);
 	                                if (!data || typeof data !== 'object' || !Array.isArray(data.url)) return payload;
 
-	                                const rawHeader = data.header && typeof data.header === 'object' ? data.header : null;
-		                                const ua = rawHeader && rawHeader['User-Agent'] ? String(rawHeader['User-Agent']) : '';
+		                                const rawHeader = data.header && typeof data.header === 'object' ? data.header : null;
+			                                const ua = rawHeader && rawHeader['User-Agent'] ? String(rawHeader['User-Agent']) : '';
 
-		                                const cfg = getDirectLinkConfig();
-		                                const directLinkEnabled = !!(cfg && cfg.directLinkEnabled);
-		                                const needsBaiduRewrite = hasBaidu && !directLinkEnabled;
+			                                const cfg = getDirectLinkConfig();
+			                                const directLinkEnabled = !!(cfg && cfg.directLinkEnabled);
+			                                const needsBaiduRewrite = hasBaidu && !directLinkEnabled;
 		                                const q = req && req.query && typeof req.query === 'object' ? req.query : null;
-		                                const hasQuarkTv =
+		                                const hasQuarkTvParam =
 		                                    !!(q && (Object.prototype.hasOwnProperty.call(q, 'quark_tv') || Object.prototype.hasOwnProperty.call(q, 'quarkTv')));
-		                                const needsQuarkDirect = hasQuark && directLinkEnabled && !hasQuarkTv;
-		                                const needsQuarkSaveOnly = hasQuark && hasQuarkTv;
+		                                const parseBoolish = (v) => {
+		                                    if (typeof v === 'boolean') return v;
+		                                    if (typeof v === 'number') return v !== 0;
+		                                    if (v == null) return null;
+		                                    const s = String(v).trim().toLowerCase();
+		                                    if (!s) return null;
+		                                    if (s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on') return true;
+		                                    if (s === '0' || s === 'false' || s === 'no' || s === 'n' || s === 'off') return false;
+		                                    return null;
+		                                };
+		                                const quarkTvValueRaw = q
+		                                    ? (Object.prototype.hasOwnProperty.call(q, 'quark_tv') ? q.quark_tv : q.quarkTv)
+		                                    : null;
+		                                const quarkTvParsed = hasQuarkTvParam ? parseBoolish(quarkTvValueRaw) : null;
+		                                const quarkTvEnabled = quarkTvParsed === true;
+		                                const quarkTvExplicitOff = quarkTvParsed === false;
+		                                // quark_tv=0 means "resolve direct link" (same as no tv mode param).
+		                                const needsQuarkDirect = hasQuark && directLinkEnabled && !quarkTvEnabled;
+		                                const needsQuarkSaveOnly = hasQuark && quarkTvEnabled;
 		                                // In proxy mode (directLinkEnabled=false), we should still rewrite proxy URLs to a
 		                                // client-accessible base (avoid returning 0.0.0.0:3006 / localhost).
-		                                const needsProxyBaseRewrite = (hasQuark && (!directLinkEnabled || needsQuarkSaveOnly)) || needsBaiduRewrite;
+		                                // But if the caller explicitly asked for `quark_tv=0` and direct-link mode is disabled,
+		                                // return the original payload unchanged (no Quark proxy base rewrite).
+		                                const needsQuarkProxyBaseRewrite =
+		                                    hasQuark && (!directLinkEnabled || needsQuarkSaveOnly) && !(quarkTvExplicitOff && !directLinkEnabled);
+		                                const needsProxyBaseRewrite = needsQuarkProxyBaseRewrite || needsBaiduRewrite;
 		                                if (!needsBaiduRewrite && !needsQuarkDirect && !needsQuarkSaveOnly && !needsProxyBaseRewrite) return payload;
 
 	                                const firstHeaderVal = (v) => String(v || '').split(',')[0].trim();
@@ -3112,7 +3390,7 @@ async function loadOneFile(filePath) {
 			                                        continue;
 			                                    }
 
-			                                    if (isQuarkProxy && needsQuarkDirect) {
+				                                    if (isQuarkProxy && needsQuarkDirect) {
 			                                        // Only rewrite the first (default) playback URL to avoid triggering
 			                                        // multiple expensive resolves for "quality" variants that are typically unused.
 	                                            const firstUrlIdx = isPairFormat
@@ -3127,11 +3405,11 @@ async function loadOneFile(filePath) {
 		                                            continue;
 		                                        }
 
-                                        try {
-                                            const runtimeCtx = quarkRuntime.ctx || context;
+	                                        try {
+	                                            const runtimeCtx = quarkRuntime.ctx || context;
 
-	                                            const parsedDown = parseQuarkProxyDownUrl(absItem);
-	                                            if (!parsedDown) throw new Error('unrecognized quark proxy url');
+		                                            const parsedDown = parseQuarkProxyDownUrl(absItem);
+		                                            if (!parsedDown) throw new Error('unrecognized quark proxy url');
                                             // Do not force Quark init here; it can trigger noisy/slow API calls.
                                             // Only bind per-user variables; the resolver uses explicit API calls below.
                                             let effectiveHeader = null;
@@ -3161,24 +3439,54 @@ async function loadOneFile(filePath) {
                                                     isPairFormat,
                                                 });
                                             }
-	                                            const directUrl = await resolveQuarkDirectUrlCached({
-	                                                shareId: parsedDown.shareId,
-	                                                stoken: parsedDown.stoken,
-	                                                fid: parsedDown.fid,
-	                                                fidToken: parsedDown.fidToken,
-                                                toPdirFid:
-                                                    context && context.UW && String(context.UW) !== '0'
-                                                        ? String(context.UW)
-                                                        : context && context.s8 && String(context.s8) !== '0'
-                                                          ? String(context.s8)
-                                                          : runtimeCtx && runtimeCtx.UW && String(runtimeCtx.UW) !== '0'
-                                                            ? String(runtimeCtx.UW)
-                                                            : runtimeCtx && runtimeCtx.s8 && String(runtimeCtx.s8) !== '0'
-                                                              ? String(runtimeCtx.s8)
-                                                              : '0',
-	                                                rawHeader: effectiveHeader,
-	                                                scriptContext: runtimeCtx,
-	                                            });
+		                                            const toPdirFid =
+		                                                context && context.UW && String(context.UW) !== '0'
+		                                                    ? String(context.UW)
+		                                                    : context && context.s8 && String(context.s8) !== '0'
+		                                                      ? String(context.s8)
+		                                                      : runtimeCtx && runtimeCtx.UW && String(runtimeCtx.UW) !== '0'
+		                                                        ? String(runtimeCtx.UW)
+		                                                        : runtimeCtx && runtimeCtx.s8 && String(runtimeCtx.s8) !== '0'
+		                                                          ? String(runtimeCtx.s8)
+		                                                          : '0';
+
+	                                            // TV fallback: when `quark_tv=0` is explicitly requested, prefer using the
+	                                            // previously-saved file fid (from the `quark_tv=1` save-only flow) to fetch a
+	                                            // direct download_url, instead of re-saving the share (stoken may be single-use).
+	                                            if (quarkTvExplicitOff) {
+	                                                try {
+	                                                    const saved = getRememberedQuarkSavedFile({
+	                                                        shareId: parsedDown.shareId,
+	                                                        stoken: parsedDown.stoken,
+	                                                        fid: parsedDown.fid,
+	                                                        fidToken: parsedDown.fidToken,
+	                                                        toPdirFid,
+	                                                        rawHeader: effectiveHeader,
+	                                                    });
+	                                                    if (saved && saved.fid) {
+	                                                        const url3 = await quarkDownloadUrlFromSavedFileViaApi({
+	                                                            savedFid: saved.fid,
+	                                                            savedFidToken: saved.token,
+	                                                            rawHeader: effectiveHeader,
+	                                                            scriptContext: runtimeCtx,
+	                                                        });
+	                                                        if (url3 && String(url3).trim()) {
+	                                                            rewritten.push(String(url3).trim());
+	                                                            continue;
+	                                                        }
+	                                                    }
+	                                                } catch (_) {}
+	                                            }
+
+		                                            const directUrl = await resolveQuarkDirectUrlCached({
+		                                                shareId: parsedDown.shareId,
+		                                                stoken: parsedDown.stoken,
+		                                                fid: parsedDown.fid,
+		                                                fidToken: parsedDown.fidToken,
+	                                                toPdirFid,
+		                                                rawHeader: effectiveHeader,
+		                                                scriptContext: runtimeCtx,
+		                                            });
 	                                            if (!directUrl || !String(directUrl).trim()) {
 	                                                const err = new Error('获取播放地址失败');
 	                                                // Not a CatPawOpen service outage; usually cookie/login/params.
