@@ -28,7 +28,7 @@ Build `npm run build`
 
 ### Custom Source 站点（custom_source）
 
-- 将自定义站点脚本放到：`CatPawOpen/src/custom_spider/`
+- 将自定义站点脚本放到：`CatPawOpen/custom_spider/`
 - 启动时会加载该目录下所有 `.js`（忽略 `_` 开头文件）
 - 查看加载状态：`/custom_source`
 

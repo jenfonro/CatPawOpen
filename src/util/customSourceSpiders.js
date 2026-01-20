@@ -1672,13 +1672,10 @@ function collectSpidersDeep(seedValues) {
 
 function resolveCustomSourceDirCandidates() {
     const candidates = [];
-    // New location: load all custom spiders from project `src/custom_spider/`
-    candidates.push(path.resolve(process.cwd(), 'src/custom_spider'));
-    // Prefer an external writable root when packaged by pkg.
     const externalRoot = getExternalRootDir();
-    if (externalRoot) candidates.push(path.resolve(externalRoot, 'src/custom_spider'));
-    // Fallback: use embedded bundle root (works for dist/ and pkg snapshots).
-    candidates.push(path.resolve(getEmbeddedRootDir(), 'src/custom_spider'));
+    if (externalRoot) candidates.push(path.resolve(externalRoot, 'custom_spider'));
+    candidates.push(path.resolve(getEmbeddedRootDir(), 'custom_spider'));
+    candidates.push(path.resolve(process.cwd(), 'custom_spider'));
     return Array.from(new Set(candidates.filter(Boolean)));
 }
 
@@ -3633,9 +3630,9 @@ async function loadOneFile(filePath) {
 export async function loadCustomSourceSpiders() {
     const dirCandidates = resolveCustomSourceDirCandidates();
     const dirPath = dirCandidates.find((p) => p && fs.existsSync(p)) || (dirCandidates[0] || '');
-    if (!dirPath || !fs.existsSync(dirPath)) {
+    if (!dirPath) {
         cache = {
-            dirPath: dirPath || '',
+            dirPath: '',
             files: [],
             spiders: [],
             errors: { _dir: 'custom_spider not found' },
@@ -3647,8 +3644,31 @@ export async function loadCustomSourceSpiders() {
             websiteErrors: { _dir: 'custom_spider not found' },
             websiteByFile: {},
         };
-        console.warn(`[customSpider] dir not found: ${dirPath || '(empty)'}`);
+        console.warn('[customSpider] dir not found: (empty)');
         return [];
+    }
+
+    if (!fs.existsSync(dirPath)) {
+        try {
+            fs.mkdirSync(dirPath, { recursive: true });
+        } catch (err) {
+            const msg = (err && err.message) || String(err);
+            cache = {
+                dirPath,
+                files: [],
+                spiders: [],
+                errors: { _dir: `custom_spider mkdir failed: ${msg}` },
+                byFile: {},
+                webPlugins: [],
+                webErrors: { _dir: `custom_spider mkdir failed: ${msg}` },
+                webByFile: {},
+                websiteBundles: [],
+                websiteErrors: { _dir: `custom_spider mkdir failed: ${msg}` },
+                websiteByFile: {},
+            };
+            console.warn(`[customSpider] mkdir failed: ${dirPath} error=${msg}`);
+            return [];
+        }
     }
 
     const filePaths = listJsFiles(dirPath);
