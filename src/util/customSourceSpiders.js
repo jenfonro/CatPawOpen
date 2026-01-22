@@ -1505,6 +1505,64 @@ function findPanCookieInDbJson(panKey) {
     cookie = tryGet(root, ['config', pan, 'ck']);
     if (cookie) return cookie;
 
+    // Common "token-hash -> cookie" layout (used by some bundles / website UIs):
+    // {
+    //   "quark": { "<md5(token)>": "a=b; c=d; ..." },
+    //   "uc":    { "<md5(token)>": "..." }
+    // }
+    const looksLikeCookieString = (s) => {
+        const v = typeof s === 'string' ? s.trim() : '';
+        if (!v) return false;
+        // Cookies are typically long and contain key=value pairs separated by ';'
+        if (!v.includes('=') || !v.includes(';')) return false;
+        if (v.length < 30) return false;
+        return true;
+    };
+    const looksLikeQuarkCookie = (s) => {
+        const v = typeof s === 'string' ? s : '';
+        return (
+            looksLikeCookieString(v) &&
+            (v.includes('__puus=') || v.includes('__pus=') || v.includes('ctoken=') || v.includes('b-user-id=') || v.includes('isQuark='))
+        );
+    };
+    const looksLikeUcCookie = (s) => {
+        const v = typeof s === 'string' ? s : '';
+        // UC cookie formats vary; keep it permissive.
+        return looksLikeCookieString(v) && (v.includes('uc') || v.includes('UC') || v.includes('__puus=') || v.includes('utoken='));
+    };
+    const pickLongest = (arr) =>
+        arr
+            .filter((v) => typeof v === 'string')
+            .map((v) => v.trim())
+            .filter(Boolean)
+            .sort((a, b) => b.length - a.length)[0] || '';
+    const pickFromMap = (obj, panName) => {
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return '';
+        const vals = [];
+        for (const v of Object.values(obj)) {
+            if (typeof v !== 'string') continue;
+            const s = v.trim();
+            if (!s) continue;
+            if (panName === 'quark') {
+                if (looksLikeQuarkCookie(s)) vals.push(s);
+            } else if (panName === 'uc') {
+                if (looksLikeUcCookie(s)) vals.push(s);
+            } else {
+                if (looksLikeCookieString(s)) vals.push(s);
+            }
+        }
+        return vals.length ? pickLongest(vals) : '';
+    };
+    // Try both exact key and normalized key.
+    try {
+        cookie = pickFromMap(root[panKey], pan);
+        if (cookie) return cookie;
+    } catch (_) {}
+    try {
+        cookie = pickFromMap(root[pan], pan);
+        if (cookie) return cookie;
+    } catch (_) {}
+
     // pans.list = [{key, cookie, ...}]
     try {
         const list = root && root.pans && typeof root.pans === 'object' ? root.pans.list : null;
@@ -1543,13 +1601,18 @@ function findPanCookieInDbJson(panKey) {
                 const c = v.trim();
                 if (c) {
                     const looksLikeBaiduCookie = pan === 'baidu' && (c.includes('BDUSS=') || c.includes('BDUSS_BFESS=') || c.includes('STOKEN='));
+                    const looksLikeQuark = pan === 'quark' && looksLikeQuarkCookie(c);
+                    const looksLikeUc = pan === 'uc' && looksLikeUcCookie(c);
                     const isCookieField = key === 'cookie' || key === 'ck' || key === 'cookies';
-                    if (isCookieField || looksLikeBaiduCookie) {
+                    // Some layouts store cookies under hash keys inside `root.<pan>.<hash>`.
+                    const isPanMapValue = nextPath.includes(`.${pan}.`) && looksLikeCookieString(c);
+                    if (isCookieField || looksLikeBaiduCookie || looksLikeQuark || looksLikeUc || isPanMapValue) {
                         const score =
                             (nextPath.includes(`.${pan}.`) ? 5 : 0) +
                             (nextPath.endsWith(`.${pan}.cookie`) || nextPath.endsWith(`.${pan}.ck`) ? 3 : 0) +
                             (cur.path.toLowerCase().includes(pan) ? 2 : 0) +
                             (looksLikeBaiduCookie ? 3 : 0) +
+                            (looksLikeQuark || looksLikeUc ? 2 : 0) +
                             (c.length > 50 ? 1 : 0);
                         if (score > best.score || (score === best.score && c.length > best.len)) {
                             best = { score, len: c.length, cookie: c };
@@ -2161,6 +2224,8 @@ async function loadOneFile(filePath) {
             const hostname = String(host).split(':')[0].trim().toLowerCase();
             const isBaidu = hostname === 'pan.baidu.com' || hostname.endsWith('.pan.baidu.com');
             const isBaiduPcs = hostname === 'pcs.baidu.com' || hostname.endsWith('.pcs.baidu.com');
+            const isQuark = hostname === 'pan.quark.cn' || hostname === 'drive.quark.cn' || hostname.endsWith('.quark.cn');
+            const isUc = hostname === 'drive.uc.cn' || hostname.endsWith('.uc.cn');
 
             const parseCookie = (cookieStr) => {
                 const out = {};
@@ -2209,6 +2274,75 @@ async function loadOneFile(filePath) {
                 }
                 return stringifyCookie(merged);
             };
+
+            const mergeCookiePreferDbLower = (existingCookie, dbCookie, preferDbLowerKeys) => {
+                const existingMap = parseCookie(existingCookie);
+                const dbMap = parseCookie(dbCookie);
+                const preferDbLower = new Set((preferDbLowerKeys || []).map((k) => String(k || '').toLowerCase()).filter(Boolean));
+                const merged = { ...existingMap };
+                for (const [k, v] of Object.entries(dbMap)) {
+                    const key = String(k || '').trim();
+                    if (!key) continue;
+                    const lower = key.toLowerCase();
+                    if (preferDbLower.has(lower) || !(key in merged)) merged[key] = v;
+                }
+                return stringifyCookie(merged);
+            };
+
+            // Ensure Quark/UC cookies exist. Some bundles:
+            // - omit Cookie entirely (guest)
+            // - or accidentally keep only playback cookie (Video-Auth) after a /play flow
+            // The latter breaks directory APIs like `/1/clouddrive/file/sort` and causes outer HTTP 500.
+            try {
+                if (isQuark) {
+                    const cookieFromDb = findPanCookieInDbJson('quark');
+                    if (cookieFromDb) {
+                        const existingCookie = getHeader('cookie') || headers.Cookie || '';
+                        if (!String(existingCookie || '').trim()) {
+                            setHeaderIfMissing('Cookie', cookieFromDb);
+                        } else {
+                            // If current cookie has only Video-Auth (or misses key login markers),
+                            // merge back the configured login cookie while keeping Video-Auth.
+                            const existingMap = parseCookie(existingCookie);
+                            const hasLoginMarkers =
+                                !!String(existingMap.ctoken || '').trim() ||
+                                !!String(existingMap.__uid || '').trim() ||
+                                !!String(existingMap['b-user-id'] || '').trim() ||
+                                !!String(existingMap.__puus || existingMap.__pus || '').trim() ||
+                                !!String(existingMap.tfstk || '').trim() ||
+                                !!String(existingMap.isg || '').trim();
+                            const hasVideoAuth = !!String(existingMap['Video-Auth'] || existingMap['video-auth'] || '').trim();
+                            if (!hasLoginMarkers && hasVideoAuth) {
+                                const mergedCookie = mergeCookiePreferDbLower(existingCookie, cookieFromDb, [
+                                    'ctoken',
+                                    '__uid',
+                                    '__puus',
+                                    '__pus',
+                                    'tfstk',
+                                    'isg',
+                                    'b-user-id',
+                                    'web-grey-id',
+                                    'web-grey-id.sig',
+                                    'grey-id',
+                                    'grey-id.sig',
+                                    'isquark',
+                                    'isquark.sig',
+                                ]);
+                                if (mergedCookie) {
+                                    deleteHeader('cookie');
+                                    headers.Cookie = mergedCookie;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_) {}
+            try {
+                if (!hasCookie() && isUc) {
+                    const cookieFromDb = findPanCookieInDbJson('uc');
+                    if (cookieFromDb) setHeaderIfMissing('Cookie', cookieFromDb);
+                }
+            } catch (_) {}
 
             if (isBaidu || isBaiduPcs) {
                 // Ensure Baidu account cookie exists (BDUSS/STOKEN). Also preserve share-session cookies (e.g. BDCLND).
@@ -2721,6 +2855,27 @@ async function loadOneFile(filePath) {
     const timeoutMs = Number.parseInt(process.env.CATPAW_CUSTOM_SOURCE_TIMEOUT_MS || '', 10);
     script.runInContext(context, { timeout: Number.isFinite(timeoutMs) ? timeoutMs : 120000 });
 
+    // two.js sometimes expects an internal persistent store (`kO`) to exist and calls `kO.push(...)`
+    // from its request helper (`uA`). In server-only mode the store may be null, causing:
+    // "TypeError: Cannot read properties of null (reading 'push')".
+    // Provide a minimal shim so the bundle won't crash. (It only affects persistence of refreshed cookie tokens.)
+    try {
+        const base = filePath ? path.basename(filePath).toLowerCase() : '';
+        if (base === 'two.js') {
+            const hasPush = context && context.kO && typeof context.kO.push === 'function';
+            if (!hasPush) {
+                const shim = {
+                    push: async () => null,
+                    getData: async () => ({}),
+                    getObjectDefault: async (_path, def) => (def == null ? {} : def),
+                    delete: async () => null,
+                };
+                context.kO = shim;
+                if (context.globalThis) context.globalThis.kO = shim;
+            }
+        }
+    } catch (_) {}
+
     // Initialize per-user Quark vars once for the default (no-header) user context (usually `test`).
     // This helps scripts that run immediate init code at load time avoid using root/default folders.
     try {
@@ -3123,18 +3278,21 @@ async function loadOneFile(filePath) {
                                 const requestPath = rawUrl.split('?')[0] || '';
                                 if (!requestPath.endsWith('/play')) return payload;
 
-	                                const raw = Buffer.isBuffer(payload)
-	                                    ? payload.toString('utf8')
-	                                    : typeof payload === 'string'
-	                                      ? payload
-	                                      : null;
-	                                if (typeof raw !== 'string') return payload;
-	                                const hasBaidu = raw.includes('baidupcs.com');
-	                                const hasQuark = raw.includes('/proxy/quark/');
-	                                if (!hasBaidu && !hasQuark) return payload;
+		                                const raw = Buffer.isBuffer(payload)
+		                                    ? payload.toString('utf8')
+		                                    : typeof payload === 'string'
+		                                      ? payload
+		                                      : null;
+		                                if (typeof raw !== 'string') return payload;
+		                                const hasBaidu = raw.includes('baidupcs.com');
+		                                const hasQuark = raw.includes('/proxy/quark');
+		                                const hasLocalBase =
+		                                    raw.includes('127.0.0.1') || raw.includes('0.0.0.0') || raw.toLowerCase().includes('localhost');
+		                                if (!hasBaidu && !hasQuark && !hasLocalBase) return payload;
 
-	                                const data = JSON.parse(raw);
-	                                if (!data || typeof data !== 'object' || !Array.isArray(data.url)) return payload;
+			                                const data = JSON.parse(raw);
+			                                const urlVal = data && typeof data === 'object' ? data.url : null;
+			                                if (!data || typeof data !== 'object' || (typeof urlVal !== 'string' && !Array.isArray(urlVal))) return payload;
 
 		                                const rawHeader = data.header && typeof data.header === 'object' ? data.header : null;
 			                                const ua = rawHeader && rawHeader['User-Agent'] ? String(rawHeader['User-Agent']) : '';
@@ -3168,27 +3326,24 @@ async function loadOneFile(filePath) {
 		                                // client-accessible base (avoid returning 0.0.0.0:3006 / localhost).
 		                                // But if the caller explicitly asked for `quark_tv=0` and direct-link mode is disabled,
 		                                // return the original payload unchanged (no Quark proxy base rewrite).
-		                                const needsQuarkProxyBaseRewrite =
-		                                    hasQuark && (!directLinkEnabled || needsQuarkSaveOnly) && !(quarkTvExplicitOff && !directLinkEnabled);
-		                                const needsProxyBaseRewrite = needsQuarkProxyBaseRewrite || needsBaiduRewrite;
+			                                const needsQuarkProxyBaseRewrite =
+			                                    hasQuark && (!directLinkEnabled || needsQuarkSaveOnly) && !(quarkTvExplicitOff && !directLinkEnabled);
+			                                const needsProxyBaseRewrite = needsQuarkProxyBaseRewrite || needsBaiduRewrite || hasLocalBase;
 		                                if (!needsBaiduRewrite && !needsQuarkDirect && !needsQuarkSaveOnly && !needsProxyBaseRewrite) return payload;
 
-	                                const firstHeaderVal = (v) => String(v || '').split(',')[0].trim();
-	                                const proto = firstHeaderVal(req.headers['x-forwarded-proto']) || String(req.protocol || 'http');
-	                                const host =
-	                                    firstHeaderVal(req.headers['x-forwarded-host']) ||
-	                                    firstHeaderVal(req.headers['x-original-host']) ||
-	                                    firstHeaderVal(req.headers.host);
-	                                const baseFromReq = host ? `${proto}://${host}`.replace(/\/+$/g, '') : '';
-	                                const proxyBase = cfg && cfg.rewriteBase ? String(cfg.rewriteBase || '').trim() : '';
-	                                const baseForProxy = proxyBase || baseFromReq;
-	                                const isLocalHost = (hn) => {
-	                                    const h = String(hn || '').toLowerCase();
-	                                    return h === '0.0.0.0' || h === '127.0.0.1' || h === 'localhost' || h === '::1';
-	                                };
-	                                const rewriteUrlToBase = (urlStr) => {
-	                                    const base = baseForProxy;
-	                                    if (!base) return urlStr;
+			                                const firstHeaderVal = (v) => String(v || '').split(',')[0].trim();
+			                                const proto = firstHeaderVal(req.headers['x-forwarded-proto']) || String(req.protocol || 'http');
+			                                const host = firstHeaderVal(req.headers['x-forwarded-host']) || firstHeaderVal(req.headers.host);
+			                                const isLocalHost = (hn) => {
+			                                    const h = String(hn || '').toLowerCase();
+			                                    return h === '0.0.0.0' || h === '127.0.0.1' || h === 'localhost' || h === '::1';
+			                                };
+			                                const baseFromReq = host ? `${proto}://${host}`.replace(/\/+$/g, '') : '';
+			                                const proxyBase = cfg && cfg.rewriteBase ? String(cfg.rewriteBase || '').trim() : '';
+			                                const baseForProxy = proxyBase || baseFromReq;
+		                                const rewriteUrlToBase = (urlStr) => {
+		                                    const base = baseForProxy;
+		                                    if (!base) return urlStr;
 	                                    const raw = typeof urlStr === 'string' ? urlStr.trim() : '';
 	                                    if (!raw) return urlStr;
 	                                    const isAbs = /^https?:\/\//i.test(raw);
@@ -3206,21 +3361,31 @@ async function loadOneFile(filePath) {
 	                                    }
 	                                };
 
-	                                const next = { ...data };
-	                                const rewritten = [];
-                                    const isHttpUrlStr = (s) => {
-                                        if (typeof s !== 'string') return false;
-                                        try {
-                                            const u = new URL(s);
-                                            return u.protocol === 'http:' || u.protocol === 'https:';
-                                        } catch (_) {
-                                            return false;
-                                        }
-                                    };
-                                    // Support both formats:
-                                    // - [label,url,label,url,...] (common in some spiders)
-                                    // - [url,url,...] (some custom scripts)
-                                    const evenUrlCount = data.url.filter((v, i) => i % 2 === 0 && isHttpUrlStr(v)).length;
+			                                const next = { ...data };
+
+			                                // Some spiders return a single URL string instead of an array.
+			                                if (typeof urlVal === 'string') {
+			                                    next.url = rewriteUrlToBase(urlVal);
+			                                    reply.type('application/json; charset=utf-8');
+			                                    return JSON.stringify(next);
+			                                }
+
+			                                const rewritten = [];
+	                                    const isHttpUrlStr = (s) => {
+	                                        if (typeof s !== 'string') return false;
+	                                        try {
+	                                            const u = new URL(s);
+	                                            return u.protocol === 'http:' || u.protocol === 'https:';
+	                                        } catch (_) {
+	                                            return false;
+	                                        }
+	                                    };
+			                                if (!Array.isArray(data.url)) return payload;
+
+	                                    // Support both formats:
+	                                    // - [label,url,label,url,...] (common in some spiders)
+	                                    // - [url,url,...] (some custom scripts)
+	                                    const evenUrlCount = data.url.filter((v, i) => i % 2 === 0 && isHttpUrlStr(v)).length;
                                     const oddUrlCount = data.url.filter((v, i) => i % 2 === 1 && isHttpUrlStr(v)).length;
                                     const isPairFormat = oddUrlCount > 0 && evenUrlCount === 0 && data.url.length >= 2;
 	                                for (let idx = 0; idx < data.url.length; idx++) {
@@ -3252,9 +3417,15 @@ async function loadOneFile(filePath) {
 	                                            continue;
 	                                        }
 		                                    }
-		                                    const hn = String(parsed.hostname || '').toLowerCase();
-		                                    const isBaidu = hn && (hn.endsWith('.baidupcs.com') || hn === 'baidupcs.com');
-		                                    const isQuarkProxy = parsed.pathname && parsed.pathname.includes('/proxy/quark/');
+			                                    const hn = String(parsed.hostname || '').toLowerCase();
+			                                    const isBaidu = hn && (hn.endsWith('.baidupcs.com') || hn === 'baidupcs.com');
+			                                    const pathname = String(parsed.pathname || '');
+			                                    const isLocalSpider = isLocalHost(hn) && pathname.startsWith('/spider/');
+			                                    const isQuarkProxy = pathname && /\/proxy\/quark(?:\/|$)/.test(pathname);
+			                                    if (isLocalSpider && needsProxyBaseRewrite) {
+			                                        rewritten.push(rewriteUrlToBase(absItem));
+			                                        continue;
+			                                    }
 		                                    if (isBaidu && needsBaiduRewrite) {
 		                                        const token = putBaiduProxyEntry(
 		                                            item,
