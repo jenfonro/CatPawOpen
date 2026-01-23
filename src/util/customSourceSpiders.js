@@ -189,8 +189,7 @@ function getConfigJsonPath() {
 function getGlobalPanDirNameForCurrentUser() {
     // Global per-pan destination folder base name (shared by Quark/Baidu/etc).
     // Final folder name is `${base}_${TVUser}`.
-    const rawBase = process.env.CATPAW_DIR_NAME || process.env.CATPAW_PAN_DIR_NAME || 'TV_Server';
-    const base = String(rawBase || 'TV_Server')
+    const base = String('TV_Server')
         .trim()
         .replace(/[^a-zA-Z0-9._-]+/g, '_')
         .replace(/^_+|_+$/g, '') || 'TV_Server';
@@ -247,7 +246,7 @@ function getDirectLinkConfig() {
 async function quarkResolveDownloadUrlViaApi({ shareId, stoken, fid, fidToken, toPdirFid, rawHeader, scriptContext, want }) {
     const fetchImpl = globalThis.fetch;
     if (typeof fetchImpl !== 'function') throw new Error('fetch is not available');
-    const QUARK_DEBUG = process.env.CATPAW_QUARK_DEBUG === '1' || process.env.CATPAW_DEBUG === '1';
+    const QUARK_DEBUG = process.env.CATPAW_DEBUG === '1';
     const mask = (v) => {
         const s = String(v || '').trim();
         if (!s) return '';
@@ -1015,7 +1014,7 @@ function getRememberedQuarkSavedFile({ shareId, stoken, fid, fidToken, toPdirFid
 async function quarkDownloadUrlFromSavedFileViaApi({ savedFid, savedFidToken, rawHeader, scriptContext }) {
     const fetchImpl = globalThis.fetch;
     if (typeof fetchImpl !== 'function') throw new Error('fetch is not available');
-    const QUARK_DEBUG = process.env.CATPAW_QUARK_DEBUG === '1' || process.env.CATPAW_DEBUG === '1';
+    const QUARK_DEBUG = process.env.CATPAW_DEBUG === '1';
     const mask = (v) => {
         const s = String(v || '').trim();
         if (!s) return '';
@@ -1540,38 +1539,10 @@ function getDbJsonPath() {
         if (now - state.ts < 2000) return state.path;
     }
 
-    const resolvePathFromRaw = (raw) => {
-        const guess = String(raw || '').trim();
-        if (!guess) return '';
-        if (guess.endsWith('.json')) return path.resolve(guess);
-        return path.resolve(guess, 'db.json');
-    };
-
-    const candidates = [];
-    if (process.env.CATPAW_DB_JSON_PATH) candidates.push(resolvePathFromRaw(process.env.CATPAW_DB_JSON_PATH));
-    if (process.env.NODE_PATH) candidates.push(resolvePathFromRaw(process.env.NODE_PATH));
-    candidates.push(path.resolve(process.cwd(), 'db.json'));
-    candidates.push(path.resolve(process.cwd(), '..', 'db.json'));
-
-    // Try relative to the bundle root (works for both src/ and dist/ layouts).
-    const embeddedRoot = getEmbeddedRootDir();
-    candidates.push(path.resolve(embeddedRoot, 'db.json'));
-    candidates.push(path.resolve(embeddedRoot, '..', 'db.json'));
-
-    for (const p of candidates) {
-        try {
-            if (p && fs.existsSync(p)) {
-                state.path = p;
-                state.ts = now;
-                return p;
-            }
-        } catch (_) {}
-    }
-    // Default fallback (keeps previous behavior).
-    const fallback = resolvePathFromRaw(process.env.NODE_PATH || '.') || path.resolve(process.cwd(), 'db.json');
-    state.path = fallback;
+    const p = path.resolve(process.cwd(), 'db.json');
+    state.path = p;
     state.ts = now;
-    return fallback;
+    return p;
 }
 
 function readDbJsonSafeCached() {
@@ -2325,7 +2296,7 @@ async function loadOneFile(filePath) {
     const code = fs.readFileSync(filePath, 'utf8');
     const baseRequire = createRequire(filePath);
 
-    const BAIDU_DEBUG = process.env.CATPAW_BAIDU_DEBUG === '1' || process.env.CATPAW_DEBUG === '1';
+    const BAIDU_DEBUG = process.env.CATPAW_DEBUG === '1';
     const baiduLog = (...args) => {
         if (!BAIDU_DEBUG) return;
         // eslint-disable-next-line no-console
@@ -2745,7 +2716,7 @@ async function loadOneFile(filePath) {
         const v = Number.parseInt(process.env.CATPAW_QUARK_INIT_COOLDOWN_MS || '', 10);
         return Number.isFinite(v) && v >= 0 ? v : 60_000;
     })();
-    const QUARK_DEBUG = process.env.CATPAW_QUARK_DEBUG === '1' || process.env.CATPAW_DEBUG === '1';
+    const QUARK_DEBUG = process.env.CATPAW_DEBUG === '1';
     const quarkMask = (v) => {
         const s = String(v || '').trim();
         if (!s) return '';
@@ -2769,55 +2740,6 @@ async function loadOneFile(filePath) {
     };
 
     const getPanDirNameForCurrentUser = () => getGlobalPanDirNameForCurrentUser();
-
-    const getDirReplaceTokens = () => {
-        const raw = process.env.CATPAW_PAN_DIR_REPLACE_FROM || 'WexFnw';
-        return String(raw || '')
-            .split(',')
-            .map((s) => String(s || '').trim())
-            .filter(Boolean);
-    };
-
-    const applyDirNameOverrideToValue = (value) => {
-        if (typeof value !== 'string') return value;
-        const target = value;
-        if (!target) return target;
-        const fromList = getDirReplaceTokens();
-        if (!fromList.length) return target;
-        const to = getPanDirNameForCurrentUser();
-        if (!to) return target;
-
-        // Exact match.
-        if (fromList.includes(target)) return to;
-
-        // Best-effort path-like replacement (avoid touching huge blobs).
-        if (target.length > 300) return target;
-        if (!target.includes('/')) return target;
-        let out = target;
-        for (const from of fromList) {
-            if (!from) continue;
-            if (!out.includes(from)) continue;
-            out = out.split(from).join(to);
-        }
-        return out;
-    };
-
-    const applyDirNameOverrideToContext = () => {
-        const keys = Object.keys(context || {});
-        if (!keys.length) return;
-        for (const key of keys) {
-            try {
-                const v = context[key];
-                if (typeof v === 'string') {
-                    const next = applyDirNameOverrideToValue(v);
-                    if (next !== v) {
-                        context[key] = next;
-                        if (context.globalThis) context.globalThis[key] = next;
-                    }
-                }
-            } catch (_) {}
-        }
-    };
 
     const syncQuarkVarsForCurrentUser = () => {
         const hasQuarkBindings =
@@ -2997,11 +2919,6 @@ async function loadOneFile(filePath) {
     try {
         syncQuarkVarsForCurrentUser();
     } catch (_) {}
-    // Also patch any remaining default folder names (e.g. Baidu/Quark internal defaults like "WexFnw").
-    try {
-        applyDirNameOverrideToContext();
-    } catch (_) {}
-
     // Capture the Quark resolver context if the bundle provides it (some bundles expose `WKt`).
     // This avoids relying on whichever spider happened to install the global onSend hook first.
     try {
@@ -3157,13 +3074,6 @@ async function loadOneFile(filePath) {
                 const isNameConflict = (err) => getErrCode(err) === '23008';
                 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
                 try {
-                    // Force folder name override for known default roots (e.g. "WexFnw") before hitting the API.
-                    try {
-                        if (obj && typeof obj.file_name === 'string') {
-                            const nextName = applyDirNameOverrideToValue(obj.file_name);
-                            if (nextName && nextName !== obj.file_name) obj.file_name = nextName;
-                        }
-                    } catch (_) {}
                     return await original(url, payload, ...rest);
                 } catch (err) {
                     // Quark dir init may return "same name conflict" when the folder already exists.

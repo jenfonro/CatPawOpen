@@ -2,6 +2,7 @@ import fastify from 'fastify';
 import router from './router.js';
 import { JsonDB, Config } from 'node-json-db';
 import axios from 'axios';
+import path from 'node:path';
 
 let server = null;
 
@@ -52,6 +53,11 @@ function ensureConfigDefaults(config) {
         if (!cur || typeof cur !== 'object') config[key] = {};
         return config[key];
     };
+    const ensureNonEmptyString = (obj, field, fallback) => {
+        if (!obj || typeof obj !== 'object') return;
+        const cur = obj[field];
+        if (typeof cur !== 'string' || !cur.trim()) obj[field] = fallback;
+    };
     const ensureCookie = (key) => {
         const obj = ensureObj(key);
         if (typeof obj.cookie !== 'string') obj.cookie = '';
@@ -73,6 +79,16 @@ function ensureConfigDefaults(config) {
     ensureAccount('tianyi');
     ensureAccount('pan123');
     ensureAccount('yunchao');
+
+    // UC custom bundles persist multiple values under `/uc/<md5(config.uc.*)>`.
+    // If these identifiers are empty, different values collide at MD5('') and overwrite each other.
+    try {
+        const uc = ensureObj('uc');
+        // Keep `uc.cookie` default as empty for backwards-compat (existing db.json may use MD5('') for UC cookie).
+        ensureNonEmptyString(uc, 'token', '__uc_token_id__');
+        ensureNonEmptyString(uc, 'refreshtoken', '__uc_refreshtoken_id__');
+        ensureNonEmptyString(uc, 'ut', '__uc_ut_id__');
+    } catch (_) {}
 
     return config;
 }
@@ -128,11 +144,11 @@ export async function start(config) {
     });
     server.stop = false;
     server.config = ensureConfigDefaults(config);
-    // 推荐使用NODE_PATH做db存储的更目录，这个目录在应用中清除缓存时会被清空
-    server.db = new JsonDB(new Config((process.env['NODE_PATH'] || '.') + '/db.json', true, true, '/', true));
+    // Persist db.json in current working directory.
+    server.db = new JsonDB(new Config(path.resolve(process.cwd(), 'db.json'), true, true, '/', true));
     server.register(router);
     // 注意 一定要监听ipv4地址 build后 app中使用时 端口使用0让系统自动分配可用端口
-    const isStandalone = !!(process && process.pkg) || process.env['CATPAW_STANDALONE'] === '1';
+    const isStandalone = !!(process && process.pkg);
 
     const envPortRaw = process.env['DEV_HTTP_PORT'] || process.env['PORT'] || '';
     const defaultPort = isStandalone ? 3006 : 0;
