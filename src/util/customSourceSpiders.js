@@ -23,20 +23,18 @@ let cache = {
     websiteByFile: {},
 };
 
-let pansCache = {
-    ts: 0,
-    list: null,
-};
-
 let dbJsonCache = {
-    ts: 0,
-    data: null,
     path: '',
+    mtimeMs: 0,
+    size: 0,
+    data: null,
 };
 
 const directLinkConfigState = {
-    ts: 0,
-    config: null,
+    path: '',
+    mtimeMs: 0,
+    size: 0,
+    config: { directLinkEnabled: true, rewriteBase: '' },
 };
 
 function getEmbeddedRootDir() {
@@ -92,30 +90,36 @@ function normalizeHttpBase(value) {
 }
 
 function getDirectLinkConfig() {
-    const now = Date.now();
-    if (directLinkConfigState.config && now - directLinkConfigState.ts < 1000) return directLinkConfigState.config;
-
     const cfgPath = getConfigJsonPath();
-
-    let cfg = { directLinkEnabled: true, rewriteBase: '' };
     try {
-        if (fs.existsSync(cfgPath)) {
-            const raw = fs.readFileSync(cfgPath, 'utf8');
-            const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
-            const root = parsed && typeof parsed === 'object' ? parsed : null;
-            const directLink =
-                root && root.directLink && typeof root.directLink === 'object' && !Array.isArray(root.directLink)
-                    ? root.directLink
-                    : null;
-            const directLinkEnabled =
-                directLink && Object.prototype.hasOwnProperty.call(directLink, 'enabled') ? !!directLink.enabled : true;
-            cfg = { directLinkEnabled, rewriteBase: normalizeHttpBase(root && root.rewriteBase) };
+        const st = fs.statSync(cfgPath);
+        if (
+            directLinkConfigState &&
+            directLinkConfigState.config &&
+            directLinkConfigState.path === cfgPath &&
+            directLinkConfigState.mtimeMs === st.mtimeMs &&
+            directLinkConfigState.size === st.size
+        ) {
+            return directLinkConfigState.config;
         }
-    } catch (_) {}
 
-    directLinkConfigState.ts = now;
-    directLinkConfigState.config = cfg;
-    return cfg;
+        const raw = fs.readFileSync(cfgPath, 'utf8');
+        const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
+        const root = parsed && typeof parsed === 'object' ? parsed : null;
+        const directLink =
+            root && root.directLink && typeof root.directLink === 'object' && !Array.isArray(root.directLink) ? root.directLink : null;
+        const directLinkEnabled =
+            directLink && Object.prototype.hasOwnProperty.call(directLink, 'enabled') ? !!directLink.enabled : true;
+        const cfg = { directLinkEnabled, rewriteBase: normalizeHttpBase(root && root.rewriteBase) };
+
+        directLinkConfigState.path = cfgPath;
+        directLinkConfigState.mtimeMs = st.mtimeMs;
+        directLinkConfigState.size = st.size;
+        directLinkConfigState.config = cfg;
+        return cfg;
+    } catch (_e) {
+        return directLinkConfigState && directLinkConfigState.config ? directLinkConfigState.config : { directLinkEnabled: true, rewriteBase: '' };
+    }
 }
 
 async function quarkResolveDownloadUrlViaApi({ shareId, stoken, fid, fidToken, toPdirFid, rawHeader, scriptContext, want }) {
@@ -419,10 +423,9 @@ async function quarkResolveDownloadUrlViaApi({ shareId, stoken, fid, fidToken, t
             if (state < 0 && Number.isFinite(readNum(data.task.state))) state = readNum(data.task.state);
         }
 
-        const finished =
-            (typeof data.finish === 'boolean' ? data.finish : null) ??
-            (data.task && typeof data.task === 'object' && typeof data.task.finish === 'boolean' ? data.task.finish : null) ??
-            false;
+        let finished = false;
+        if (typeof data.finish === 'boolean') finished = data.finish;
+        else if (data.task && typeof data.task === 'object' && typeof data.task.finish === 'boolean') finished = data.task.finish;
 
         const pickFidFromArr = (arr) => {
             if (!Array.isArray(arr) || !arr.length) return '';
@@ -1288,7 +1291,7 @@ export function registerGlobalBaiduProxy(fastify) {
         } catch (_) {}
 
         try {
-            reply.raw.flushHeaders?.();
+            if (reply && reply.raw && typeof reply.raw.flushHeaders === 'function') reply.raw.flushHeaders();
         } catch (_) {}
 
         try {
@@ -1398,29 +1401,23 @@ export function registerGlobalBaiduProxy(fastify) {
     });
 }
 
-function readPansListFromDbJson() {
-    const dbPath = path.resolve(process.env.NODE_PATH || '.', 'db.json');
-    try {
-        if (!fs.existsSync(dbPath)) return null;
-        const raw = fs.readFileSync(dbPath, 'utf8');
-        if (!raw.trim()) return null;
-        const data = JSON.parse(raw);
-        const list = data && data.pans && Array.isArray(data.pans.list) ? data.pans.list : null;
-        return list;
-    } catch (_) {
-        return null;
-    }
-}
-
 function getPansListCached() {
-    const now = Date.now();
-    if (pansCache.list && now - pansCache.ts < 1000) return pansCache.list;
-    const list = readPansListFromDbJson();
-    pansCache = { ts: now, list: Array.isArray(list) ? list : null };
-    return pansCache.list;
+    const root = readDbJsonSafeCached();
+    const list = root && root.pans && typeof root.pans === 'object' && Array.isArray(root.pans.list) ? root.pans.list : null;
+    return Array.isArray(list) ? list : null;
 }
 
 function getDbJsonPath() {
+    if (!getDbJsonPath.state) getDbJsonPath.state = { path: '', ts: 0 };
+    const state = getDbJsonPath.state;
+    const now = Date.now();
+    if (state.path) {
+        try {
+            if (fs.existsSync(state.path)) return state.path;
+        } catch (_) {}
+        if (now - state.ts < 2000) return state.path;
+    }
+
     const resolvePathFromRaw = (raw) => {
         const guess = String(raw || '').trim();
         if (!guess) return '';
@@ -1441,28 +1438,39 @@ function getDbJsonPath() {
 
     for (const p of candidates) {
         try {
-            if (p && fs.existsSync(p)) return p;
+            if (p && fs.existsSync(p)) {
+                state.path = p;
+                state.ts = now;
+                return p;
+            }
         } catch (_) {}
     }
     // Default fallback (keeps previous behavior).
-    return resolvePathFromRaw(process.env.NODE_PATH || '.') || path.resolve(process.cwd(), 'db.json');
+    const fallback = resolvePathFromRaw(process.env.NODE_PATH || '.') || path.resolve(process.cwd(), 'db.json');
+    state.path = fallback;
+    state.ts = now;
+    return fallback;
 }
 
 function readDbJsonSafeCached() {
-    const now = Date.now();
     const dbPath = getDbJsonPath();
-    if (dbJsonCache.data && dbJsonCache.path === dbPath && now - dbJsonCache.ts < 1000) return dbJsonCache.data;
     try {
-        if (!fs.existsSync(dbPath)) {
-            dbJsonCache = { ts: now, data: null, path: dbPath };
-            return null;
+        const st = fs.statSync(dbPath);
+        if (dbJsonCache.path === dbPath && dbJsonCache.mtimeMs === st.mtimeMs && dbJsonCache.size === st.size) {
+            return dbJsonCache.data;
         }
         const raw = fs.readFileSync(dbPath, 'utf8');
         const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
-        dbJsonCache = { ts: now, data: parsed && typeof parsed === 'object' ? parsed : null, path: dbPath };
+        dbJsonCache.path = dbPath;
+        dbJsonCache.mtimeMs = st.mtimeMs;
+        dbJsonCache.size = st.size;
+        dbJsonCache.data = parsed && typeof parsed === 'object' ? parsed : null;
         return dbJsonCache.data;
     } catch (_) {
-        dbJsonCache = { ts: now, data: null, path: dbPath };
+        dbJsonCache.path = dbPath;
+        dbJsonCache.mtimeMs = 0;
+        dbJsonCache.size = 0;
+        dbJsonCache.data = null;
         return null;
     }
 }
@@ -1482,27 +1490,11 @@ function findPanCookieInDbJson(panKey) {
         return typeof cur === 'string' ? cur.trim() : '';
     };
 
-    // Common layouts.
     let cookie = '';
-    cookie = tryGet(root, [panKey, 'cookie']);
+    // Common layouts.
+    cookie = tryGet(root, [panKey, 'cookie']) || tryGet(root, [pan, 'cookie']) || tryGet(root, ['pans', pan, 'cookie']);
     if (cookie) return cookie;
-    cookie = tryGet(root, [pan, 'cookie']);
-    if (cookie) return cookie;
-    cookie = tryGet(root, [panKey, 'ck']);
-    if (cookie) return cookie;
-    cookie = tryGet(root, [pan, 'ck']);
-    if (cookie) return cookie;
-    cookie = tryGet(root, ['pans', pan, 'cookie']);
-    if (cookie) return cookie;
-    cookie = tryGet(root, ['pans', pan, 'ck']);
-    if (cookie) return cookie;
-    cookie = tryGet(root, ['pan', pan, 'cookie']);
-    if (cookie) return cookie;
-    cookie = tryGet(root, ['pan', pan, 'ck']);
-    if (cookie) return cookie;
-    cookie = tryGet(root, ['config', pan, 'cookie']);
-    if (cookie) return cookie;
-    cookie = tryGet(root, ['config', pan, 'ck']);
+    cookie = tryGet(root, [panKey, 'ck']) || tryGet(root, [pan, 'ck']) || tryGet(root, ['pans', pan, 'ck']);
     if (cookie) return cookie;
 
     // Common "token-hash -> cookie" layout (used by some bundles / website UIs):
@@ -1577,60 +1569,7 @@ function findPanCookieInDbJson(panKey) {
         }
     } catch (_) {}
 
-    // Best-effort: search for any cookie-like field and pick the most plausible one.
-    const queue = [{ obj: root, path: 'root', depth: 0 }];
-    const seen = new Set();
-    const maxNodes = 8000;
-    let nodes = 0;
-    let best = { score: 0, len: 0, cookie: '' };
-    while (queue.length && nodes < maxNodes) {
-        const cur = queue.shift();
-        nodes += 1;
-        const obj = cur && cur.obj;
-        if (!obj || typeof obj !== 'object') continue;
-        if (seen.has(obj)) continue;
-        seen.add(obj);
-        if (Array.isArray(obj)) {
-            for (let i = 0; i < Math.min(obj.length, 50); i += 1) queue.push({ obj: obj[i], path: `${cur.path}[${i}]`, depth: cur.depth + 1 });
-            continue;
-        }
-        for (const [k, v] of Object.entries(obj)) {
-            const key = String(k || '').toLowerCase();
-            const nextPath = `${cur.path}.${key}`;
-            if (typeof v === 'string') {
-                const c = v.trim();
-                if (c) {
-                    const looksLikeBaiduCookie = pan === 'baidu' && (c.includes('BDUSS=') || c.includes('BDUSS_BFESS=') || c.includes('STOKEN='));
-                    const looksLikeQuark = pan === 'quark' && looksLikeQuarkCookie(c);
-                    const looksLikeUc = pan === 'uc' && looksLikeUcCookie(c);
-                    const isCookieField = key === 'cookie' || key === 'ck' || key === 'cookies';
-                    // Some layouts store cookies under hash keys inside `root.<pan>.<hash>`.
-                    const isPanMapValue = nextPath.includes(`.${pan}.`) && looksLikeCookieString(c);
-                    if (isCookieField || looksLikeBaiduCookie || looksLikeQuark || looksLikeUc || isPanMapValue) {
-                        const score =
-                            (nextPath.includes(`.${pan}.`) ? 5 : 0) +
-                            (nextPath.endsWith(`.${pan}.cookie`) || nextPath.endsWith(`.${pan}.ck`) ? 3 : 0) +
-                            (cur.path.toLowerCase().includes(pan) ? 2 : 0) +
-                            (looksLikeBaiduCookie ? 3 : 0) +
-                            (looksLikeQuark || looksLikeUc ? 2 : 0) +
-                            (c.length > 50 ? 1 : 0);
-                        if (score > best.score || (score === best.score && c.length > best.len)) {
-                            best = { score, len: c.length, cookie: c };
-                        }
-                    }
-                }
-            }
-            if (v && typeof v === 'object' && cur.depth < 10) queue.push({ obj: v, path: nextPath, depth: cur.depth + 1 });
-        }
-    }
-    const picked = best.cookie || '';
-    // Avoid returning a cookie from the wrong pan when the db.json layout is unknown.
-    if (pan === 'baidu') {
-        const s = picked;
-        const ok = typeof s === 'string' && (s.includes('BDUSS=') || s.includes('BDUSS_BFESS=') || s.includes('STOKEN=') || s.includes('BAIDUID='));
-        return ok ? s : '';
-    }
-    return picked;
+    return '';
 }
 
 export function getCustomSourceStatus() {
@@ -2249,7 +2188,7 @@ async function loadOneFile(filePath) {
                 for (const [k, v] of Object.entries(cookieObj)) {
                     const key = String(k || '').trim();
                     if (!key) continue;
-                    parts.push(`${key}=${String(v ?? '').trim()}`);
+                    parts.push(`${key}=${String(v == null ? '' : v).trim()}`);
                 }
                 return parts.join('; ');
             };
@@ -2275,20 +2214,6 @@ async function loadOneFile(filePath) {
                 return stringifyCookie(merged);
             };
 
-            const mergeCookiePreferDbLower = (existingCookie, dbCookie, preferDbLowerKeys) => {
-                const existingMap = parseCookie(existingCookie);
-                const dbMap = parseCookie(dbCookie);
-                const preferDbLower = new Set((preferDbLowerKeys || []).map((k) => String(k || '').toLowerCase()).filter(Boolean));
-                const merged = { ...existingMap };
-                for (const [k, v] of Object.entries(dbMap)) {
-                    const key = String(k || '').trim();
-                    if (!key) continue;
-                    const lower = key.toLowerCase();
-                    if (preferDbLower.has(lower) || !(key in merged)) merged[key] = v;
-                }
-                return stringifyCookie(merged);
-            };
-
             // Ensure Quark/UC cookies exist. Some bundles:
             // - omit Cookie entirely (guest)
             // - or accidentally keep only playback cookie (Video-Auth) after a /play flow
@@ -2301,33 +2226,17 @@ async function loadOneFile(filePath) {
                         if (!String(existingCookie || '').trim()) {
                             setHeaderIfMissing('Cookie', cookieFromDb);
                         } else {
-                            // If current cookie has only Video-Auth (or misses key login markers),
-                            // merge back the configured login cookie while keeping Video-Auth.
-                            const existingMap = parseCookie(existingCookie);
-                            const hasLoginMarkers =
-                                !!String(existingMap.ctoken || '').trim() ||
-                                !!String(existingMap.__uid || '').trim() ||
-                                !!String(existingMap['b-user-id'] || '').trim() ||
-                                !!String(existingMap.__puus || existingMap.__pus || '').trim() ||
-                                !!String(existingMap.tfstk || '').trim() ||
-                                !!String(existingMap.isg || '').trim();
-                            const hasVideoAuth = !!String(existingMap['Video-Auth'] || existingMap['video-auth'] || '').trim();
-                            if (!hasLoginMarkers && hasVideoAuth) {
-                                const mergedCookie = mergeCookiePreferDbLower(existingCookie, cookieFromDb, [
-                                    'ctoken',
-                                    '__uid',
-                                    '__puus',
-                                    '__pus',
-                                    'tfstk',
-                                    'isg',
-                                    'b-user-id',
-                                    'web-grey-id',
-                                    'web-grey-id.sig',
-                                    'grey-id',
-                                    'grey-id.sig',
-                                    'isquark',
-                                    'isquark.sig',
-                                ]);
+                            // After /play, some flows keep only `Video-Auth=...` and lose login cookies.
+                            // Fix: merge the configured login cookie back, while preserving Video-Auth pairs.
+                            const s = String(existingCookie || '');
+                            const hasVideoAuth = /(?:^|;\s*)video-auth=/i.test(s);
+                            const hasLoginMarkers = /(?:^|;\s*)(ctoken|__uid|b-user-id|__puus|__pus|tfstk|isg)=/i.test(s);
+                            if (hasVideoAuth && !hasLoginMarkers) {
+                                const pairs = s.match(/(?:^|;\s*)video-auth=[^;]*/gi) || [];
+                                const mergedCookie = [String(cookieFromDb || '').trim()]
+                                    .concat(pairs.map((p) => String(p || '').trim()).filter(Boolean))
+                                    .filter(Boolean)
+                                    .join('; ');
                                 if (mergedCookie) {
                                     deleteHeader('cookie');
                                     headers.Cookie = mergedCookie;
@@ -2542,8 +2451,10 @@ async function loadOneFile(filePath) {
                                         } catch (_) {
                                             return;
                                         }
-                                        const errno = json && (json.errno ?? json.error_code ?? json.error);
-                                        const msg = json && (json.msg ?? json.message ?? json.error_msg);
+                                        const errno =
+                                            json && json.errno != null ? json.errno : json && json.error_code != null ? json.error_code : json && json.error != null ? json.error : undefined;
+                                        const msg =
+                                            json && json.msg != null ? json.msg : json && json.message != null ? json.message : json && json.error_msg != null ? json.error_msg : undefined;
                                         const hasBdstoken = !!(json && (json.bdstoken || (json.data && json.data.bdstoken)));
                                         baiduLog('json', {
                                             path: p,
@@ -3301,35 +3212,16 @@ async function loadOneFile(filePath) {
 			                                const directLinkEnabled = !!(cfg && cfg.directLinkEnabled);
 			                                const needsBaiduRewrite = hasBaidu && !directLinkEnabled;
 		                                const q = req && req.query && typeof req.query === 'object' ? req.query : null;
-		                                const hasQuarkTvParam =
-		                                    !!(q && (Object.prototype.hasOwnProperty.call(q, 'quark_tv') || Object.prototype.hasOwnProperty.call(q, 'quarkTv')));
-		                                const parseBoolish = (v) => {
-		                                    if (typeof v === 'boolean') return v;
-		                                    if (typeof v === 'number') return v !== 0;
-		                                    if (v == null) return null;
-		                                    const s = String(v).trim().toLowerCase();
-		                                    if (!s) return null;
-		                                    if (s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on') return true;
-		                                    if (s === '0' || s === 'false' || s === 'no' || s === 'n' || s === 'off') return false;
-		                                    return null;
-		                                };
-		                                const quarkTvValueRaw = q
+		                                const quarkTvRaw = q
 		                                    ? (Object.prototype.hasOwnProperty.call(q, 'quark_tv') ? q.quark_tv : q.quarkTv)
 		                                    : null;
-		                                const quarkTvParsed = hasQuarkTvParam ? parseBoolish(quarkTvValueRaw) : null;
-		                                const quarkTvEnabled = quarkTvParsed === true;
-		                                const quarkTvExplicitOff = quarkTvParsed === false;
-		                                // quark_tv=0 means "resolve direct link" (same as no tv mode param).
+		                                const quarkTvStr = String(quarkTvRaw == null ? '' : quarkTvRaw).trim().toLowerCase();
+		                                const quarkTvEnabled = quarkTvStr === '1' || quarkTvStr === 'true' || quarkTvStr === 'yes' || quarkTvStr === 'on';
+
 		                                const needsQuarkDirect = hasQuark && directLinkEnabled && !quarkTvEnabled;
 		                                const needsQuarkSaveOnly = hasQuark && quarkTvEnabled;
-		                                // In proxy mode (directLinkEnabled=false), we should still rewrite proxy URLs to a
-		                                // client-accessible base (avoid returning 0.0.0.0:3006 / localhost).
-		                                // But if the caller explicitly asked for `quark_tv=0` and direct-link mode is disabled,
-		                                // return the original payload unchanged (no Quark proxy base rewrite).
-			                                const needsQuarkProxyBaseRewrite =
-			                                    hasQuark && (!directLinkEnabled || needsQuarkSaveOnly) && !(quarkTvExplicitOff && !directLinkEnabled);
-			                                const needsProxyBaseRewrite = needsQuarkProxyBaseRewrite || needsBaiduRewrite || hasLocalBase;
-		                                if (!needsBaiduRewrite && !needsQuarkDirect && !needsQuarkSaveOnly && !needsProxyBaseRewrite) return payload;
+		                                const needsProxyBaseRewrite = hasQuark || needsBaiduRewrite || hasLocalBase;
+		                                if (!needsQuarkDirect && !needsQuarkSaveOnly && !needsProxyBaseRewrite) return payload;
 
 			                                const firstHeaderVal = (v) => String(v || '').split(',')[0].trim();
 			                                const proto = firstHeaderVal(req.headers['x-forwarded-proto']) || String(req.protocol || 'http');
@@ -3474,11 +3366,10 @@ async function loadOneFile(filePath) {
 				                                                        if (effectiveHeader && cookieFromDb && !effectiveHeader.Cookie && !effectiveHeader.cookie) {
 				                                                            effectiveHeader.Cookie = cookieFromDb;
 				                                                        }
-				                                                        syncCookieFromRawHeader(effectiveHeader);
-				                                                        await maybeInitQuarkDestForCurrentUser(effectiveHeader);
-				                                                        syncQuarkVarsForCurrentUser();
-				                                                        ensureQuarkDestForCurrentUser();
-				                                                    } catch (_) {}
+                                                        await maybeInitQuarkDestForCurrentUser(effectiveHeader);
+                                                        syncQuarkVarsForCurrentUser();
+                                                        ensureQuarkDestForCurrentUser();
+                                                    } catch (_) {}
 
 				                                                    // Quark TV mode expects a "clear + save" flow. The bundled script's `MBe()`
 				                                                    // performs the self-check/refresh cleanup in the configured destination folder.
@@ -3588,7 +3479,6 @@ async function loadOneFile(filePath) {
                                                 if (effectiveHeader && cookieFromDb && !effectiveHeader.Cookie && !effectiveHeader.cookie) {
                                                     effectiveHeader.Cookie = cookieFromDb;
                                                 }
-                                                syncCookieFromRawHeader(effectiveHeader);
                                                 // The Quark cookie is often carried in the `/play` response headers (data.header),
                                                 // not the inbound HTTP request headers, so init the folder here as well.
                                                 await maybeInitQuarkDestForCurrentUser(effectiveHeader);
@@ -3617,34 +3507,6 @@ async function loadOneFile(filePath) {
 		                                                        : runtimeCtx && runtimeCtx.s8 && String(runtimeCtx.s8) !== '0'
 		                                                          ? String(runtimeCtx.s8)
 		                                                          : '0';
-
-	                                            // TV fallback: when `quark_tv=0` is explicitly requested, prefer using the
-	                                            // previously-saved file fid (from the `quark_tv=1` save-only flow) to fetch a
-	                                            // direct download_url, instead of re-saving the share (stoken may be single-use).
-	                                            if (quarkTvExplicitOff) {
-	                                                try {
-	                                                    const saved = getRememberedQuarkSavedFile({
-	                                                        shareId: parsedDown.shareId,
-	                                                        stoken: parsedDown.stoken,
-	                                                        fid: parsedDown.fid,
-	                                                        fidToken: parsedDown.fidToken,
-	                                                        toPdirFid,
-	                                                        rawHeader: effectiveHeader,
-	                                                    });
-	                                                    if (saved && saved.fid) {
-	                                                        const url3 = await quarkDownloadUrlFromSavedFileViaApi({
-	                                                            savedFid: saved.fid,
-	                                                            savedFidToken: saved.token,
-	                                                            rawHeader: effectiveHeader,
-	                                                            scriptContext: runtimeCtx,
-	                                                        });
-	                                                        if (url3 && String(url3).trim()) {
-	                                                            rewritten.push(String(url3).trim());
-	                                                            continue;
-	                                                        }
-	                                                    }
-	                                                } catch (_) {}
-	                                            }
 
 		                                            const directUrl = await resolveQuarkDirectUrlCached({
 		                                                shareId: parsedDown.shareId,
