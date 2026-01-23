@@ -37,6 +37,97 @@ const directLinkConfigState = {
     config: { directLinkEnabled: true, rewriteBase: '' },
 };
 
+const spiderAutoInitState = new Map();
+
+function parseStandardSpiderPath(pathname) {
+    const raw = typeof pathname === 'string' ? pathname : '';
+    if (!raw) return null;
+    const m = raw.match(/^\/spider\/([^/]+)\/([^/]+)\/(init|home|category|detail|play|search)$/);
+    if (!m) return null;
+    const key = m[1];
+    const type = m[2];
+    const action = m[3];
+    return { base: `/spider/${key}/${type}`, key, type, action };
+}
+
+async function ensureSpiderInitOnceForRequest(req) {
+    if (!req || !req.raw) return;
+    const skip = req.headers && (req.headers['x-cp-skip-auto-init'] || req.headers['X-CP-SKIP-AUTO-INIT']);
+    if (String(skip || '') === '1') return;
+
+    const rawUrl = String(req.raw.url || '');
+    const pathname = rawUrl.split('?')[0] || '';
+    const parsed = parseStandardSpiderPath(pathname);
+    if (!parsed) return;
+    if (parsed.action === 'init') return;
+
+    const user = sanitizeTvUsername(getCurrentTvUser());
+    const cacheKey = `${user}:${parsed.base}`;
+    const cur = spiderAutoInitState.get(cacheKey) || { done: false, inflight: null, noInit: false, nextRetryAtMs: 0 };
+    if (cur.done || cur.noInit) return;
+    if (cur.nextRetryAtMs && Date.now() < Number(cur.nextRetryAtMs)) return;
+    if (cur.inflight) {
+        await cur.inflight;
+        return;
+    }
+
+    const tvUserHeader = user ? { 'X-TV-User': user } : {};
+    const inflight = (async () => {
+        try {
+            const res = await req.server.inject({
+                method: 'POST',
+                url: `${parsed.base}/init`,
+                headers: {
+                    'content-type': 'application/json',
+                    'x-cp-skip-auto-init': '1',
+                    ...tvUserHeader,
+                },
+                payload: {},
+            });
+            if (res && res.statusCode === 404) {
+                cur.noInit = true;
+                return;
+            }
+            if (res && res.statusCode >= 200 && res.statusCode < 300) {
+                cur.done = true;
+                return;
+            }
+            // Avoid spamming init on every request when init keeps failing.
+            cur.nextRetryAtMs = Date.now() + 60 * 1000;
+        } catch (_) {}
+    })();
+
+    cur.inflight = inflight;
+    spiderAutoInitState.set(cacheKey, cur);
+    try {
+        await inflight;
+    } finally {
+        cur.inflight = null;
+        spiderAutoInitState.set(cacheKey, cur);
+    }
+}
+
+function markSpiderAutoInitDoneFromInitResponse(req, reply) {
+    try {
+        if (!req || !req.raw || !reply) return;
+        const rawUrl = String(req.raw.url || '');
+        const pathname = rawUrl.split('?')[0] || '';
+        const parsed = parseStandardSpiderPath(pathname);
+        if (!parsed || parsed.action !== 'init') return;
+
+        const user = sanitizeTvUsername(getCurrentTvUser());
+        const cacheKey = `${user}:${parsed.base}`;
+        const cur = spiderAutoInitState.get(cacheKey) || { done: false, inflight: null, noInit: false, nextRetryAtMs: 0 };
+        const code = Number(reply.statusCode || 0);
+        if (code >= 200 && code < 300) {
+            cur.done = true;
+            cur.noInit = false;
+            cur.nextRetryAtMs = 0;
+        }
+        spiderAutoInitState.set(cacheKey, cur);
+    } catch (_) {}
+}
+
 function getEmbeddedRootDir() {
     // When bundled by esbuild (cjs), `__dirname` points to `dist/`.
     // When packaged by pkg, `__dirname` points into `/snapshot/.../dist`.
@@ -3156,6 +3247,22 @@ async function loadOneFile(filePath) {
             if (spider && typeof spider.api === 'function') {
                 const originalApi = spider.api;
                 spider.api = async (instance, opts) => {
+                    instance.addHook('onRequest', async (req, _reply) => {
+                        try {
+                            await ensureSpiderInitOnceForRequest(req);
+                        } catch (_) {}
+                    });
+
+                    if (!instance.__cp_auto_init_mark) {
+                        instance.__cp_auto_init_mark = true;
+                        instance.addHook('onSend', async (req, reply, payload) => {
+                            try {
+                                markSpiderAutoInitDoneFromInitResponse(req, reply);
+                            } catch (_) {}
+                            return payload;
+                        });
+                    }
+
                     // Ensure Quark directory vars are bound for this request/user before any handlers run.
                     instance.addHook('onRequest', async (req, _reply) => {
                         try {
