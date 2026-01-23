@@ -6,7 +6,7 @@ import http from 'node:http';
 import https from 'node:https';
 import zlib from 'node:zlib';
 import { createRequire } from 'module';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { getCurrentTvUser, sanitizeTvUsername } from './tvUserContext.js';
 
 let cache = {
@@ -36,6 +36,37 @@ const directLinkConfigState = {
     size: 0,
     config: { directLinkEnabled: true, rewriteBase: '' },
 };
+
+const customScriptManifestCache = new Map();
+
+function readCustomScriptManifest(filePath) {
+    const filename = typeof filePath === 'string' ? filePath : '';
+    if (!filename) return null;
+    const manifestPath = `${filename}.manifest.json`;
+    try {
+        if (!fs.existsSync(manifestPath)) return null;
+        const st = fs.statSync(manifestPath);
+        const cached = customScriptManifestCache.get(manifestPath);
+        if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached.data;
+
+        const raw = fs.readFileSync(manifestPath, 'utf8');
+        const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
+        const data = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+        customScriptManifestCache.set(manifestPath, { mtimeMs: st.mtimeMs, size: st.size, data });
+        return data;
+    } catch (_e) {
+        return null;
+    }
+}
+
+function normalizeCustomScriptFormat(value) {
+    const v = String(value || '').trim().toLowerCase();
+    if (!v) return 'vm';
+    if (v === 'vm') return 'vm';
+    if (v === 'esm' || v === 'module') return 'esm';
+    if (v === 'cjs' || v === 'commonjs') return 'cjs';
+    return 'vm';
+}
 
 const spiderAutoInitState = new Map();
 
@@ -572,7 +603,7 @@ async function quarkResolveDownloadUrlViaApi({ shareId, stoken, fid, fidToken, t
     const deadline = Date.now() + 60_000;
     let retryIndex = 0;
     while (Date.now() < deadline) {
-        // Quark task endpoint returns progressively richer payloads as retry_index increases (see two.js logic).
+        // Quark task endpoint returns progressively richer payloads as retry_index increases (seen in some bundles).
         const u = `${taskUrlBase}&task_id=${encodeURIComponent(taskID)}&retry_index=${retryIndex}`;
         retryIndex += 1;
         const taskResp = await fetchJson(u, { method: 'GET', headers });
@@ -858,7 +889,7 @@ function parseQuarkProxyDownUrl(urlStr) {
         decoded = decodeURIComponent(enc);
     } catch (_) {}
     const segs = decoded.split('*');
-    // two.js encodes quark share tokens as: "<stoken>*<fid>*<fid_token>" (no shareId in this segment).
+    // Some bundles encode quark share tokens as: "<stoken>*<fid>*<fid_token>" (no shareId in this segment).
     const stoken = segs[0] || '';
     const fid = segs[1] || '';
     const fidToken = segs[2] || '';
@@ -872,7 +903,7 @@ const baiduProxyState = {
     map: new Map(), // token -> { url, headers, ts }
 };
 
-// Some custom bundles (e.g. two.js) contain the real Quark `download_url` resolver (`WKt`).
+// Some custom bundles contain the real Quark `download_url` resolver (`WKt`).
 // The play-rewrite hook is installed only once per Fastify instance, so we keep a module-level
 // reference to the bundle that actually provides Quark resolving.
 const quarkRuntime = {
@@ -1772,15 +1803,33 @@ function resolveCustomSourceDirCandidates() {
     return Array.from(new Set(candidates.filter(Boolean)));
 }
 
-function listJsFiles(dirPath) {
+function listCustomScriptFiles(dirPath) {
     if (!dirPath || !fs.existsSync(dirPath)) return [];
-    const files = fs
-        .readdirSync(dirPath, { withFileTypes: true })
-        .filter((it) => it.isFile())
-        .map((it) => it.name)
-        .filter((name) => name.endsWith('.js') && !name.startsWith('_'))
-        .sort((a, b) => a.localeCompare(b, 'en'));
-    return files.map((name) => path.join(dirPath, name));
+    const out = [];
+    const stack = [dirPath];
+    while (stack.length) {
+        const cur = stack.pop();
+        let entries;
+        try {
+            entries = fs.readdirSync(cur, { withFileTypes: true });
+        } catch (_) {
+            continue;
+        }
+        entries.forEach((ent) => {
+            const name = ent.name || '';
+            if (!name || name.startsWith('.') || name.startsWith('_')) return;
+            const full = path.join(cur, name);
+            if (ent.isDirectory()) {
+                stack.push(full);
+                return;
+            }
+            if (!ent.isFile()) return;
+            const lower = name.toLowerCase();
+            if (!(lower.endsWith('.js') || lower.endsWith('.mjs') || lower.endsWith('.cjs'))) return;
+            out.push(full);
+        });
+    }
+    return out.sort((a, b) => a.localeCompare(b, 'en'));
 }
 
 function unwrapIife(bundleCode) {
@@ -2206,6 +2255,73 @@ function collectFileStats(filePaths) {
 }
 
 async function loadOneFile(filePath) {
+    const manifest = readCustomScriptManifest(filePath) || null;
+    const scriptEnabled = manifest && Object.prototype.hasOwnProperty.call(manifest, 'enabled') ? !!manifest.enabled : true;
+    const scriptFormat = normalizeCustomScriptFormat(manifest && manifest.format);
+    if (!scriptEnabled) {
+        return { spiders: [], webPlugins: [], webError: 'disabled by manifest', websiteJs: '' };
+    }
+
+    if (scriptFormat === 'esm' || scriptFormat === 'cjs') {
+        try {
+            let mod = null;
+            if (scriptFormat === 'esm') {
+                const href = pathToFileURL(filePath).href;
+                // Bypass ESM import cache when the file changes.
+                const st = fs.statSync(filePath);
+                mod = await import(`${href}?mtime=${encodeURIComponent(String(st.mtimeMs))}`);
+            } else {
+                const req = createRequire(filePath);
+                mod = req(filePath);
+            }
+
+            const seed = [];
+            if (mod && typeof mod === 'object') seed.push(mod);
+            if (mod && typeof mod === 'object') seed.push(...Object.values(mod));
+
+            const spiders = collectSpidersDeep(seed).map((spider) => {
+                try {
+                    if (spider && typeof spider === 'object') {
+                        // Will be overwritten by outer loader with the relative path within custom_spider dir.
+                        spider.__customFile = path.basename(filePath);
+                        spider.__customFormat = scriptFormat;
+                    }
+                } catch (_) {}
+                return spider;
+            });
+
+            // Optional exports for non-bundled scripts.
+            const webPlugins = [];
+            let webError = '';
+            try {
+                const exportedWebPlugins =
+                    (mod && mod.webPlugins) || (mod && mod.default && mod.default.webPlugins) || null;
+                if (Array.isArray(exportedWebPlugins)) {
+                    exportedWebPlugins.forEach((p) => {
+                        if (!p || typeof p !== 'object') return;
+                        if (typeof p.prefix !== 'string' || !p.prefix) return;
+                        if (typeof p.plugin !== 'function') return;
+                        webPlugins.push({ prefix: p.prefix, plugin: p.plugin });
+                    });
+                }
+            } catch (e) {
+                webError = (e && e.message) || String(e);
+            }
+
+            let websiteJs = '';
+            try {
+                const websiteBundle = (mod && mod.websiteBundle) || (mod && mod.default && mod.default.websiteBundle) || null;
+                if (typeof websiteBundle === 'string') websiteJs = websiteBundle;
+                else if (typeof websiteBundle === 'function') websiteJs = String(websiteBundle() || '');
+            } catch (_) {}
+
+            return { spiders, webPlugins, webError, websiteJs };
+        } catch (err) {
+            const msg = (err && err.message) || String(err);
+            return { spiders: [], webPlugins: [], webError: `load ${scriptFormat} failed: ${msg}`, websiteJs: '' };
+        }
+    }
+
     const code = fs.readFileSync(filePath, 'utf8');
     const baseRequire = createRequire(filePath);
 
@@ -2857,24 +2973,22 @@ async function loadOneFile(filePath) {
     const timeoutMs = Number.parseInt(process.env.CATPAW_CUSTOM_SOURCE_TIMEOUT_MS || '', 10);
     script.runInContext(context, { timeout: Number.isFinite(timeoutMs) ? timeoutMs : 120000 });
 
-    // two.js sometimes expects an internal persistent store (`kO`) to exist and calls `kO.push(...)`
-    // from its request helper (`uA`). In server-only mode the store may be null, causing:
+    // Some bundled scripts expect an internal persistent store (`kO`) to exist and call `kO.push(...)`.
+    // In server-only mode the store may be null, causing crashes like:
     // "TypeError: Cannot read properties of null (reading 'push')".
     // Provide a minimal shim so the bundle won't crash. (It only affects persistence of refreshed cookie tokens.)
     try {
-        const base = filePath ? path.basename(filePath).toLowerCase() : '';
-        if (base === 'two.js') {
-            const hasPush = context && context.kO && typeof context.kO.push === 'function';
-            if (!hasPush) {
-                const shim = {
-                    push: async () => null,
-                    getData: async () => ({}),
-                    getObjectDefault: async (_path, def) => (def == null ? {} : def),
-                    delete: async () => null,
-                };
-                context.kO = shim;
-                if (context.globalThis) context.globalThis.kO = shim;
-            }
+        const hasK0Binding = context && Object.prototype.hasOwnProperty.call(context, 'kO');
+        const hasPush = hasK0Binding && context.kO && typeof context.kO.push === 'function';
+        if (hasK0Binding && !hasPush) {
+            const shim = {
+                push: async () => null,
+                getData: async () => ({}),
+                getObjectDefault: async (_path, def) => (def == null ? {} : def),
+                delete: async () => null,
+            };
+            context.kO = shim;
+            if (context.globalThis) context.globalThis.kO = shim;
         }
     } catch (_) {}
 
@@ -2888,7 +3002,7 @@ async function loadOneFile(filePath) {
         applyDirNameOverrideToContext();
     } catch (_) {}
 
-    // Capture the real Quark resolver context if the bundle provides it (two.js exposes `WKt`).
+    // Capture the Quark resolver context if the bundle provides it (some bundles expose `WKt`).
     // This avoids relying on whichever spider happened to install the global onSend hook first.
     try {
         if (typeof context.WKt === 'function') {
@@ -2897,7 +3011,7 @@ async function loadOneFile(filePath) {
         }
     } catch (_) {}
 
-    // two.js (and possibly other bundles) expects init config `hl.baiduuk` to be an array and calls `.includes(...)`.
+    // Some bundles expect init config `hl.baiduuk` to be an array and call `.includes(...)`.
     // Some init config endpoints omit this field, causing runtime crashes in `/play`.
     // Patch the global `hl` binding (when present) so any assignment guarantees `baiduuk` is always an array.
     try {
@@ -3092,7 +3206,7 @@ async function loadOneFile(filePath) {
             if (context.globalThis) context.globalThis[fnName] = context[fnName];
         };
 
-        // two.js uses `fa(...)` for Quark directory init; other bundles may use `ws(...)`.
+        // Different bundles may use different function names for Quark directory init.
         wrapCreateDirFn('fa');
         wrapCreateDirFn('ws');
     } catch (_) {}
@@ -3112,7 +3226,7 @@ async function loadOneFile(filePath) {
         }
     } catch (_) {}
 
-    // Some scripts (e.g. two.js) run a Quark "self-check/refresh" task (`MBe`) that may delete files in the
+    // Some scripts run a Quark "self-check/refresh" task (`MBe`) that may delete files in the
     // configured destination folder. If the destination folder fid (`s8`) is missing, some APIs default to root.
     // Guard against accidental root cleanup by skipping the task when a safe folder fid cannot be resolved.
     try {
@@ -3148,7 +3262,7 @@ async function loadOneFile(filePath) {
         }
     } catch (_) {}
 
-    // Normalize Quark proxy errors (two.js) so callers can distinguish "stoken expired" from generic failures.
+    // Normalize Quark proxy errors so callers can distinguish "stoken expired" from generic failures.
     // Applies ONLY to Quark proxy handler (`KBe`), other pans have different error codes.
     try {
                 if (typeof context.KBe === 'function') {
@@ -3723,7 +3837,7 @@ async function loadOneFile(filePath) {
         webPlugins.push({ prefix, plugin });
     };
 
-    // 1) Prefer discovering plugins from the script itself (e.g. two.js uses `_te`/`fMe`/...).
+    // 1) Prefer discovering plugins from the script itself (some bundles use `_te`/`fMe`/...).
     try {
         const detectedFromScript = detectWebPluginSymbols(code);
         for (const [prefix, symbol] of detectedFromScript.entries()) {
@@ -3811,8 +3925,15 @@ export async function loadCustomSourceSpiders() {
         }
     }
 
-    const filePaths = listJsFiles(dirPath);
-    const files = collectFileStats(filePaths);
+    const scriptPaths = listCustomScriptFiles(dirPath);
+    const manifestPaths = [];
+    scriptPaths.forEach((p) => {
+        const mp = `${p}.manifest.json`;
+        try {
+            if (fs.existsSync(mp)) manifestPaths.push(mp);
+        } catch (_) {}
+    });
+    const files = collectFileStats([...scriptPaths, ...manifestPaths]);
     if (cache.dirPath === dirPath && sameFiles(cache.files, files)) {
         return cache.spiders;
     }
@@ -3826,8 +3947,11 @@ export async function loadCustomSourceSpiders() {
     const websiteErrors = {};
     const websiteByFile = {};
     const allWebsiteBundles = [];
-    for (const filePath of filePaths) {
-        const fileName = path.basename(filePath);
+    for (const filePath of scriptPaths) {
+        const fileName = path
+            .relative(dirPath, filePath)
+            .split(path.sep)
+            .join('/');
         try {
             const startNs = process.hrtime.bigint();
             const { spiders, webPlugins, webError, websiteJs } = await loadOneFile(filePath);

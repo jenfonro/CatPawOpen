@@ -29,6 +29,12 @@ Build `npm run build`
 ### Custom Source 站点（custom_source）
 
 - 将自定义站点脚本放到：`CatPawOpen/custom_spider/`
+- 支持递归子目录与多种扩展名：`.js` / `.mjs` / `.cjs`
+- 可选：为任意脚本添加同名清单来控制加载方式：`<script>.manifest.json`（例如 `foo.js.manifest.json`）
+  - `{"enabled": false}`：禁用该脚本
+  - `{"format": "vm"}`（默认）：VM 沙盒方式加载（兼容各类打包脚本）
+  - `{"format": "esm"}`：按原生 ESM `import()` 加载（适合你后续新增的“非打包”脚本）
+  - `{"format": "cjs"}`：按 CommonJS `require()` 加载
 - 启动时会加载该目录下所有 `.js`（忽略 `_` 开头文件）
 - 查看加载状态：`/custom_source`
 
