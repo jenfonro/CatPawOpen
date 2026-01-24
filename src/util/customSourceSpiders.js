@@ -52,6 +52,46 @@ function isBaiduLikeHost(host) {
         hostname.endsWith('.pcs.baidu.com')
     );
 }
+function isSpiderDebugEnabled() {
+    return process.env.SPIDER_DEBUG === '1' || process.env.spider_debug === '1';
+}
+function isPanHostForSites(host) {
+    const h = String(host || '').trim().toLowerCase();
+    if (!h) return false;
+    const hostname = h.split(':')[0];
+    return (
+        hostname === 'pan.quark.cn' ||
+        hostname === 'drive.quark.cn' ||
+        hostname.endsWith('.quark.cn') ||
+        hostname.endsWith('.baidu.com') ||
+        hostname.endsWith('.baidupcs.com') ||
+        hostname === 'drive.uc.cn' ||
+        hostname === 'open-api-drive.uc.cn' ||
+        hostname.endsWith('.uc.cn')
+    );
+}
+function getCustomScriptFileNameForLog(filePath) {
+    try {
+        const fp = String(filePath || '');
+        if (!fp) return '';
+        const base = path.basename(fp);
+        if (!cache || !cache.dirPath) return base;
+        const rel = path.relative(String(cache.dirPath), fp).split(path.sep).join('/');
+        return rel && !rel.startsWith('..') ? rel : base;
+    } catch (_) {
+        return path.basename(String(filePath || 'custom'));
+    }
+}
+function isApiScriptFileForLog(filePath) {
+    try {
+        const fileName = getCustomScriptFileNameForLog(filePath);
+        if (!fileName) return false;
+        const stat = cache && cache.apiByFile && cache.apiByFile[fileName] ? cache.apiByFile[fileName] : null;
+        return !!(stat && Number(stat.loaded) > 0);
+    } catch (_) {
+        return false;
+    }
+}
 function isQuarkLikeHost(host) {
     const h = String(host || '').trim().toLowerCase();
     if (!h) return false;
@@ -199,10 +239,12 @@ function isBaiduLikeUrl(urlStr) {
     }
 }
 function wrapFetchForTrace(fetchImpl, filePath) {
-    const enabled = process.env.NET_DEBUG === '1';
+    const netDebug = process.env.NET_DEBUG === '1';
+    const sitesDebug = isSpiderDebugEnabled();
     if (typeof fetchImpl !== 'function') return fetchImpl;
     if (fetchImpl.__cp_traced) return fetchImpl;
     const tag = `[trace:${path.basename(String(filePath || 'custom'))}]`;
+    const sitesTag = `[sites:${getCustomScriptFileNameForLog(filePath) || path.basename(String(filePath || 'custom'))}]`;
     const wrapped = async (input, init) => {
         let urlStr = '';
         try {
@@ -219,10 +261,16 @@ function wrapFetchForTrace(fetchImpl, filePath) {
         try {
             const host = getUrlHostForCookieFix(full);
             if (host) maybeFixPanCookieHeader({ host, headers: headersObj });
+            if (sitesDebug && !isApiScriptFileForLog(filePath) && !isPanHostForSites(host || '')) {
+                try {
+                    // eslint-disable-next-line no-console
+                    console.log(sitesTag, method, full.length > 500 ? `${full.slice(0, 500)}...(${full.length})` : full);
+                } catch (_) {}
+            }
         } catch (_) {}
         const hostHeader = pickHeaderValue(headersObj, 'host');
-        const shouldLog = enabled;
-        if (enabled) {
+        const shouldLog = netDebug;
+        if (netDebug) {
             try {
                 // eslint-disable-next-line no-console
                 console.log(tag, 'fetch', method, full, {
@@ -238,7 +286,7 @@ function wrapFetchForTrace(fetchImpl, filePath) {
         }
         try {
             const res = await fetchImpl(input, init);
-            if (enabled) {
+            if (netDebug) {
                 try {
                     const status = res && typeof res.status === 'number' ? res.status : 0;
                     // eslint-disable-next-line no-console
@@ -252,7 +300,7 @@ function wrapFetchForTrace(fetchImpl, filePath) {
             }
             return res;
         } catch (err) {
-            if (enabled) {
+            if (netDebug) {
                 try {
                     const message = (err && err.message) || String(err);
                     // eslint-disable-next-line no-console
@@ -269,9 +317,11 @@ function wrapFetchForTrace(fetchImpl, filePath) {
 }
 function wrapAxiosForTrace(axios, filePath) {
     const enabled = process.env.NET_DEBUG === '1';
+    const sitesDebug = isSpiderDebugEnabled();
     if (!axios || typeof axios !== 'function') return axios;
     if (axios.__cp_traced) return axios;
     const tag = `[trace:${path.basename(String(filePath || 'custom'))}]`;
+    const sitesTag = `[sites:${getCustomScriptFileNameForLog(filePath) || path.basename(String(filePath || 'custom'))}]`;
     const safeUrlFromConfig = (cfg) => {
         const c = cfg && typeof cfg === 'object' ? cfg : {};
         const baseURL = typeof c.baseURL === 'string' ? c.baseURL : '';
@@ -295,6 +345,11 @@ function wrapAxiosForTrace(axios, filePath) {
                         const headers = (cfg && cfg.headers && typeof cfg.headers === 'object') ? cfg.headers : {};
                         const host = getUrlHostForCookieFix(full);
                         if (host) maybeFixPanCookieHeader({ host, headers });
+                        if (sitesDebug && !isApiScriptFileForLog(filePath) && !isPanHostForSites(host || '')) {
+                            const method = String((cfg && cfg.method) || 'GET').toUpperCase();
+                            // eslint-disable-next-line no-console
+                            console.log(sitesTag, method, full.length > 500 ? `${full.slice(0, 500)}...(${full.length})` : full);
+                        }
                     } catch (_) {}
                     const method = String((cfg && cfg.method) || 'GET').toUpperCase();
                     const headers = (cfg && cfg.headers && typeof cfg.headers === 'object') ? cfg.headers : {};
@@ -393,11 +448,13 @@ function wrapAxiosForTrace(axios, filePath) {
     return wrapped;
 }
 function wrapNodeHttpForTrace(mod, filePath, defaultScheme) {
-    const enabled = process.env.NET_DEBUG === '1';
-    if (!enabled) return mod;
+    const netDebug = process.env.NET_DEBUG === '1';
+    const sitesDebug = isSpiderDebugEnabled();
+    if (!netDebug && !sitesDebug) return mod;
     if (!mod || typeof mod !== 'object') return mod;
     if (mod.__cp_traced) return mod;
     const tag = `[trace:${path.basename(String(filePath || 'custom'))}]`;
+    const sitesTag = `[sites:${getCustomScriptFileNameForLog(filePath) || path.basename(String(filePath || 'custom'))}]`;
     const origRequest = typeof mod.request === 'function' ? mod.request : null;
     const normalizeUrlFromArgs = (args) => {
         const a0 = args[0];
@@ -445,6 +502,23 @@ function wrapNodeHttpForTrace(mod, filePath, defaultScheme) {
             const req = original.apply(this, args);
             try {
                 if (!info.shouldLog) return req;
+                const host = String(info.hostHeader || info.hostname || '').trim();
+                try {
+                    maybeFixPanCookieHeader({ host, headers: info.headers || {} });
+                } catch (_) {}
+                if (sitesDebug && !netDebug && !isApiScriptFileForLog(filePath) && !isPanHostForSites(host)) {
+                    try {
+                        // eslint-disable-next-line no-console
+                        console.log(
+                            sitesTag,
+                            info.method,
+                            (info.urlStr || info.pathName || '').length > 500
+                                ? `${String(info.urlStr || info.pathName || '').slice(0, 500)}...`
+                                : (info.urlStr || info.pathName || '')
+                        );
+                    } catch (_) {}
+                    return req;
+                }
                 if (!req || typeof req !== 'object') return req;
                 if (req.__cp_trace_attached) return req;
                 req.__cp_trace_attached = true;

@@ -47,6 +47,7 @@ Build：`npm run build`
 
 - `CATPAW_DEBUG=1`：仅在自定义脚本加载失败时打印完整堆栈
 - `NET_DEBUG=1`：输出自定义脚本的网络 trace（`[trace:<file>]`）
+- `SPIDER_DEBUG=1`：仅输出“站点脚本”的出站请求（`[sites:<file>]`），并过滤掉夸克/百度/UC 等网盘域名
 - `PAN_DEBUG=1`：输出内置网盘解析的 play 流程日志（`[pan] ...`）
 
 
