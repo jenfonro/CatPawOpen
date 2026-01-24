@@ -49,6 +49,63 @@ function normalizeHttpBase(value) {
     }
 }
 
+function pickForwardedFirst(value) {
+    if (typeof value !== 'string') return '';
+    const first = value.split(',')[0];
+    return String(first || '').trim();
+}
+
+function getExternalOriginFromRequest(request) {
+    const headers = (request && request.headers) || {};
+    const proto = pickForwardedFirst(headers['x-forwarded-proto']) || '';
+    const host = pickForwardedFirst(headers['x-forwarded-host']) || String(headers.host || '').trim();
+    if (!host) return '';
+    const scheme = proto === 'https' || proto === 'http' ? proto : 'http';
+    return `${scheme}://${host}`;
+}
+
+function rewriteLocalUrlToExternal(url, externalOrigin) {
+    if (!externalOrigin || typeof url !== 'string') return url;
+    const raw = url.trim();
+    if (!raw) return url;
+    let parsed;
+    try {
+        parsed = new URL(raw);
+    } catch (_) {
+        return url;
+    }
+    const host = String(parsed.hostname || '').toLowerCase();
+    if (host !== '127.0.0.1' && host !== 'localhost' && host !== '0.0.0.0') return url;
+    // Only rewrite URLs that clearly point back to this service.
+    const pathName = String(parsed.pathname || '');
+    if (!pathName.startsWith('/')) return url;
+    return `${externalOrigin}${pathName}${parsed.search || ''}${parsed.hash || ''}`;
+}
+
+function rewriteLocalUrlsDeep(value, externalOrigin) {
+    const seen = new WeakSet();
+    const walk = (node) => {
+        if (typeof node === 'string') return rewriteLocalUrlToExternal(node, externalOrigin);
+        if (!node || typeof node !== 'object') return node;
+        if (seen.has(node)) return node;
+        seen.add(node);
+        if (Array.isArray(node)) {
+            for (let i = 0; i < node.length; i += 1) node[i] = walk(node[i]);
+            return node;
+        }
+        Object.keys(node).forEach((k) => {
+            node[k] = walk(node[k]);
+        });
+        return node;
+    };
+    return walk(value);
+}
+
+function isSpiderPlayPath(urlPath) {
+    const p = String(urlPath || '').split('?')[0];
+    return /^\/spider\/[^/]+\/\d+\/play$/.test(p);
+}
+
 function readDirectLinkEnabledFromConfigRoot(root) {
     const cfg = root && typeof root === 'object' && !Array.isArray(root) ? root : {};
     const directLink =
@@ -286,6 +343,37 @@ export default async function router(fastify) {
             tvUserStorage.enterWith({ user });
         } catch (_) {}
         done();
+    });
+
+    // Rewrite play response URLs like `http://127.0.0.1:PORT/...` into the externally accessed origin.
+    // This keeps clients from needing a local CatPawOpen instance.
+    fastify.addHook('preSerialization', (request, _reply, payload, done) => {
+        try {
+            const urlPath = (request && request.raw && request.raw.url) || request.url || '';
+            if (!isSpiderPlayPath(urlPath)) return done(null, payload);
+            const externalOrigin = getExternalOriginFromRequest(request);
+            if (!externalOrigin) return done(null, payload);
+            if (payload && typeof payload === 'object') rewriteLocalUrlsDeep(payload, externalOrigin);
+        } catch (_) {}
+        done(null, payload);
+    });
+    fastify.addHook('onSend', async (request, reply, payload) => {
+        try {
+            const urlPath = (request && request.raw && request.raw.url) || request.url || '';
+            if (!isSpiderPlayPath(urlPath)) return payload;
+            const externalOrigin = getExternalOriginFromRequest(request);
+            if (!externalOrigin) return payload;
+            const ct = String(reply.getHeader('content-type') || '').toLowerCase();
+            const isJson = ct.includes('application/json') || ct.includes('+json');
+            const text = Buffer.isBuffer(payload) ? payload.toString('utf8') : typeof payload === 'string' ? payload : '';
+            if (!isJson && (!text.startsWith('{') && !text.startsWith('['))) return payload;
+            const parsed = text ? JSON.parse(text) : null;
+            if (!parsed || typeof parsed !== 'object') return payload;
+            rewriteLocalUrlsDeep(parsed, externalOrigin);
+            return JSON.stringify(parsed);
+        } catch (_) {
+            return payload;
+        }
     });
 
     // CORS is handled by reverse proxy (Nginx); do not add CORS hooks here.
