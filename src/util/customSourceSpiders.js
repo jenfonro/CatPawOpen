@@ -121,7 +121,7 @@ function isBaiduLikeUrl(urlStr) {
     }
 }
 function wrapFetchForTrace(fetchImpl, filePath) {
-    const enabled = process.env.CATPAW_DEBUG === '1';
+    const enabled = process.env.NET_DEBUG === '1';
     if (!enabled) return fetchImpl;
     if (typeof fetchImpl !== 'function') return fetchImpl;
     if (fetchImpl.__cp_traced) return fetchImpl;
@@ -187,7 +187,7 @@ function wrapFetchForTrace(fetchImpl, filePath) {
     return wrapped;
 }
 function wrapAxiosForTrace(axios, filePath) {
-    const enabled = process.env.CATPAW_DEBUG === '1';
+    const enabled = process.env.NET_DEBUG === '1';
     if (!enabled) return axios;
     if (!axios || typeof axios !== 'function') return axios;
     if (axios.__cp_traced) return axios;
@@ -304,7 +304,7 @@ function wrapAxiosForTrace(axios, filePath) {
     return wrapped;
 }
 function wrapNodeHttpForTrace(mod, filePath, defaultScheme) {
-    const enabled = process.env.CATPAW_DEBUG === '1';
+    const enabled = process.env.NET_DEBUG === '1';
     if (!enabled) return mod;
     if (!mod || typeof mod !== 'object') return mod;
     if (mod.__cp_traced) return mod;
@@ -1441,7 +1441,7 @@ async function loadOneFile(filePath) {
         return fn;
     })();
     if (false) {
-    const BAIDU_DEBUG = process.env.CATPAW_DEBUG === '1';
+    const BAIDU_DEBUG = process.env.NET_DEBUG === '1';
     const baiduLog = (...args) => {
         if (!BAIDU_DEBUG) return;
         // eslint-disable-next-line no-console
@@ -1843,7 +1843,7 @@ async function loadOneFile(filePath) {
         const v = Number.parseInt(process.env.CATPAW_QUARK_INIT_COOLDOWN_MS || '', 10);
         return Number.isFinite(v) && v >= 0 ? v : 60_000;
     })();
-    const QUARK_DEBUG = process.env.CATPAW_DEBUG === '1';
+    const QUARK_DEBUG = process.env.NET_DEBUG === '1';
     const quarkMask = (v) => {
         const s = String(v || '').trim();
         if (!s) return '';
