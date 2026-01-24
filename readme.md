@@ -51,14 +51,6 @@ Build：`npm run build`
 - `PAN_DEBUG=1`：输出内置网盘解析的 play 流程日志（`[pan] ...`）
 
 
-### 播放流程（重要）：
-- 客户端请求 `CatPawOpen` 获取播放地址（以及 `header` 等必要参数）
-- 客户端请求 `GoProxy` 注册 `{url, headers}`（`POST /register`）
-- 客户端使用 `GoProxy` 返回的 token 地址播放（`GET /<token>`）
-
-说明：
-- `CatPawOpen` 不会与 `GoProxy` 通信；是否使用 `GoProxy` 由 `TV_Server` 前端决定。
-
 ## Nginx反代配置
 
 需要确保把外部访问域名信息转发给 CatPawOpen（用于播放地址改写）：

@@ -3,5 +3,5 @@ generated
 node_modules
 db.json
 custom_spider/*
-!custom_spider/baidu.js
-!custom_spider/quark.js
+!custom_spider/baidu.cjs
+!custom_spider/quark.cjs

@@ -477,7 +477,7 @@ async function resolveDownloadUrl({ shareId, stoken, fid, fidToken, toPdirFid, c
   return await quarkDirectDownload({ fid: pickedFid, fidToken: pickedToken, cookie, want });
 }
 
-export const apiPlugins = [
+const apiPlugins = [
   {
     prefix: '/api/quark',
     plugin: async function quarkApi(instance) {
@@ -992,3 +992,5 @@ export const apiPlugins = [
     },
   },
 ];
+
+module.exports = { apiPlugins };

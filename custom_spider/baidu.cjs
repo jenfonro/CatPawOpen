@@ -1,9 +1,8 @@
 // Baidu Netdisk API plugin.
 
-import axios from 'axios';
-import http from 'http';
-import https from 'https';
-import zlib from 'node:zlib';
+const http = require('http');
+const https = require('https');
+const zlib = require('zlib');
 
 const BAIDU_SCRIPT_WEB_UA =
   'Mozilla/5.0 (Linux; Android 12; V2238A) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.40 Safari/537.36';
@@ -11,6 +10,8 @@ const BAIDU_SCRIPT_NETDISK_UA = 'netdisk;12.11.9;V2238A;android-android;12;JSbri
 const BAIDU_PLAY_UA = 'com.android.chrome/131.0.6778.200 (Linux;Android 10) AndroidXMedia3/1.5.1';
 const BAIDU_APP_ID = '250528';
 const PAN_DEBUG = process.env.PAN_DEBUG === '1';
+const fetchFn =
+  typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : null;
 
 function panLog(...args) {
   if (!PAN_DEBUG) return;
@@ -25,13 +26,195 @@ function maskForLog(value, head = 6, tail = 4) {
   return `${s.slice(0, head)}...${s.slice(-tail)}`;
 }
 
-const baiduHttp = axios.create({
-  httpAgent: new http.Agent({ keepAlive: true }),
-  httpsAgent: new https.Agent({ keepAlive: true, rejectUnauthorized: false }),
-  maxRedirects: 5,
-  validateStatus: () => true,
-  responseType: 'arraybuffer',
-});
+const httpAgent = new http.Agent({ keepAlive: true });
+const httpsAgent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
+
+function normalizeHeaderKey(k) {
+  return String(k || '').trim();
+}
+
+function normalizeHeaders(h) {
+  const out = {};
+  if (!h || typeof h !== 'object') return out;
+  for (const [k, v] of Object.entries(h)) {
+    const key = normalizeHeaderKey(k);
+    if (!key) continue;
+    out[key] = v;
+  }
+  return out;
+}
+
+function pickSetCookie(headers) {
+  if (!headers || typeof headers !== 'object') return [];
+  const v = headers['set-cookie'] || headers['Set-Cookie'];
+  if (!v) return [];
+  if (Array.isArray(v)) return v.map((x) => String(x || '')).filter(Boolean);
+  return [String(v || '')].filter(Boolean);
+}
+
+function splitSetCookieHeader(headerValue) {
+  const s = String(headerValue || '').trim();
+  if (!s) return [];
+  const out = [];
+  let start = 0;
+  let i = 0;
+  let inExpires = false;
+  while (i < s.length) {
+    const ch = s[i];
+    if (!inExpires) {
+      if (ch === ',') {
+        const part = s.slice(start, i).trim();
+        if (part) out.push(part);
+        start = i + 1;
+        i += 1;
+        continue;
+      }
+      if ((ch === 'E' || ch === 'e') && s.slice(i, i + 8).toLowerCase() === 'expires=') {
+        inExpires = true;
+        i += 8;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === ';') inExpires = false;
+    i += 1;
+  }
+  const last = s.slice(start).trim();
+  if (last) out.push(last);
+  return out;
+}
+
+function getFetchSetCookies(headers) {
+  if (!headers) return [];
+  try {
+    if (typeof headers.getSetCookie === 'function') {
+      const v = headers.getSetCookie();
+      return Array.isArray(v) ? v.map((x) => String(x || '')).filter(Boolean) : [];
+    }
+  } catch {}
+  try {
+    if (typeof headers.raw === 'function') {
+      const raw = headers.raw();
+      const v = raw && raw['set-cookie'];
+      return Array.isArray(v) ? v.map((x) => String(x || '')).filter(Boolean) : [];
+    }
+  } catch {}
+  try {
+    if (typeof headers.get === 'function') {
+      return splitSetCookieHeader(headers.get('set-cookie'));
+    }
+  } catch {}
+  return [];
+}
+
+async function httpRequestOnce(urlStr, init) {
+  const url = new URL(String(urlStr || '').trim());
+  const isHttps = url.protocol === 'https:';
+  const method = String((init && init.method) || 'GET').toUpperCase();
+  const headers = normalizeHeaders(init && init.headers);
+  const body = init && Object.prototype.hasOwnProperty.call(init, 'body') ? init.body : undefined;
+  const timeoutMs = Number.isFinite(Number(init && init.timeoutMs)) ? Number(init.timeoutMs) : 30000;
+  const maxBytes = Number.isFinite(Number(init && init.maxBytes)) ? Number(init.maxBytes) : 30 * 1024 * 1024;
+
+  const bodyBuf =
+    body == null
+      ? null
+      : Buffer.isBuffer(body)
+        ? body
+        : typeof body === 'string'
+          ? Buffer.from(body, 'utf8')
+          : Buffer.from(String(body), 'utf8');
+
+  const reqHeaders = { ...headers };
+  if (!Object.keys(reqHeaders).some((k) => k.toLowerCase() === 'accept-encoding')) {
+    reqHeaders['Accept-Encoding'] = 'gzip, deflate, br';
+  }
+  if (bodyBuf && !Object.keys(reqHeaders).some((k) => k.toLowerCase() === 'content-length')) {
+    reqHeaders['Content-Length'] = String(bodyBuf.length);
+  }
+
+  const lib = isHttps ? https : http;
+  const agent = isHttps ? httpsAgent : httpAgent;
+  const options = {
+    protocol: url.protocol,
+    hostname: url.hostname,
+    port: url.port ? Number(url.port) : isHttps ? 443 : 80,
+    path: `${url.pathname || '/'}${url.search || ''}`,
+    method,
+    headers: reqHeaders,
+    agent,
+  };
+
+  return await new Promise((resolve, reject) => {
+    const req = lib.request(options, (res) => {
+      const chunks = [];
+      let bytes = 0;
+      res.on('data', (chunk) => {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bytes += buf.length;
+        if (bytes > maxBytes) {
+          try {
+            req.destroy(new Error('response too large'));
+          } catch {}
+          return;
+        }
+        chunks.push(buf);
+      });
+      res.on('end', () => {
+        const raw = chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0);
+        resolve({
+          status: res.statusCode || 0,
+          headers: res.headers || {},
+          body: raw,
+          url: url.toString(),
+        });
+      });
+    });
+    req.on('error', reject);
+    if (timeoutMs > 0) {
+      req.setTimeout(timeoutMs, () => {
+        try {
+          req.destroy(new Error('timeout'));
+        } catch {}
+      });
+    }
+    if (bodyBuf) req.write(bodyBuf);
+    req.end();
+  });
+}
+
+async function httpRequestFollow(urlStr, init) {
+  const maxRedirects = Number.isFinite(Number(init && init.maxRedirects)) ? Number(init.maxRedirects) : 5;
+  let current = String(urlStr || '').trim();
+  let method = String((init && init.method) || 'GET').toUpperCase();
+  let headers = normalizeHeaders(init && init.headers);
+  let body = init && Object.prototype.hasOwnProperty.call(init, 'body') ? init.body : undefined;
+  for (let i = 0; i <= maxRedirects; i += 1) {
+    const res = await httpRequestOnce(current, { ...init, method, headers, body });
+    const status = Number(res.status || 0);
+    const loc = (res.headers && (res.headers.location || res.headers.Location)) || '';
+    if ([301, 302, 303, 307, 308].includes(status) && loc) {
+      const next = new URL(String(loc), current).toString();
+      current = next;
+      if (status === 303) {
+        method = 'GET';
+        body = undefined;
+        // Drop content headers when switching to GET.
+        const nextHeaders = {};
+        for (const [k, v] of Object.entries(headers || {})) {
+          const lower = String(k || '').toLowerCase();
+          if (lower === 'content-length' || lower === 'content-type') continue;
+          nextHeaders[k] = v;
+        }
+        headers = nextHeaders;
+      }
+      continue;
+    }
+    return res;
+  }
+  throw new Error('too many redirects');
+}
 
 function looksLikeCookieString(v) {
   const s = String(v || '').trim();
@@ -137,20 +320,24 @@ async function fetchText(url, init) {
   const method = String((init && init.method) || 'GET').toUpperCase();
   const headers = (init && init.headers && typeof init.headers === 'object' ? init.headers : {}) || {};
   const body = init && Object.prototype.hasOwnProperty.call(init, 'body') ? init.body : undefined;
-  const res = await baiduHttp.request({
-    url,
-    method,
-    headers,
-    data: body,
-  });
-  const setCookie = Array.isArray(res.headers && res.headers['set-cookie'])
-    ? res.headers['set-cookie'].map((x) => String(x || '')).filter(Boolean)
-    : [];
-  const raw = Buffer.isBuffer(res.data) ? res.data : Buffer.from(res.data == null ? '' : res.data);
-  const enc = (res.headers && (res.headers['content-encoding'] || res.headers['Content-Encoding'])) || '';
+  if (fetchFn) {
+    const resp = await fetchFn(url, { method, headers, body, redirect: 'follow' });
+    const status = resp && typeof resp.status === 'number' ? resp.status : 0;
+    const setCookie = getFetchSetCookies(resp && resp.headers);
+    const ab = await resp.arrayBuffer();
+    const raw = Buffer.from(ab);
+    // Node's fetch (undici) transparently decompresses for us.
+    const text = raw.toString('utf8');
+    return { res: { status, headers: {} }, text, setCookie };
+  }
+
+  const resp = await httpRequestFollow(url, { ...init, method, headers, body, maxRedirects: 5 });
+  const setCookie = pickSetCookie(resp.headers);
+  const raw = Buffer.isBuffer(resp.body) ? resp.body : Buffer.from(resp.body == null ? '' : resp.body);
+  const enc = (resp.headers && (resp.headers['content-encoding'] || resp.headers['Content-Encoding'])) || '';
   const buf = decodeMaybeCompressed(raw, enc);
   const text = buf.toString('utf8');
-  return { res, text, setCookie };
+  return { res: { status: resp.status, headers: resp.headers }, text, setCookie };
 }
 
 async function fetchJson(url, init) {
@@ -404,19 +591,26 @@ function extractNameFromTvServerId(rawId) {
 async function resolveBaiduFinalUrlFromDlink(dlink) {
   const url = String(dlink || '').trim();
   if (!url) throw new Error('missing dlink');
-  const res = await baiduHttp.request({
-    url,
+  if (fetchFn) {
+    const resp = await fetchFn(url, {
+      method: 'GET',
+      redirect: 'follow',
+      headers: { 'User-Agent': BAIDU_PLAY_UA, Range: 'bytes=0-0' },
+    });
+    const status = resp && typeof resp.status === 'number' ? resp.status : 0;
+    if (!(status >= 200 && status < 400)) throw new Error(`baidu dlink resolve http ${status || 0}`);
+    return String((resp && resp.url) || url);
+  }
+  const resp = await httpRequestFollow(url, {
     method: 'GET',
     headers: { 'User-Agent': BAIDU_PLAY_UA, Range: 'bytes=0-0' },
     maxRedirects: 5,
+    timeoutMs: 30000,
+    maxBytes: 1024 * 1024,
   });
-  const status = res && typeof res.status === 'number' ? res.status : 0;
+  const status = Number(resp && resp.status) || 0;
   if (!(status >= 200 && status < 400)) throw new Error(`baidu dlink resolve http ${status || 0}`);
-  const finalUrl =
-    (res && res.request && res.request.res && res.request.res.responseUrl) ||
-    (res && res.request && res.request._redirectable && res.request._redirectable._currentUrl) ||
-    url;
-  return String(finalUrl || url);
+  return String(resp.url || url);
 }
 
 async function verifySharePwd({ surl, pwd, cookieRef }) {
@@ -635,7 +829,7 @@ async function baiduMediaInfoScript({ cookie, path }) {
   return data;
 }
 
-export const apiPlugins = [
+const apiPlugins = [
   {
     prefix: '/api/baidu',
     plugin: async function baiduApi(instance) {
@@ -1013,3 +1207,5 @@ export const apiPlugins = [
     },
   },
 ];
+
+module.exports = { apiPlugins };

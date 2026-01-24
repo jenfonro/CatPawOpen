@@ -1518,9 +1518,21 @@ async function loadOneFile(filePath) {
             let mod = null;
             if (scriptFormat === 'esm') {
                 const href = pathToFileURL(filePath).href;
-                // Bypass ESM import cache when the file changes.
-                const st = fs.statSync(filePath);
-                mod = await import(`${href}?mtime=${encodeURIComponent(String(st.mtimeMs))}`);
+                // In dev, bypass ESM import cache when the file changes.
+                // In pkg executables, avoid `?mtime=` because some runtimes don't support external ESM URL queries.
+                const isPkg = (() => {
+                    try {
+                        return !!(process && process.pkg);
+                    } catch (_) {
+                        return false;
+                    }
+                })();
+                if (isPkg) {
+                    mod = await import(href);
+                } else {
+                    const st = fs.statSync(filePath);
+                    mod = await import(`${href}?mtime=${encodeURIComponent(String(st.mtimeMs))}`);
+                }
             } else {
                 const req = createRequire(filePath);
                 mod = req(filePath);
