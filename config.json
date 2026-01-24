@@ -1,6 +1,6 @@
 {
   "proxy": "",
-  "directLink": {
-    "enabled": true
+  "panResolver": {
+    "builtinEnabled": false
   }
 }

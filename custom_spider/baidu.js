@@ -10,6 +10,20 @@ const BAIDU_SCRIPT_WEB_UA =
 const BAIDU_SCRIPT_NETDISK_UA = 'netdisk;12.11.9;V2238A;android-android;12;JSbridge4.4.0;jointBridge;1.1.0;';
 const BAIDU_PLAY_UA = 'com.android.chrome/131.0.6778.200 (Linux;Android 10) AndroidXMedia3/1.5.1';
 const BAIDU_APP_ID = '250528';
+const PAN_DEBUG = process.env.PAN_DEBUG === '1';
+
+function panLog(...args) {
+  if (!PAN_DEBUG) return;
+  // eslint-disable-next-line no-console
+  console.log('[pan]', ...args);
+}
+
+function maskForLog(value, head = 6, tail = 4) {
+  const s = String(value == null ? '' : value);
+  if (!s) return '';
+  if (s.length <= head + tail + 3) return s;
+  return `${s.slice(0, head)}...${s.slice(-tail)}`;
+}
 
 const baiduHttp = axios.create({
   httpAgent: new http.Agent({ keepAlive: true }),
@@ -260,16 +274,7 @@ function pickDirEntryFromApiList(data, dirPath) {
     dirs.find((it) => String(it.path || '').trim() === wantPath) ||
     (wantName ? dirs.find((it) => String(it.server_filename || it.filename || it.name || '').trim() === wantName) : null);
   if (exact) return exact;
-  if (!wantName) return null;
-  const pref = `${wantName}_`;
-  const candidates = dirs.filter((it) => {
-    const nm = String(it.server_filename || it.filename || it.name || '').trim();
-    const p = String(it.path || '').trim();
-    return (nm && nm.startsWith(pref)) || (p && p.startsWith(`/${pref}`));
-  });
-  if (!candidates.length) return null;
-  candidates.sort((a, b) => Number(b.mtime || 0) - Number(a.mtime || 0));
-  return candidates[0] || null;
+  return null;
 }
 
 async function baiduEnsureDir({ cookie, dirPath, bdstoken }) {
@@ -680,6 +685,9 @@ export const apiPlugins = [
       });
 
       instance.post('/play', async (req, reply) => {
+        const reqId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+        const tStart = Date.now();
+        let stage = 'recv';
         const body = req && typeof req.body === 'object' ? req.body : {};
         const flag = String(body.flag || '').trim();
         const id = String(body.id || '').trim();
@@ -693,7 +701,7 @@ export const apiPlugins = [
 
         const dirPath = destPathRaw
           ? destPathRaw.startsWith('/') ? destPathRaw : `/${destPathRaw}`
-          : destName ? `/${destName}` : '';
+          : destName ? `/${destName}` : '/TV_Server';
         if (!dirPath || !dirPath.startsWith('/')) {
           reply.code(400);
           return { ok: false, message: 'missing destPath/destName' };
@@ -707,6 +715,15 @@ export const apiPlugins = [
         }
 
         try {
+          panLog(`baidu play recv id=${reqId}`, {
+            dirPath,
+            flag: flag.length > 80 ? `${flag.slice(0, 80)}...(${flag.length})` : flag,
+            idLen: id.length,
+            tvUser: String((req && req.headers && (req.headers['x-tv-user'] || req.headers['X-TV-User'])) || ''),
+          });
+
+          stage = 'decode';
+          const tDecodeStart = Date.now();
           const decoded = decodePlayIdToJson(id);
           if (!decoded) {
             reply.code(400);
@@ -719,6 +736,15 @@ export const apiPlugins = [
           const pwd = String(decoded.pwd || decoded.pass || '').trim();
           const nameHint = extractNameFromTvServerId(id);
           const fileName = String(decoded.realName || decoded.server_filename || decoded.serverFilename || nameHint || '').trim();
+          panLog(`baidu play decode done id=${reqId}`, {
+            ms: Date.now() - tDecodeStart,
+            surl: maskForLog(surl, 4, 4),
+            shareid: maskForLog(shareid),
+            uk: maskForLog(uk),
+            fsid: maskForLog(fsid),
+            hasPwd: !!pwd,
+            fileName: fileName || undefined,
+          });
 
           if (!shareid || !uk || !fsid) {
             reply.code(400);
@@ -729,7 +755,23 @@ export const apiPlugins = [
             return { ok: false, message: 'missing filename' };
           }
 
+          stage = 'ensure_dir';
+          const tEnsureStart = Date.now();
           const ensured = await baiduEnsureDir({ cookie: baseCookie, dirPath });
+          const ensuredPathRaw =
+            ensured && ensured.data && typeof ensured.data === 'object'
+              ? (ensured.data.path || ensured.data.name)
+              : '';
+          const ensuredPath =
+            typeof ensuredPathRaw === 'string' && ensuredPathRaw.trim().startsWith('/') ? ensuredPathRaw.trim() : dirPath;
+          panLog(`baidu play ensure_dir done id=${reqId}`, {
+            ms: Date.now() - tEnsureStart,
+            existed: !!(ensured && ensured.data && ensured.data.existed),
+            path: ensuredPath,
+          });
+
+          stage = 'transfer';
+          const tTransferStart = Date.now();
           const transfer = await shareTransferToDirScript({
             baseCookie: ensured.cookie || baseCookie,
             shareid,
@@ -737,11 +779,14 @@ export const apiPlugins = [
             surl,
             pwd,
             fsid,
-            destPath: dirPath,
+            destPath: ensuredPath,
           });
+          panLog(`baidu play transfer done id=${reqId}`, { ms: Date.now() - tTransferStart });
 
           const safeName = fileName.replace(/^\/+/, '');
-          const fullPath = `${dirPath.replace(/\/+$/g, '')}/${safeName}`.replace(/\/{2,}/g, '/');
+          const fullPath = `${ensuredPath.replace(/\/+$/g, '')}/${safeName}`.replace(/\/{2,}/g, '/');
+          stage = 'mediainfo';
+          const tMediaStart = Date.now();
           const media = await baiduMediaInfoScript({ cookie: transfer.cookie || ensured.cookie || baseCookie, path: fullPath });
           const dlink =
             media &&
@@ -752,10 +797,36 @@ export const apiPlugins = [
               ? media.info.dlink
               : '';
           if (!dlink) throw new Error('mediainfo missing dlink');
+          panLog(`baidu play mediainfo done id=${reqId}`, {
+            ms: Date.now() - tMediaStart,
+            path: fullPath,
+            dlinkHost: (() => {
+              try {
+                return new URL(dlink).host;
+              } catch (_e) {
+                return '';
+              }
+            })(),
+          });
 
+          stage = 'resolve_final';
+          const tResolveStart = Date.now();
           const finalUrl = await resolveBaiduFinalUrlFromDlink(dlink);
+          panLog(`baidu play resolve_final done id=${reqId}`, {
+            ms: Date.now() - tResolveStart,
+            finalHost: (() => {
+              try {
+                return new URL(finalUrl).host;
+              } catch (_e) {
+                return '';
+              }
+            })(),
+          });
+          panLog(`baidu play done id=${reqId}`, { ms: Date.now() - tStart });
           return { ok: true, parse: 0, url: finalUrl, header: { 'User-Agent': BAIDU_PLAY_UA } };
         } catch (e) {
+          const message = (e && e.message) || String(e);
+          panLog(`baidu play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: message.slice(0, 400) });
           reply.code(502);
           return { ok: false, ...normalizeBaiduErr(e) };
         }

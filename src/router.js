@@ -107,14 +107,6 @@ function isSpiderPlayPath(urlPath) {
     return /^\/spider\/[^/]+\/\d+\/play$/.test(p);
 }
 
-function readDirectLinkEnabledFromConfigRoot(root) {
-    const cfg = root && typeof root === 'object' && !Array.isArray(root) ? root : {};
-    const directLink =
-        cfg && cfg.directLink && typeof cfg.directLink === 'object' && !Array.isArray(cfg.directLink) ? cfg.directLink : null;
-    if (directLink && Object.prototype.hasOwnProperty.call(directLink, 'enabled')) return !!directLink.enabled;
-    return true;
-}
-
 function readPanBuiltinResolverEnabledFromConfigRoot(root) {
     const cfg = root && typeof root === 'object' && !Array.isArray(root) ? root : {};
     const panResolver =
@@ -326,7 +318,7 @@ function decodeTvServerPlayId(rawId) {
  * @return {Promise<void>} - A Promise that resolves when the router is initialized
  */
 export default async function router(fastify) {
-    // Load persisted settings (proxy / directLink) from config.json on startup.
+    // Load persisted settings from config.json on startup.
     try {
         const cfgPath = getConfigJsonPath();
         const root = readConfigJsonSafe(cfgPath);
@@ -375,13 +367,18 @@ export default async function router(fastify) {
 
             const flag = typeof parsed.flag === 'string' ? parsed.flag : '';
             const id = typeof parsed.id === 'string' ? parsed.id : '';
-            if (!flag.includes('百度') || !id) return;
+            if (!id) return;
+            const isBaidu = flag.includes('百度');
+            const isQuark = flag.includes('夸克') || flag.toLowerCase().includes('quark');
+            if (!isBaidu && !isQuark) return;
 
+            const rawUrl = (request && request.raw && request.raw.url) || request.url || '';
+            const queryStr = rawUrl.includes('?') ? rawUrl.slice(rawUrl.indexOf('?')) : '';
             const destName = getGlobalPanDirNameForCurrentUser();
             const tvUser = getTvUserFromRequest(request);
             const injected = await fastify.inject({
                 method: 'POST',
-                url: '/api/baidu/play',
+                url: isBaidu ? `/api/baidu/play${queryStr}` : `/api/quark/play${queryStr}`,
                 headers: {
                     'content-type': 'application/json',
                     ...(tvUser ? { 'x-tv-user': tvUser } : {}),
@@ -659,7 +656,7 @@ export default async function router(fastify) {
         }
     }
 
-    // Unified admin settings endpoint so clients can persist proxy + direct-link mode with a single request.
+    // Unified admin settings endpoint so clients can persist proxy + pan settings with a single request.
     fastify.get('/admin/settings', async function (_request, reply) {
         const cfgPath = getConfigJsonPath();
         const root = readConfigJsonSafe(cfgPath);
@@ -667,7 +664,6 @@ export default async function router(fastify) {
             success: true,
             settings: {
                 proxy: getGlobalProxy() || '',
-                directLinkEnabled: readDirectLinkEnabledFromConfigRoot(root),
                 panBuiltinResolverEnabled: readPanBuiltinResolverEnabledFromConfigRoot(root),
             },
         });
@@ -680,8 +676,6 @@ export default async function router(fastify) {
 
         const hasProxy = Object.prototype.hasOwnProperty.call(body, 'proxy');
         const proxy = hasProxy && typeof body.proxy === 'string' ? body.proxy : getGlobalProxy() || '';
-        const hasDirect = Object.prototype.hasOwnProperty.call(body, 'directLinkEnabled');
-        const directLinkEnabled = hasDirect ? !!body.directLinkEnabled : readDirectLinkEnabledFromConfigRoot(prev);
         const hasPanBuiltin = Object.prototype.hasOwnProperty.call(body, 'panBuiltinResolverEnabled');
         const panBuiltinResolverEnabled = hasPanBuiltin ? !!body.panBuiltinResolverEnabled : readPanBuiltinResolverEnabledFromConfigRoot(prev);
 
@@ -696,10 +690,6 @@ export default async function router(fastify) {
         const next = {
             ...prev,
             proxy: applied || '',
-            directLink: {
-                ...(prev && prev.directLink && typeof prev.directLink === 'object' ? prev.directLink : {}),
-                enabled: !!directLinkEnabled,
-            },
             panResolver: {
                 ...(prev && prev.panResolver && typeof prev.panResolver === 'object' ? prev.panResolver : {}),
                 builtinEnabled: !!panBuiltinResolverEnabled,
@@ -710,6 +700,7 @@ export default async function router(fastify) {
             delete next.panPassthrough;
             delete next.interceptPans;
             delete next.goProxy;
+            delete next.directLink;
         } catch (_) {}
 
         try {
@@ -723,7 +714,7 @@ export default async function router(fastify) {
 
         return reply.send({
             success: true,
-            settings: { proxy: applied || '', directLinkEnabled: !!directLinkEnabled, panBuiltinResolverEnabled: !!panBuiltinResolverEnabled },
+            settings: { proxy: applied || '', panBuiltinResolverEnabled: !!panBuiltinResolverEnabled },
         });
     });
 

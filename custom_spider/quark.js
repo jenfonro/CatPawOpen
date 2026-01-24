@@ -4,6 +4,20 @@ const QUARK_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch';
 
 const QUARK_REFERER = 'https://pan.quark.cn';
+const PAN_DEBUG = process.env.PAN_DEBUG === '1';
+
+function panLog(...args) {
+  if (!PAN_DEBUG) return;
+  // eslint-disable-next-line no-console
+  console.log('[pan]', ...args);
+}
+
+function maskForLog(value, head = 6, tail = 4) {
+  const s = String(value == null ? '' : value);
+  if (!s) return '';
+  if (s.length <= head + tail + 3) return s;
+  return `${s.slice(0, head)}...${s.slice(-tail)}`;
+}
 
 async function readDbRoot(server) {
   try {
@@ -57,6 +71,27 @@ function parseQuarkProxyDownUrl(urlStr) {
   const fidToken = segs[2] || '';
   if (!stoken || !fid || !fidToken) return null;
   return { shareId, stoken, fid, fidToken };
+}
+
+function parseQuarkPlayId(idStr) {
+  const raw = String(idStr || '').trim();
+  if (!raw) return null;
+  // Format: shareId*stoken*fid*fidToken***filename
+  let head = raw;
+  let name = '';
+  const nameIdx = raw.indexOf('***');
+  if (nameIdx >= 0) {
+    head = raw.slice(0, nameIdx);
+    name = raw.slice(nameIdx + 3);
+  }
+  const parts = head.split('*');
+  if (parts.length < 4) return null;
+  const shareId = String(parts[0] || '').trim();
+  const stoken = String(parts[1] || '').trim();
+  const fid = String(parts[2] || '').trim();
+  const fidToken = String(parts[3] || '').trim();
+  if (!shareId || !stoken || !fid || !fidToken) return null;
+  return { shareId, stoken, fid, fidToken, name: String(name || '').trim() };
 }
 
 function parseQuarkShareUrl(urlStr) {
@@ -142,12 +177,41 @@ async function quarkListDir({ pdirFid, cookie, size }) {
   return await fetchJson(url, { method: 'GET', headers });
 }
 
-async function ensureFolderFid({ name, cookie }) {
+function sanitizeQuarkFolderName(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (raw === '.' || raw === '..') return '';
+  // Avoid path traversal / separators; keep unicode as-is for Quark folder names.
+  const cleaned = raw.replace(/[\\/]+/g, '_').replace(/\0/g, '').trim();
+  if (!cleaned || cleaned === '.' || cleaned === '..') return '';
+  return cleaned.length > 120 ? cleaned.slice(0, 120) : cleaned;
+}
+
+function getTvUserFromReq(req) {
+  const headers = (req && req.headers) || {};
+  const raw = headers['x-tv-user'] || headers['X-TV-User'] || headers['x_tv_user'] || '';
+  return sanitizeQuarkFolderName(raw);
+}
+
+function parseSubPathSegments(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  const parts = raw
+    .split(/[\\/]+/g)
+    .map((s) => sanitizeQuarkFolderName(s))
+    .filter(Boolean);
+  // Refuse suspicious paths.
+  if (parts.some((p) => p === '.' || p === '..')) return [];
+  return parts.slice(0, 20);
+}
+
+async function ensureFolderFid({ name, cookie, parentFid }) {
   const folderName = String(name || '').trim();
   if (!folderName) throw new Error('missing folder name');
+  const parent = String(parentFid == null ? '0' : parentFid).trim() || '0';
 
   const headers = buildQuarkHeaders(cookie);
-  const sortResp = await quarkListDir({ pdirFid: '0', cookie, size: 500 });
+  const sortResp = await quarkListDir({ pdirFid: parent, cookie, size: 500 });
   const list =
     (sortResp && sortResp.data && (sortResp.data.list || sortResp.data.items || sortResp.data.files)) ||
     (sortResp && sortResp.list) ||
@@ -167,7 +231,7 @@ async function ensureFolderFid({ name, cookie }) {
 
   // Create folder.
   const createUrl = `https://drive.quark.cn/1/clouddrive/file?pr=ucpro&fr=pc`;
-  const body = { pdir_fid: '0', file_name: folderName, dir_path: '', dir_init_lock: false };
+  const body = { pdir_fid: parent, file_name: folderName, dir_path: '', dir_init_lock: false };
   const createResp = await fetchJson(createUrl, { method: 'POST', headers, body: JSON.stringify(body) });
   const fid =
     String(
@@ -176,6 +240,22 @@ async function ensureFolderFid({ name, cookie }) {
     ).trim();
   if (!fid) throw new Error('create folder: fid not found');
   return fid;
+}
+
+async function ensureUserDirFid({ req, cookie, subPath }) {
+  const rootName = 'TV_Server';
+  const user = getTvUserFromReq(req);
+  if (!user) throw new Error('missing X-TV-User');
+
+  const rootFid = await ensureFolderFid({ name: rootName, cookie, parentFid: '0' });
+  const userFid = await ensureFolderFid({ name: user, cookie, parentFid: rootFid });
+
+  const segs = parseSubPathSegments(subPath);
+  let cur = userFid;
+  for (const seg of segs) {
+    cur = await ensureFolderFid({ name: seg, cookie, parentFid: cur });
+  }
+  return { rootName, rootFid, user, userFid, fid: cur, subPath: segs.join('/') };
 }
 
 async function quarkDeleteFiles({ fids, cookie }) {
@@ -565,6 +645,7 @@ export const apiPlugins = [
       instance.post('/file/ensure_dir', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
         const name = String(body.name || '').trim();
+        const parentFid = String(body.parentFid || body.parent_fid || body.pdir_fid || body.pdirFid || '0').trim() || '0';
         if (!name) {
           reply.code(400);
           return { ok: false, message: 'missing name' };
@@ -575,8 +656,34 @@ export const apiPlugins = [
           reply.code(400);
           return { ok: false, message: 'missing quark cookie' };
         }
-        const fid = await ensureFolderFid({ name, cookie });
-        return { ok: true, fid };
+        try {
+          const fid = await ensureFolderFid({ name, cookie, parentFid });
+          return { ok: true, fid };
+        } catch (e) {
+          const msg = (e && e.message) || String(e);
+          reply.code(502);
+          return { ok: false, message: msg.slice(0, 400) };
+        }
+      });
+
+      // Ensure a per-user working directory: TV_Server/<X-TV-User>/<subPath...>
+      instance.post('/file/ensure_user_dir', async (req, reply) => {
+        const body = req && typeof req.body === 'object' ? req.body : {};
+        const subPath = String(body.subPath || body.sub_path || body.path || '').trim();
+        const root = await readDbRoot(req.server);
+        const cookie = getQuarkCookieFromDbRoot(root);
+        if (!cookie) {
+          reply.code(400);
+          return { ok: false, message: 'missing quark cookie' };
+        }
+        try {
+          const out = await ensureUserDirFid({ req, cookie, subPath });
+          return { ok: true, ...out };
+        } catch (e) {
+          const msg = (e && e.message) || String(e);
+          reply.code(400);
+          return { ok: false, message: msg.slice(0, 400) };
+        }
       });
 
       instance.post('/file/clear', async (req, reply) => {
@@ -608,8 +715,9 @@ export const apiPlugins = [
         const stoken = String(body.stoken || '').trim();
         const fid = String(body.fid || '').trim();
         const fidToken = String(body.fidToken || body.fid_token || '').trim();
-        const toPdirFid = String(body.toPdirFid || body.to_pdir_fid || '').trim();
-        if (!shareId || !stoken || !fid || !fidToken || !toPdirFid) {
+        const toPdirPath = String(body.toPdirPath || body.to_pdir_path || body.toPath || body.to_path || '').trim();
+        let toPdirFid = String(body.toPdirFid || body.to_pdir_fid || '').trim();
+        if (!shareId || !stoken || !fid || !fidToken) {
           reply.code(400);
           return { ok: false, message: 'missing parameters' };
         }
@@ -620,6 +728,14 @@ export const apiPlugins = [
           return { ok: false, message: 'missing quark cookie' };
         }
         try {
+          if (!toPdirFid) {
+            if (!toPdirPath) {
+              reply.code(400);
+              return { ok: false, message: 'missing toPdirFid (or toPdirPath)' };
+            }
+            const ensured = await ensureUserDirFid({ req, cookie, subPath: toPdirPath });
+            toPdirFid = ensured.fid;
+          }
           const out = await quarkShareSave({ shareId, stoken, fid, fidToken, toPdirFid, cookie });
           return { ok: true, ...out };
         } catch (e) {
@@ -644,9 +760,18 @@ export const apiPlugins = [
         const stoken = String(body.stoken || (parsedDown ? parsedDown.stoken : '') || '').trim();
         const fid = String(body.fid || (parsedDown ? parsedDown.fid : '') || '').trim();
         const fidToken = String(body.fidToken || body.fid_token || (parsedDown ? parsedDown.fidToken : '') || '').trim();
-        const toPdirFid = String(body.toPdirFid || body.to_pdir_fid || '').trim();
+        const toPdirPath = String(body.toPdirPath || body.to_pdir_path || body.toPath || body.to_path || '').trim();
+        let toPdirFid = String(body.toPdirFid || body.to_pdir_fid || '').trim();
         const want = String(body.want || 'download_url').trim();
         try {
+          if (!toPdirFid) {
+            if (!toPdirPath) {
+              reply.code(400);
+              return { ok: false, message: 'missing toPdirFid (or toPdirPath)' };
+            }
+            const ensured = await ensureUserDirFid({ req, cookie, subPath: toPdirPath });
+            toPdirFid = ensured.fid;
+          }
           const url = await resolveDownloadUrl({ shareId, stoken, fid, fidToken, toPdirFid, cookie, want });
           return {
             ok: true,
@@ -659,6 +784,200 @@ export const apiPlugins = [
           };
         } catch (e) {
           const msg = (e && e.message) || String(e);
+          reply.code(502);
+          return { ok: false, message: msg };
+        }
+      });
+
+      // TV_Server play adapter:
+      // - ensure Quark dir TV_Server/<X-TV-User> exists
+      // - when quark_tv is missing: clear + save + resolve direct url
+      // - when quark_tv=1: clear + save only
+      // - when quark_tv=0: resolve direct url only (fallback; do NOT clear/save)
+      instance.post('/play', async (req, reply) => {
+        const reqId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+        const tStart = Date.now();
+        let stage = 'recv';
+        const body = req && typeof req.body === 'object' ? req.body : {};
+        const rawId = String(body.id || '').trim();
+        const parsed = parseQuarkPlayId(rawId);
+        if (!parsed) {
+          panLog(`quark play failed id=${reqId}`, { stage: 'decode', ms: Date.now() - tStart, message: 'invalid id' });
+          reply.code(400);
+          return { ok: false, message: 'invalid id' };
+        }
+
+        const root = await readDbRoot(req.server);
+        const cookie = getQuarkCookieFromDbRoot(root);
+        if (!cookie) {
+          panLog(`quark play failed id=${reqId}`, { stage: 'cookie', ms: Date.now() - tStart, message: 'missing quark cookie' });
+          reply.code(400);
+          return { ok: false, message: 'missing quark cookie' };
+        }
+
+        const query = (req && req.query) || {};
+        const quarkTv = String(query.quark_tv == null ? '' : query.quark_tv).trim();
+        const isTvPrepare = quarkTv === '1';
+        const isTvFallback = quarkTv === '0';
+        panLog(`quark play recv id=${reqId}`, {
+          idLen: rawId.length,
+          shareId: maskForLog(parsed.shareId, 4, 4),
+          fid: maskForLog(parsed.fid),
+          tvUser: getTvUserFromReq(req) || '',
+          quark_tv: quarkTv || undefined,
+        });
+
+        // Ensure per-user dir: TV_Server/<X-TV-User>
+        let ensured;
+        try {
+          stage = 'ensure_dir';
+          ensured = await ensureUserDirFid({ req, cookie, subPath: '' });
+        } catch (e) {
+          const msg = ((e && e.message) || String(e)).slice(0, 400);
+          panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
+          reply.code(400);
+          return { ok: false, message: msg };
+        }
+
+        const playHeader = { Cookie: cookie, Referer: QUARK_REFERER, 'User-Agent': QUARK_UA };
+
+        const toPdirFid = ensured.fid;
+        panLog(`quark play ensure_dir done id=${reqId}`, {
+          ms: Date.now() - tStart,
+          toPdirFid: maskForLog(toPdirFid),
+        });
+        let saveOut = null;
+        if (!isTvFallback) {
+          try {
+            stage = 'clear';
+            await quarkClearDir({ pdirFid: toPdirFid, cookie });
+          } catch (e) {
+            const msg = ((e && e.message) || String(e)).slice(0, 400);
+            panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
+            reply.code(502);
+            return { ok: false, message: msg };
+          }
+
+          try {
+            stage = 'save';
+            saveOut = await quarkShareSave({
+              shareId: parsed.shareId,
+              stoken: parsed.stoken,
+              fid: parsed.fid,
+              fidToken: parsed.fidToken,
+              toPdirFid,
+              cookie,
+            });
+          } catch (e) {
+            const msg = ((e && e.message) || String(e)).slice(0, 400);
+            panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
+            reply.code(502);
+            return { ok: false, message: msg };
+          }
+
+          if (isTvPrepare) {
+            panLog(`quark play done id=${reqId}`, { stage: 'saved', ms: Date.now() - tStart, toPdirFid: maskForLog(toPdirFid) });
+            return {
+              ok: true,
+              stage: 'saved',
+              toPdirFid,
+              save: saveOut,
+              parse: 0,
+              url: '',
+              header: playHeader,
+              headers: playHeader,
+            };
+          }
+        }
+
+        const pickFirstFileInDir = async () => {
+          const sortResp = await quarkListDir({ pdirFid: toPdirFid, cookie, size: 200 });
+          const list =
+            (sortResp && sortResp.data && (sortResp.data.list || sortResp.data.items || sortResp.data.files)) ||
+            (sortResp && sortResp.list) ||
+            [];
+          if (!Array.isArray(list)) return null;
+          for (const it of list) {
+            if (!it || typeof it !== 'object') continue;
+            const isDir = it.dir === true || it.file_type === 0 || it.type === 'folder' || it.kind === 'folder';
+            if (isDir) continue;
+            return it;
+          }
+          return null;
+        };
+
+        // List destination folder and request a direct url for the first saved file.
+        let picked = null;
+        try {
+          stage = 'list';
+          picked = await pickFirstFileInDir();
+        } catch (e) {
+          const msg = ((e && e.message) || String(e)).slice(0, 400);
+          panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
+          reply.code(502);
+          return { ok: false, message: msg };
+        }
+
+        // In fallback mode (quark_tv=0), we expect the file to already exist from a previous quark_tv=1 call.
+        // If it's empty, best-effort try a save once (without clearing) and list again.
+        if (!picked && isTvFallback) {
+          try {
+            stage = 'save_fallback';
+            saveOut = await quarkShareSave({
+              shareId: parsed.shareId,
+              stoken: parsed.stoken,
+              fid: parsed.fid,
+              fidToken: parsed.fidToken,
+              toPdirFid,
+              cookie,
+            });
+          } catch (e) {
+            // ignore; will report empty folder below
+            saveOut = null;
+          }
+          try {
+            stage = 'list_fallback';
+            picked = await pickFirstFileInDir();
+          } catch (_) {}
+        }
+
+        const pickedFid = picked ? String(picked.fid || picked.file_id || picked.id || '').trim() : '';
+        const pickedToken = picked ? String(picked.fid_token || picked.fidToken || picked.token || '').trim() : '';
+        if (!pickedFid) {
+          panLog(`quark play failed id=${reqId}`, { stage: 'empty', ms: Date.now() - tStart, message: 'destination folder is empty' });
+          reply.code(502);
+          return { ok: false, message: 'destination folder is empty' };
+        }
+
+        const want = String(body.want || query.want || 'download_url').trim() || 'download_url';
+        try {
+          stage = 'download';
+          const url = await quarkDirectDownload({ fid: pickedFid, fidToken: pickedToken, cookie, want });
+          panLog(`quark play done id=${reqId}`, {
+            ms: Date.now() - tStart,
+            want,
+            toPdirFid: maskForLog(toPdirFid),
+            pickedFid: maskForLog(pickedFid),
+            host: (() => {
+              try {
+                return new URL(url).host;
+              } catch (_e) {
+                return '';
+              }
+            })(),
+          });
+          return {
+            ok: true,
+            url,
+            parse: 0,
+            header: playHeader,
+            headers: playHeader,
+            saved: { toPdirFid, fid: pickedFid, fidToken: pickedToken, name: parsed.name || '' },
+            save: saveOut || undefined,
+          };
+        } catch (e) {
+          const msg = ((e && e.message) || String(e)).slice(0, 400);
+          panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
           reply.code(502);
           return { ok: false, message: msg };
         }
