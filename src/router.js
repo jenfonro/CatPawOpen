@@ -3,15 +3,17 @@ import path from 'path';
 import { pathToFileURL } from 'url';
 import {
     getCustomSourceStatus,
+    getCustomSourceApiPlugins,
     getCustomSourceWebPlugins,
     getCustomSourceWebsiteBundles,
-    registerGlobalBaiduProxy,
     loadCustomSourceSpiders,
 } from './util/customSourceSpiders.js';
 import { getGlobalProxy, setGlobalProxy } from './util/proxy.js';
-import { getTvUserFromRequest, hasExplicitTvUser, tvUserStorage } from './util/tvUserContext.js';
+import { getCurrentTvUser, getTvUserFromRequest, hasExplicitTvUser, sanitizeTvUsername, tvUserStorage } from './util/tvUserContext.js';
 
 const spiderPrefix = '/spider';
+
+const BAIDU_PLAY_UA = 'com.android.chrome/131.0.6778.200 (Linux;Android 10) AndroidXMedia3/1.5.1';
 
 function getEmbeddedRootDir() {
     // When bundled by esbuild (cjs), `__dirname` points to `dist/`.
@@ -209,6 +211,48 @@ async function loadSpidersFromFiles(filePaths, options = {}) {
     return spiders;
 }
 
+function getGlobalPanDirNameForCurrentUser() {
+    const base = String('TV_Server')
+        .trim()
+        .replace(/[^a-zA-Z0-9._-]+/g, '_')
+        .replace(/^_+|_+$/g, '') || 'TV_Server';
+    const user = sanitizeTvUsername(getCurrentTvUser());
+    return `${base}_${user}`;
+}
+
+function decodeTvServerPlayId(rawId) {
+    const idStr = String(rawId || '');
+    if (!idStr) return { json: null, name: '' };
+
+    const delims = ['|||', '######', '@@@', '***', '___'];
+    let b64 = idStr;
+    let name = '';
+    for (const d of delims) {
+        const idx = idStr.indexOf(d);
+        if (idx >= 0) {
+            b64 = idStr.slice(0, idx);
+            name = idStr.slice(idx + d.length);
+            break;
+        }
+    }
+
+    // Support urlsafe base64 and missing padding.
+    let normalized = String(b64 || '').trim();
+    normalized = normalized.replace(/-/g, '+').replace(/_/g, '/');
+    while (normalized.length % 4 !== 0) normalized += '=';
+
+    let json = null;
+    try {
+        const buf = Buffer.from(normalized, 'base64');
+        const text = buf.toString('utf8');
+        const parsed = text && text.trim() ? JSON.parse(text) : null;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) json = parsed;
+    } catch (_) {
+        json = null;
+    }
+    return { json, name: String(name || '') };
+}
+
 /**
  * A function to initialize the router.
  *
@@ -244,11 +288,169 @@ export default async function router(fastify) {
         done();
     });
 
-    // CORS is handled by reverse proxy (Nginx); do not add CORS hooks here.
+    // Intercept play for Baidu/Quark pans: resolve via internal pan APIs instead of letting bundled scripts handle it.
+    // For non-Baidu/Quark, do not intercept.
+    fastify.addHook('preHandler', async (request, reply) => {
+        try {
+            if (!request || !request.raw) return;
+            const method = String(request.method || '').toUpperCase();
+            if (method !== 'POST') return;
+            const rawUrl = String(request.raw.url || '');
+            const pathname = rawUrl.split('?')[0] || '';
+            if (!/^\/spider\/[^/]+\/[^/]+\/play$/.test(pathname)) return;
 
-    // Global engine proxy (not tied to any single spider): currently used for Baidu streaming.
-    // Registered once to avoid per-spider route duplication and to keep proxy routes clearly separated.
-    registerGlobalBaiduProxy(fastify);
+            const body = request.body && typeof request.body === 'object' ? request.body : null;
+            const flag = body ? String(body.flag || '') : '';
+            const id = body ? body.id : '';
+            if (!id) return;
+
+            // Identify pan type by `flag` only (stable in TV_Server), and only then decode `id`.
+            const isBaidu = flag.includes('百度');
+            const isQuark = flag.includes('夸克') || flag.toLowerCase().includes('quark');
+            if (!isBaidu && !isQuark) return;
+
+            const decoded = decodeTvServerPlayId(id);
+            const payload = decoded.json;
+            if (!payload || typeof payload !== 'object') return;
+
+            const user = sanitizeTvUsername(getCurrentTvUser());
+            const tvUserHeader = user ? { 'X-TV-User': user } : {};
+            const panDirName = getGlobalPanDirNameForCurrentUser();
+
+            if (isBaidu) {
+                const fs_id = payload && payload.fs_id != null ? payload.fs_id : null;
+                const uk = payload && payload.uk != null ? payload.uk : null;
+                const shareid = payload && payload.shareid != null ? payload.shareid : null;
+                const surl = payload && payload.surl != null ? payload.surl : null;
+                const pwd = payload && payload.pwd != null ? payload.pwd : '';
+                const fileName = String((payload && (payload.realName || payload.server_filename || payload.serverFileName)) || decoded.name || '').trim();
+                if (!fs_id || !uk || !shareid || !surl) return;
+
+                const ensureRes = await request.server.inject({
+                    method: 'POST',
+                    url: '/api/baidu/file/ensure_dir',
+                    headers: { 'content-type': 'application/json', ...tvUserHeader },
+                    payload: { name: panDirName },
+                });
+                if (ensureRes.statusCode < 200 || ensureRes.statusCode >= 300) return;
+                const ensured = ensureRes.json();
+                const dirPath = ensured && ensured.dirPath ? String(ensured.dirPath) : `/${panDirName}`;
+
+                await request.server.inject({
+                    method: 'POST',
+                    url: '/api/baidu/file/clear',
+                    headers: { 'content-type': 'application/json', ...tvUserHeader },
+                    payload: { dirPath },
+                });
+
+                const saveRes = await request.server.inject({
+                    method: 'POST',
+                    url: '/api/baidu/share/save',
+                    headers: { 'content-type': 'application/json', ...tvUserHeader },
+                    payload: { shareid, uk, surl, pwd, fs_id, destPath: dirPath, fileName },
+                });
+                if (saveRes.statusCode < 200 || saveRes.statusCode >= 300) {
+                    reply.code(saveRes.statusCode);
+                    reply.send(saveRes.json());
+                    return;
+                }
+                const saveJson = saveRes.json();
+                const saved = saveJson && saveJson.saved ? saveJson.saved : null;
+                const savedFsId = saved && saved.fs_id != null ? saved.fs_id : fs_id;
+
+                const dlRes = await request.server.inject({
+                    method: 'POST',
+                    url: '/api/baidu/file/download',
+                    headers: { 'content-type': 'application/json', ...tvUserHeader },
+                    payload: { fsids: [savedFsId] },
+                });
+                if (dlRes.statusCode < 200 || dlRes.statusCode >= 300) {
+                    reply.code(dlRes.statusCode);
+                    reply.send(dlRes.json());
+                    return;
+                }
+                const dlJson = dlRes.json();
+                const urls = dlJson && Array.isArray(dlJson.urls) ? dlJson.urls : [];
+                const url = urls.find((u) => typeof u === 'string' && u.startsWith('http')) || '';
+                if (!url) {
+                    reply.code(502);
+                    reply.send({ ok: false, message: 'baidu download url not found' });
+                    return;
+                }
+
+                const header = Object.assign({}, (dlJson && dlJson.headers) || {});
+                header['User-Agent'] = BAIDU_PLAY_UA;
+
+                reply.send({ parse: 0, url, header });
+                return;
+            }
+
+            if (isQuark) {
+                const quarkTvRaw = request.query && typeof request.query === 'object' ? (request.query.quark_tv ?? request.query.quarkTv) : null;
+                const quarkTvStr = String(quarkTvRaw == null ? '' : quarkTvRaw).trim().toLowerCase();
+                const quarkTvEnabled = quarkTvStr === '1' || quarkTvStr === 'true' || quarkTvStr === 'yes' || quarkTvStr === 'on';
+
+                const shareId = String((payload && (payload.shareId || payload.pwd_id || payload.share_id)) || '').trim();
+                const stoken = String((payload && (payload.stoken || payload.sToken)) || '').trim();
+                const fid = String((payload && (payload.fid || payload.file_id || payload.fileId)) || '').trim();
+                const fidToken = String((payload && (payload.fidToken || payload.fid_token || payload.fid_token_list?.[0])) || '').trim();
+                if (!shareId || !stoken || !fid || !fidToken) return;
+
+                const ensureRes = await request.server.inject({
+                    method: 'POST',
+                    url: '/api/quark/file/ensure_dir',
+                    headers: { 'content-type': 'application/json', ...tvUserHeader },
+                    payload: { name: panDirName },
+                });
+                if (ensureRes.statusCode < 200 || ensureRes.statusCode >= 300) return;
+                const ensured = ensureRes.json();
+                const toPdirFid = ensured && ensured.fid ? String(ensured.fid) : '';
+                if (!toPdirFid) return;
+
+                await request.server.inject({
+                    method: 'POST',
+                    url: '/api/quark/file/clear',
+                    headers: { 'content-type': 'application/json', ...tvUserHeader },
+                    payload: { fid: toPdirFid },
+                });
+
+                if (quarkTvEnabled) {
+                    const saveRes = await request.server.inject({
+                        method: 'POST',
+                        url: '/api/quark/share/save',
+                        headers: { 'content-type': 'application/json', ...tvUserHeader },
+                        payload: { shareId, stoken, fid, fidToken, toPdirFid },
+                    });
+                    if (saveRes.statusCode < 200 || saveRes.statusCode >= 300) {
+                        reply.code(saveRes.statusCode);
+                        reply.send(saveRes.json());
+                        return;
+                    }
+                    reply.send({ parse: 0, url: '', header: {} });
+                    return;
+                }
+
+                const dlRes = await request.server.inject({
+                    method: 'POST',
+                    url: '/api/quark/share/download',
+                    headers: { 'content-type': 'application/json', ...tvUserHeader },
+                    payload: { shareId, stoken, fid, fidToken, toPdirFid },
+                });
+                if (dlRes.statusCode < 200 || dlRes.statusCode >= 300) {
+                    reply.code(dlRes.statusCode);
+                    reply.send(dlRes.json());
+                    return;
+                }
+                const dlJson = dlRes.json();
+                const url = dlJson && dlJson.url ? String(dlJson.url) : '';
+                const header = (dlJson && dlJson.headers) || {};
+                reply.send({ parse: 0, url, header });
+                return;
+            }
+        } catch (_) {}
+    });
+
+    // CORS is handled by reverse proxy (Nginx); do not add CORS hooks here.
 
     // 默认站点：动态 import src/spider 下所有 js（含子目录），不再写死列表
     const spiderRootDir = resolveSpiderRootDir();
@@ -297,6 +499,16 @@ export default async function router(fastify) {
 
     // 4) 补全 /website：直接输出自定义脚本的 websiteBundle()（浏览器执行），不改写任何路由
     // 优先：注册自定义脚本提供的 Fastify 插件（例如 my.js 的 Yne），确保 /website 下所有子路由都存在
+    const apiPlugins = getCustomSourceApiPlugins();
+    (apiPlugins || [])
+        .filter((p) => p && typeof p.prefix === 'string' && p.prefix && typeof p.plugin === 'function')
+        .forEach((p) => {
+            fastify.register(p.plugin, { prefix: p.prefix });
+            const from = p.fileName || p.__customFile || 'custom';
+            // eslint-disable-next-line no-console
+            console.log(`Register api plugin: ${p.prefix} (from ${from})`);
+        });
+
     const webPlugins = getCustomSourceWebPlugins();
     // Register other extracted web prefixes first (optional helpers used by some website UIs)
     (webPlugins || [])
