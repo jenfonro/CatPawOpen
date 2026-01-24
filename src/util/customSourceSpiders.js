@@ -1581,6 +1581,18 @@ async function loadOneFile(filePath) {
             if (context.globalThis) context.globalThis.kO = shim;
         }
     } catch (_) {}
+    // Some bundles keep Baidu account state in `kl.baiduuk` and call `.includes(...)` during play.
+    // Ensure it is always an array to avoid crashes like:
+    // "TypeError: Cannot read properties of undefined (reading 'includes')".
+    try {
+        const hasKl = context && Object.prototype.hasOwnProperty.call(context, 'kl') && context.kl && typeof context.kl === 'object';
+        if (hasKl && !Array.isArray(context.kl.baiduuk)) {
+            context.kl.baiduuk = [];
+            if (context.globalThis && context.globalThis.kl === context.kl) {
+                context.globalThis.kl.baiduuk = context.kl.baiduuk;
+            }
+        }
+    } catch (_) {}
     if (false) {
         try {
             syncQuarkVarsForCurrentUser();
