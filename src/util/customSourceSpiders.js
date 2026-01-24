@@ -30,6 +30,436 @@ let dbJsonCache = {
     size: 0,
     data: null,
 };
+function parseCookieKeys(cookieStr) {
+    const raw = String(cookieStr || '').trim();
+    if (!raw) return [];
+    const keys = [];
+    for (const part of raw.split(';')) {
+        const s = String(part || '').trim();
+        if (!s) continue;
+        const idx = s.indexOf('=');
+        if (idx <= 0) continue;
+        const k = s.slice(0, idx).trim();
+        if (k) keys.push(k);
+    }
+    return keys;
+}
+function isBaiduLikeHost(host) {
+    const h = String(host || '').trim().toLowerCase();
+    if (!h) return false;
+    const hostname = h.split(':')[0];
+    return (
+        hostname === 'pan.baidu.com' ||
+        hostname.endsWith('.pan.baidu.com') ||
+        hostname === 'pcs.baidu.com' ||
+        hostname.endsWith('.pcs.baidu.com')
+    );
+}
+function looksLikeIpHost(host) {
+    const h = String(host || '').trim();
+    if (!h) return false;
+    const hostname = h.split(':')[0];
+    // ipv4 only; good enough for tracing
+    return /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname);
+}
+function pickHeaderValue(headers, name) {
+    const h = headers && typeof headers === 'object' ? headers : null;
+    if (!h) return '';
+    const target = String(name || '').toLowerCase();
+    for (const [k, v] of Object.entries(h)) {
+        if (String(k || '').toLowerCase() === target) return v == null ? '' : String(v);
+    }
+    return '';
+}
+function maskCookieForLog(cookieStr) {
+    const keys = parseCookieKeys(cookieStr);
+    if (!keys.length) return '';
+    const uniq = Array.from(new Set(keys));
+    const head = uniq.slice(0, 12);
+    const tail = uniq.length > head.length ? `...+${uniq.length - head.length}` : '';
+    return `${head.join(',')}${tail}`;
+}
+function maskAuthForLog(authValue) {
+    const raw = String(authValue || '').trim();
+    if (!raw) return '';
+    const parts = raw.split(/\s+/);
+    const scheme = parts[0] ? parts[0].slice(0, 24) : '';
+    return scheme ? `${scheme} ...` : '...';
+}
+function pickHeadersForLog(headers, fallbackHost) {
+    const h = headers && typeof headers === 'object' ? headers : {};
+    const host = pickHeaderValue(h, 'host') || String(fallbackHost || '');
+    const referer = pickHeaderValue(h, 'referer');
+    const origin = pickHeaderValue(h, 'origin');
+    const ua = pickHeaderValue(h, 'user-agent');
+    const ct = pickHeaderValue(h, 'content-type');
+    const accept = pickHeaderValue(h, 'accept');
+    const range = pickHeaderValue(h, 'range');
+    const cookie = pickHeaderValue(h, 'cookie');
+    const auth = pickHeaderValue(h, 'authorization');
+    return {
+        host: host || undefined,
+        referer: referer || undefined,
+        origin: origin || undefined,
+        contentType: ct || undefined,
+        accept: accept ? String(accept).slice(0, 120) : undefined,
+        range: range || undefined,
+        ua: ua ? String(ua).slice(0, 120) : undefined,
+        cookieKeys: cookie ? maskCookieForLog(cookie) : '',
+        authorization: auth ? maskAuthForLog(auth) : '',
+    };
+}
+function isBaiduLikeUrl(urlStr) {
+    const raw = typeof urlStr === 'string' ? urlStr.trim() : '';
+    if (!raw) return false;
+    try {
+        const u = new URL(raw, 'http://0.0.0.0');
+        const host = String(u.hostname || '').toLowerCase();
+        return host === 'pan.baidu.com' || host.endsWith('.pan.baidu.com') || host === 'pcs.baidu.com' || host.endsWith('.pcs.baidu.com');
+    } catch (_) {
+        return raw.includes('pan.baidu.com') || raw.includes('pcs.baidu.com');
+    }
+}
+function wrapFetchForTrace(fetchImpl, filePath) {
+    const enabled = process.env.CATPAW_DEBUG === '1';
+    if (!enabled) return fetchImpl;
+    if (typeof fetchImpl !== 'function') return fetchImpl;
+    if (fetchImpl.__cp_traced) return fetchImpl;
+    const tag = `[trace:${path.basename(String(filePath || 'custom'))}]`;
+    const wrapped = async (input, init) => {
+        let urlStr = '';
+        try {
+            if (typeof input === 'string') urlStr = input;
+            else if (input && typeof input === 'object' && typeof input.url === 'string') urlStr = input.url;
+        } catch (_) {}
+        const full = String(urlStr || '');
+        const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+        let headersObj = {};
+        try {
+            const headers = (init && init.headers) || (input && input.headers) || {};
+            if (headers && typeof headers === 'object') headersObj = headers;
+        } catch (_) {}
+        const hostHeader = pickHeaderValue(headersObj, 'host');
+        const shouldLog = true;
+        if (shouldLog) {
+            try {
+                // eslint-disable-next-line no-console
+                console.log(tag, 'fetch', method, full, {
+                    ...pickHeadersForLog(headersObj, hostHeader || (() => {
+                        try {
+                            return new URL(full).host;
+                        } catch (_) {
+                            return '';
+                        }
+                    })()),
+                });
+            } catch (_) {}
+        }
+        try {
+            const res = await fetchImpl(input, init);
+            if (shouldLog) {
+                try {
+                    const status = res && typeof res.status === 'number' ? res.status : 0;
+                    // eslint-disable-next-line no-console
+                    console.log(tag, 'fetchRes', status, full, {
+                        contentType:
+                            res && res.headers && typeof res.headers.get === 'function'
+                                ? String(res.headers.get('content-type') || '')
+                                : undefined,
+                    });
+                } catch (_) {}
+            }
+            return res;
+        } catch (err) {
+            if (shouldLog) {
+                try {
+                    const message = (err && err.message) || String(err);
+                    // eslint-disable-next-line no-console
+                    console.log(tag, 'fetchErr', full, message.slice(0, 300));
+                } catch (_) {}
+            }
+            throw err;
+        }
+    };
+    try {
+        wrapped.__cp_traced = true;
+    } catch (_) {}
+    return wrapped;
+}
+function wrapAxiosForTrace(axios, filePath) {
+    const enabled = process.env.CATPAW_DEBUG === '1';
+    if (!enabled) return axios;
+    if (!axios || typeof axios !== 'function') return axios;
+    if (axios.__cp_traced) return axios;
+    const tag = `[trace:${path.basename(String(filePath || 'custom'))}]`;
+    const safeUrlFromConfig = (cfg) => {
+        const c = cfg && typeof cfg === 'object' ? cfg : {};
+        const baseURL = typeof c.baseURL === 'string' ? c.baseURL : '';
+        const url = typeof c.url === 'string' ? c.url : '';
+        if (!url && !baseURL) return '';
+        try {
+            return new URL(url || baseURL, baseURL || undefined).toString();
+        } catch (_) {
+            return `${baseURL || ''}${url || ''}`;
+        }
+    };
+    const attach = (inst) => {
+        try {
+            if (!inst || !inst.interceptors || !inst.interceptors.request || !inst.interceptors.response) return inst;
+            if (inst.__cp_traced) return inst;
+            inst.__cp_traced = true;
+            inst.interceptors.request.use((cfg) => {
+                try {
+                    const full = safeUrlFromConfig(cfg);
+                    const method = String((cfg && cfg.method) || 'GET').toUpperCase();
+                    const headers = (cfg && cfg.headers && typeof cfg.headers === 'object') ? cfg.headers : {};
+                    const hostHeader = pickHeaderValue(headers, 'host') || (() => {
+                        try {
+                            return new URL(full).host;
+                        } catch (_) {
+                            return '';
+                        }
+                    })();
+                    let dataInfo = '';
+                    try {
+                        const d = cfg && Object.prototype.hasOwnProperty.call(cfg, 'data') ? cfg.data : undefined;
+                        if (typeof d === 'string') dataInfo = d.length > 200 ? `${d.slice(0, 200)}...(${d.length})` : d;
+                        else if (Buffer.isBuffer(d)) dataInfo = `Buffer(${d.length})`;
+                        else if (d && typeof d === 'object') dataInfo = `Object(${Object.keys(d).slice(0, 10).join(',')})`;
+                    } catch (_) {}
+                    // eslint-disable-next-line no-console
+                    console.log(tag, 'req', method, full, {
+                        ...pickHeadersForLog(headers, hostHeader),
+                        data: dataInfo,
+                    });
+                } catch (_) {}
+                return cfg;
+            });
+            inst.interceptors.response.use(
+                (res) => {
+                    try {
+                        const cfg = res && res.config ? res.config : null;
+                        const full = safeUrlFromConfig(cfg);
+                        const headers = (cfg && cfg.headers && typeof cfg.headers === 'object') ? cfg.headers : {};
+                        const hostHeader = pickHeaderValue(headers, 'host') || (() => {
+                            try {
+                                return new URL(full).host;
+                            } catch (_) {
+                                return '';
+                            }
+                        })();
+                        const status = res && typeof res.status === 'number' ? res.status : 0;
+                        // eslint-disable-next-line no-console
+                        console.log(tag, 'res', status, full, {
+                            host: hostHeader || undefined,
+                            contentType:
+                                res && res.headers && typeof res.headers === 'object'
+                                    ? String(res.headers['content-type'] || res.headers['Content-Type'] || '')
+                                    : undefined,
+                        });
+                    } catch (_) {}
+                    return res;
+                },
+                (err) => {
+                    try {
+                        const cfg = err && err.config ? err.config : null;
+                        const full = safeUrlFromConfig(cfg);
+                        const headers = (cfg && cfg.headers && typeof cfg.headers === 'object') ? cfg.headers : {};
+                        const hostHeader = pickHeaderValue(headers, 'host') || (() => {
+                            try {
+                                return new URL(full).host;
+                            } catch (_) {
+                                return '';
+                            }
+                        })();
+                        const status = err && err.response && typeof err.response.status === 'number' ? err.response.status : 0;
+                        const message = (err && err.message) || String(err);
+                        // eslint-disable-next-line no-console
+                        console.log(tag, 'err', status, full, { host: hostHeader || undefined, message: message.slice(0, 300) });
+                    } catch (_) {}
+                    return Promise.reject(err);
+                }
+            );
+        } catch (_) {}
+        return inst;
+    };
+    attach(axios);
+    const wrapped = new Proxy(axios, {
+        get(target, prop, receiver) {
+            if (prop === 'create') {
+                return (...args) => {
+                    const inst = target.create(...args);
+                    return attach(inst);
+                };
+            }
+            return Reflect.get(target, prop, receiver);
+        },
+        apply(target, thisArg, argArray) {
+            return Reflect.apply(target, thisArg, argArray);
+        },
+    });
+    try {
+        wrapped.__cp_traced = true;
+    } catch (_) {}
+    return wrapped;
+}
+function wrapNodeHttpForTrace(mod, filePath, defaultScheme) {
+    const enabled = process.env.CATPAW_DEBUG === '1';
+    if (!enabled) return mod;
+    if (!mod || typeof mod !== 'object') return mod;
+    if (mod.__cp_traced) return mod;
+    const tag = `[trace:${path.basename(String(filePath || 'custom'))}]`;
+    const origRequest = typeof mod.request === 'function' ? mod.request : null;
+    const normalizeUrlFromArgs = (args) => {
+        const a0 = args[0];
+        const a1 = args[1];
+        let urlStr = '';
+        let opts = null;
+        if (typeof a0 === 'string' || a0 instanceof URL) {
+            urlStr = String(a0);
+            if (a1 && typeof a1 === 'object' && !Array.isArray(a1)) opts = a1;
+        } else if (a0 && typeof a0 === 'object' && !Array.isArray(a0)) {
+            opts = a0;
+        }
+        const headers = (opts && opts.headers && typeof opts.headers === 'object') ? opts.headers : {};
+        const hostHeader = pickHeaderValue(headers, 'host');
+        let hostname = '';
+        try {
+            if (urlStr) hostname = new URL(urlStr).hostname;
+        } catch (_) {
+            hostname = '';
+        }
+        if (!hostname && opts) {
+            hostname =
+                (typeof opts.hostname === 'string' && opts.hostname) ||
+                (typeof opts.host === 'string' && opts.host) ||
+                (typeof opts.servername === 'string' && opts.servername) ||
+                '';
+        }
+        const method = String((opts && opts.method) || 'GET').toUpperCase();
+        const pathName = (opts && (opts.path || opts.pathname)) ? String(opts.path || opts.pathname) : '';
+        const cookie = pickHeaderValue(headers, 'cookie');
+        const shouldLog = true;
+        const scheme = typeof defaultScheme === 'string' && defaultScheme ? defaultScheme : '';
+        const hostForUrl = (hostHeader || hostname || '').trim();
+        const fullUrl =
+            urlStr ||
+            (scheme && hostForUrl && pathName
+                ? `${scheme}://${hostForUrl}${pathName.startsWith('/') ? '' : '/'}${pathName}`
+                : '');
+        return { shouldLog, method, urlStr: fullUrl, hostname, hostHeader, pathName, cookie, headers };
+    };
+    const wrapFn = (fnName, original) => {
+        if (!original) return;
+        mod[fnName] = function (...args) {
+            const info = normalizeUrlFromArgs(args);
+            const req = original.apply(this, args);
+            try {
+                if (!info.shouldLog) return req;
+                if (!req || typeof req !== 'object') return req;
+                if (req.__cp_trace_attached) return req;
+                req.__cp_trace_attached = true;
+
+                const headerMap = Object.assign({}, info.headers || {});
+                try {
+                    if (typeof req.getHeader === 'function') {
+                        const names = ['host', 'referer', 'origin', 'user-agent', 'cookie', 'content-type'];
+                        for (const n of names) {
+                            const v = req.getHeader(n);
+                            if (v != null && v !== '') headerMap[n] = String(v);
+                        }
+                    }
+                } catch (_) {}
+
+                const logReq = (extra) => {
+                    // eslint-disable-next-line no-console
+                    console.log(tag, fnName, info.method, info.urlStr || info.pathName || '', {
+                        ...pickHeadersForLog(headerMap, info.hostHeader || info.hostname),
+                        ...extra,
+                    });
+                };
+
+                const bodyChunks = [];
+                let bodyBytes = 0;
+                const BODY_MAX = 2048;
+                const captureBody = (chunk, encoding) => {
+                    try {
+                        if (chunk == null) return;
+                        let buf;
+                        if (Buffer.isBuffer(chunk)) buf = chunk;
+                        else if (typeof chunk === 'string') buf = Buffer.from(chunk, encoding || 'utf8');
+                        else return;
+                        if (!buf.length) return;
+                        const remain = BODY_MAX - bodyBytes;
+                        if (remain <= 0) return;
+                        const slice = buf.length > remain ? buf.slice(0, remain) : buf;
+                        bodyChunks.push(slice);
+                        bodyBytes += slice.length;
+                    } catch (_) {}
+                };
+                const originalWrite = typeof req.write === 'function' ? req.write.bind(req) : null;
+                const originalEnd = typeof req.end === 'function' ? req.end.bind(req) : null;
+                if (originalWrite) {
+                    req.write = function (chunk, encoding, cb) {
+                        captureBody(chunk, encoding);
+                        return originalWrite(chunk, encoding, cb);
+                    };
+                }
+                if (originalEnd) {
+                    req.end = function (chunk, encoding, cb) {
+                        captureBody(chunk, encoding);
+                        try {
+                            const bodyPreview = bodyChunks.length ? Buffer.concat(bodyChunks).toString('utf8') : '';
+                            logReq({ body: bodyPreview ? bodyPreview.slice(0, 400) : undefined });
+                        } catch (_) {
+                            logReq({});
+                        }
+                        return originalEnd(chunk, encoding, cb);
+                    };
+                } else {
+                    logReq({});
+                }
+
+                req.on('response', (res) => {
+                    try {
+                        if (!res) return;
+                        const status = typeof res.statusCode === 'number' ? res.statusCode : 0;
+                        const respChunks = [];
+                        let respBytes = 0;
+                        const RESP_MAX = 2048;
+                        res.on('data', (d) => {
+                            try {
+                                if (!d) return;
+                                const buf = Buffer.isBuffer(d) ? d : Buffer.from(String(d));
+                                const remain = RESP_MAX - respBytes;
+                                if (remain <= 0) return;
+                                const slice = buf.length > remain ? buf.slice(0, remain) : buf;
+                                respChunks.push(slice);
+                                respBytes += slice.length;
+                            } catch (_) {}
+                        });
+                        res.on('end', () => {
+                            try {
+                                const text = respChunks.length ? Buffer.concat(respChunks).toString('utf8') : '';
+                                // eslint-disable-next-line no-console
+                                console.log(tag, 'res', status, info.urlStr || info.pathName || '', {
+                                    ...pickHeadersForLog(headerMap, info.hostHeader || info.hostname),
+                                    body: text ? text.slice(0, 400) : undefined,
+                                });
+                            } catch (_) {}
+                        });
+                    } catch (_) {}
+                });
+            } catch (_) {}
+            return req;
+        };
+    };
+    wrapFn('request', origRequest);
+    try {
+        mod.__cp_traced = true;
+    } catch (_) {}
+    return mod;
+}
 function detectCustomScriptFormat(filePath) {
     const filename = typeof filePath === 'string' ? filePath : '';
     if (!filename) return 'vm';
@@ -749,7 +1179,7 @@ function buildVmContext(requireFunc, filePath) {
     } catch (_) {
         bufferBlob = null;
     }
-    const fetch = globalThis.fetch || (undici && undici.fetch);
+    const fetch = wrapFetchForTrace(globalThis.fetch || (undici && undici.fetch), filePath);
     const Headers = globalThis.Headers || (undici && undici.Headers);
     const Request = globalThis.Request || (undici && undici.Request);
     const Response = globalThis.Response || (undici && undici.Response);
@@ -994,7 +1424,22 @@ async function loadOneFile(filePath) {
     }
     const code = fs.readFileSync(filePath, 'utf8');
     const baseRequire = createRequire(filePath);
-    const requireFunc = baseRequire;
+    const requireFunc = (() => {
+        const fn = (id) => {
+            const mod = baseRequire(id);
+            if (id === 'axios') return wrapAxiosForTrace(mod, filePath);
+            if (id === 'http' || id === 'node:http') return wrapNodeHttpForTrace(mod, filePath, 'http');
+            if (id === 'https' || id === 'node:https') return wrapNodeHttpForTrace(mod, filePath, 'https');
+            return mod;
+        };
+        try {
+            fn.resolve = baseRequire.resolve.bind(baseRequire);
+            fn.cache = baseRequire.cache;
+            fn.extensions = baseRequire.extensions;
+            fn.main = baseRequire.main;
+        } catch (_) {}
+        return fn;
+    })();
     if (false) {
     const BAIDU_DEBUG = process.env.CATPAW_DEBUG === '1';
     const baiduLog = (...args) => {

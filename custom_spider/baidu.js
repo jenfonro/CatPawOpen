@@ -1,7 +1,22 @@
 // Baidu Netdisk API plugin.
 
-const BAIDU_UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+import axios from 'axios';
+import http from 'http';
+import https from 'https';
+import zlib from 'node:zlib';
+
+const BAIDU_SCRIPT_WEB_UA =
+  'Mozilla/5.0 (Linux; Android 12; V2238A) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.40 Safari/537.36';
+const BAIDU_SCRIPT_NETDISK_UA = 'netdisk;12.11.9;V2238A;android-android;12;JSbridge4.4.0;jointBridge;1.1.0;';
+const BAIDU_APP_ID = '250528';
+
+const baiduHttp = axios.create({
+  httpAgent: new http.Agent({ keepAlive: true }),
+  httpsAgent: new https.Agent({ keepAlive: true, rejectUnauthorized: false }),
+  maxRedirects: 5,
+  validateStatus: () => true,
+  responseType: 'arraybuffer',
+});
 
 function looksLikeCookieString(v) {
   const s = String(v || '').trim();
@@ -65,40 +80,81 @@ function mergeCookies(baseCookie, extraCookie) {
   return stringifyCookiePairs({ ...a, ...b });
 }
 
-function buildBaiduHeaders({ cookie, referer }) {
+function buildBaiduScriptWebHeaders({ cookie }) {
   const headers = {
-    Accept: 'application/json, text/plain, */*',
-    'X-Requested-With': 'XMLHttpRequest',
     Origin: 'https://pan.baidu.com',
-    Referer: referer || 'https://pan.baidu.com/disk/main',
-    'User-Agent': BAIDU_UA,
+    Referer: 'https://pan.baidu.com/',
+    'User-Agent': BAIDU_SCRIPT_WEB_UA,
   };
   if (cookie) headers.Cookie = cookie;
   return headers;
 }
 
+function assertBaiduErrnoOk(data, okErrnos = []) {
+  const n = data && typeof data === 'object' && 'errno' in data ? Number(data.errno) : 0;
+  if (n === 0) return;
+  if (okErrnos.includes(n)) return;
+  const msg =
+    (data && typeof data === 'object' && (data.show_msg || data.error_msg || data.errmsg || data.message || data.msg)) || '';
+  throw new Error(`baidu errno=${Number.isFinite(n) ? n : String(data && data.errno)}${msg ? `: ${msg}` : ''}`);
+}
+
+function decodeMaybeCompressed(buf, encoding) {
+  const enc = String(encoding || '').toLowerCase();
+  const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf == null ? '' : buf);
+  if (!b.length) return b;
+  const isGzip = enc.includes('gzip') || (b.length >= 2 && b[0] === 0x1f && b[1] === 0x8b);
+  const isBr = enc.includes('br');
+  const isDeflate = enc.includes('deflate');
+  try {
+    if (isGzip) return zlib.gunzipSync(b);
+  } catch {}
+  try {
+    if (isBr && typeof zlib.brotliDecompressSync === 'function') return zlib.brotliDecompressSync(b);
+  } catch {}
+  try {
+    if (isDeflate) return zlib.inflateSync(b);
+  } catch {}
+  return b;
+}
+
 async function fetchText(url, init) {
-  const res = await fetch(url, { redirect: 'manual', ...init });
-  const text = await res.text();
-  return { res, text };
+  const method = String((init && init.method) || 'GET').toUpperCase();
+  const headers = (init && init.headers && typeof init.headers === 'object' ? init.headers : {}) || {};
+  const body = init && Object.prototype.hasOwnProperty.call(init, 'body') ? init.body : undefined;
+  const res = await baiduHttp.request({
+    url,
+    method,
+    headers,
+    data: body,
+  });
+  const setCookie = Array.isArray(res.headers && res.headers['set-cookie'])
+    ? res.headers['set-cookie'].map((x) => String(x || '')).filter(Boolean)
+    : [];
+  const raw = Buffer.isBuffer(res.data) ? res.data : Buffer.from(res.data == null ? '' : res.data);
+  const enc = (res.headers && (res.headers['content-encoding'] || res.headers['Content-Encoding'])) || '';
+  const buf = decodeMaybeCompressed(raw, enc);
+  const text = buf.toString('utf8');
+  return { res, text, setCookie };
 }
 
 async function fetchJson(url, init) {
-  const { res, text } = await fetchText(url, init);
+  const { res, text, setCookie } = await fetchText(url, init);
   let data = null;
   try {
     data = text && text.trim() ? JSON.parse(text) : null;
   } catch {
     data = null;
   }
-  if (!res.ok) {
+  const ok = res && typeof res.status === 'number' ? res.status >= 200 && res.status < 300 : false;
+  if (!ok) {
     const msg = (data && (data.message || data.error_msg || data.msg)) || text || `status=${res.status}`;
     const err = new Error(`baidu http ${res.status}: ${String(msg).slice(0, 300)}`);
     err.status = res.status;
     err.body = data;
     throw err;
   }
-  return { res, data, text };
+  return { res, data, text, setCookie };
 }
 
 function normalizeBaiduErr(err) {
@@ -109,150 +165,201 @@ function normalizeBaiduErr(err) {
 
 function extractBdstoken(json) {
   if (!json || typeof json !== 'object') return '';
-  const direct = typeof json.bdstoken === 'string' ? json.bdstoken : '';
-  if (direct) return direct;
-  const d = json.data && typeof json.data === 'object' ? json.data : null;
-  return d && typeof d.bdstoken === 'string' ? d.bdstoken : '';
+  const info = json.login_info && typeof json.login_info === 'object' ? json.login_info : null;
+  return info && typeof info.bdstoken === 'string' ? info.bdstoken : '';
 }
 
-async function baiduEnsureDir({ cookie, dirPath, bdstoken }) {
-  const token = bdstoken || (await getBdstoken({ cookie }));
-  const p = String(dirPath || '').trim();
-  if (!p || !p.startsWith('/')) throw new Error('invalid dirPath');
-  const params = new URLSearchParams({
-    a: 'commit',
-    web: '1',
-    clienttype: '0',
-    channel: 'chunlei',
-    bdstoken: token,
-  }).toString();
-  const url = `https://pan.baidu.com/api/create?${params}`;
-  const form = new URLSearchParams({
-    path: p,
-    isdir: '1',
-    size: '0',
-    block_list: '[]',
-    rtype: '1',
-  }).toString();
-  const { data } = await fetchJson(url, {
-    method: 'POST',
-    headers: {
-      ...buildBaiduHeaders({ cookie, referer: 'https://pan.baidu.com/disk/main' }),
-      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-    },
-    body: form,
-  });
-  // errno=0 ok; errno=31066 already exists (commonly)
-  return { bdstoken: token, data };
-}
-
-async function baiduDeletePaths({ cookie, paths, bdstoken }) {
-  const token = bdstoken || (await getBdstoken({ cookie }));
-  const list = Array.isArray(paths) ? paths.map((x) => String(x || '').trim()).filter((x) => x.startsWith('/')) : [];
-  if (!list.length) return { bdstoken: token, deleted: 0, data: null };
-
-  const params = new URLSearchParams({
-    opera: 'delete',
-    async: '1',
-    web: '1',
-    clienttype: '0',
-    channel: 'chunlei',
-    bdstoken: token,
-  }).toString();
-  const url = `https://pan.baidu.com/api/filemanager?${params}`;
-  const body = new URLSearchParams({ filelist: JSON.stringify(list) }).toString();
-  const { data } = await fetchJson(url, {
-    method: 'POST',
-    headers: {
-      ...buildBaiduHeaders({ cookie, referer: 'https://pan.baidu.com/disk/main' }),
-      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-    },
-    body,
-  });
-  return { bdstoken: token, deleted: list.length, data };
-}
-
-async function baiduClearDir({ cookie, dirPath, bdstoken }) {
-  const token = bdstoken || (await getBdstoken({ cookie }));
-  const p = String(dirPath || '').trim();
-  if (!p || !p.startsWith('/')) throw new Error('invalid dirPath');
-  const listed = await listMyDir({ cookie, dir: p, start: 0, limit: 200, order: 'time', desc: true, bdstoken: token });
-  const arr = listed && listed.data && Array.isArray(listed.data.list) ? listed.data.list : [];
-  const paths = [];
-  for (const it of arr) {
-    if (!it || typeof it !== 'object') continue;
-    const path = String(it.path || '').trim();
-    if (path && path !== p) paths.push(path);
-  }
-  if (!paths.length) return { bdstoken: token, cleared: 0 };
-  const del = await baiduDeletePaths({ cookie, paths, bdstoken: token });
-  return { bdstoken: token, cleared: paths.length, delete: del };
-}
-
-async function getBdstoken({ cookie }) {
+async function getBdstokenScript({ cookie, cookieRef }) {
   const qs = new URLSearchParams({
+    clienttype: '1',
     web: '1',
-    clienttype: '0',
-    channel: 'chunlei',
+    channel: 'web',
     version: '0',
   }).toString();
   const url = `https://pan.baidu.com/api/loginStatus?${qs}`;
-  const { data } = await fetchJson(url, {
+  const { data, setCookie } = await fetchJson(url, {
     method: 'GET',
-    headers: buildBaiduHeaders({ cookie, referer: 'https://pan.baidu.com/disk/main' }),
+    headers: buildBaiduScriptWebHeaders({ cookie }),
   });
+  try {
+    if (cookieRef && setCookie && setCookie.length) cookieRef.value = mergeCookieFromSetCookie(cookieRef.value || cookie, setCookie);
+  } catch {}
   const token = extractBdstoken(data);
   if (!token) throw new Error('bdstoken not found (loginStatus)');
   return token;
 }
 
-async function listMyDir({ cookie, dir, start, limit, order, desc, bdstoken }) {
-  const token = bdstoken || (await getBdstoken({ cookie }));
-  const params = new URLSearchParams({
-    method: 'list',
-    dir: String(dir || '/'),
-    order: String(order || 'time'),
-    desc: String(desc == null ? '1' : desc ? '1' : '0'),
-    start: String(Number.isFinite(Number(start)) ? Number(start) : 0),
-    limit: String(Number.isFinite(Number(limit)) ? Number(limit) : 100),
-    web: '1',
-    clienttype: '0',
-    channel: 'chunlei',
-    bdstoken: token,
-  }).toString();
-  const url = `https://pan.baidu.com/rest/2.0/xpan/file?${params}`;
-  const { data } = await fetchJson(url, {
-    method: 'GET',
-    headers: buildBaiduHeaders({ cookie, referer: 'https://pan.baidu.com/disk/main' }),
-  });
-  return { bdstoken: token, data };
+function toCreateApiPath(dirPath) {
+  const p = String(dirPath || '').trim();
+  if (!p) return '';
+  // Match the script behavior: sending `path=//Name` for root dirs.
+  if (p.startsWith('/')) return `/${p}`;
+  return `//${p}`;
 }
 
-async function fileMetas({ cookie, fsids, bdstoken, dlink }) {
-  const token = bdstoken || (await getBdstoken({ cookie }));
-  const ids = Array.isArray(fsids) ? fsids : typeof fsids === 'string' ? [fsids] : [];
-  const cleaned = ids
-    .map((x) => String(x || '').trim())
-    .filter(Boolean)
-    .map((x) => (x.startsWith('[') ? x : x));
-  if (!cleaned.length) throw new Error('missing fsids');
-  const fsidArr = cleaned.map((x) => (x.startsWith('[') ? x : Number.isFinite(Number(x)) ? Number(x) : x));
-  const params = new URLSearchParams({
-    method: 'filemetas',
-    fsids: JSON.stringify(fsidArr),
-    dlink: dlink ? '1' : '0',
-    extra: '1',
-    web: '1',
+async function baiduCreateDirScript({ cookie, dirPath, bdstoken }) {
+  const cookieRef = { value: String(cookie || '').trim() };
+  const token = bdstoken || (await getBdstokenScript({ cookie: cookieRef.value, cookieRef }));
+  const p = String(dirPath || '').trim();
+  if (!p || !p.startsWith('/')) throw new Error('invalid dirPath');
+
+  const qs = new URLSearchParams({
+    a: 'commit',
+    bdstoken: token,
     clienttype: '0',
+    web: '1',
+  }).toString();
+  const url = `https://pan.baidu.com/api/create?${qs}`;
+  const form = new URLSearchParams({
+    path: toCreateApiPath(p),
+    isdir: '1',
+    block_list: '[]',
+  }).toString();
+  const { data, setCookie } = await fetchJson(url, {
+    method: 'POST',
+    headers: {
+      ...buildBaiduScriptWebHeaders({ cookie: cookieRef.value }),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: form,
+  });
+  if (setCookie && setCookie.length) cookieRef.value = mergeCookieFromSetCookie(cookieRef.value, setCookie);
+  assertBaiduErrnoOk(data, [31066, -8]);
+  return { bdstoken: token, cookie: cookieRef.value, data };
+}
+
+async function baiduApiListRootScript({ cookie, cookieRef }) {
+  const qs = new URLSearchParams({
+    clienttype: '0',
+    app_id: BAIDU_APP_ID,
+    web: '1',
+    order: 'time',
+    desc: '1',
+    num: '9999',
+    page: '1',
+  }).toString();
+  const url = `https://pan.baidu.com/api/list?${qs}`;
+  const { data, setCookie } = await fetchJson(url, {
+    method: 'GET',
+    headers: buildBaiduScriptWebHeaders({ cookie }),
+  });
+  try {
+    if (cookieRef && setCookie && setCookie.length) cookieRef.value = mergeCookieFromSetCookie(cookieRef.value || cookie, setCookie);
+  } catch {}
+  return data;
+}
+
+function pickDirEntryFromApiList(data, dirPath) {
+  const wantPath = String(dirPath || '').trim();
+  if (!wantPath || !wantPath.startsWith('/')) return null;
+  const wantName = wantPath.split('/').filter(Boolean).pop() || '';
+  const list = data && typeof data === 'object' && Array.isArray(data.list) ? data.list : [];
+  const dirs = list.filter((it) => it && typeof it === 'object' && Number(it.isdir) === 1);
+  const exact =
+    dirs.find((it) => String(it.path || '').trim() === wantPath) ||
+    (wantName ? dirs.find((it) => String(it.server_filename || it.filename || it.name || '').trim() === wantName) : null);
+  if (exact) return exact;
+  if (!wantName) return null;
+  const pref = `${wantName}_`;
+  const candidates = dirs.filter((it) => {
+    const nm = String(it.server_filename || it.filename || it.name || '').trim();
+    const p = String(it.path || '').trim();
+    return (nm && nm.startsWith(pref)) || (p && p.startsWith(`/${pref}`));
+  });
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => Number(b.mtime || 0) - Number(a.mtime || 0));
+  return candidates[0] || null;
+}
+
+async function baiduFileManagerDeleteScript({ cookie, paths, bdstoken }) {
+  const cookieRef = { value: String(cookie || '').trim() };
+  const token = bdstoken || (await getBdstokenScript({ cookie: cookieRef.value, cookieRef }));
+  const list = Array.isArray(paths) ? paths.map((x) => String(x || '').trim()).filter((x) => x.startsWith('/')) : [];
+  if (!list.length) return { bdstoken: token, cookie: cookieRef.value, data: null };
+
+  const qs = new URLSearchParams({
+    async: '2',
+    onnest: 'fail',
+    opera: 'delete',
+    bdstoken: token,
+    newVerify: '1',
+    clienttype: '0',
+    web: '1',
+  }).toString();
+  const url = `https://pan.baidu.com/api/filemanager?${qs}`;
+  const form = new URLSearchParams({
+    filelist: JSON.stringify(list),
+  }).toString();
+  const { data, setCookie } = await fetchJson(url, {
+    method: 'POST',
+    headers: {
+      ...buildBaiduScriptWebHeaders({ cookie: cookieRef.value }),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: form,
+  });
+  if (setCookie && setCookie.length) cookieRef.value = mergeCookieFromSetCookie(cookieRef.value, setCookie);
+  assertBaiduErrnoOk(data);
+  return { bdstoken: token, cookie: cookieRef.value, data };
+}
+
+async function baiduRecycleClearScript({ cookie, bdstoken }) {
+  const cookieRef = { value: String(cookie || '').trim() };
+  const token = bdstoken || (await getBdstokenScript({ cookie: cookieRef.value, cookieRef }));
+  const qs = new URLSearchParams({
+    async: '1',
     channel: 'chunlei',
     bdstoken: token,
+    clienttype: '0',
+    app_id: BAIDU_APP_ID,
+    web: '1',
   }).toString();
-  const url = `https://pan.baidu.com/rest/2.0/xpan/multimedia?${params}`;
-  const { data } = await fetchJson(url, {
-    method: 'GET',
-    headers: buildBaiduHeaders({ cookie, referer: 'https://pan.baidu.com/disk/main' }),
+  const url = `https://pan.baidu.com/api/recycle/clear?${qs}`;
+  const { data, setCookie } = await fetchJson(url, {
+    method: 'POST',
+    headers: {
+      ...buildBaiduScriptWebHeaders({ cookie: cookieRef.value }),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: '',
   });
-  return { bdstoken: token, data };
+  if (setCookie && setCookie.length) cookieRef.value = mergeCookieFromSetCookie(cookieRef.value, setCookie);
+  assertBaiduErrnoOk(data);
+  return { bdstoken: token, cookie: cookieRef.value, data };
+}
+
+async function baiduEnsureDir({ cookie, dirPath, bdstoken }) {
+  const cookieRef = { value: String(cookie || '').trim() };
+  const token = bdstoken || (await getBdstokenScript({ cookie: cookieRef.value, cookieRef }));
+  const p = String(dirPath || '').trim();
+  if (!p || !p.startsWith('/')) throw new Error('invalid dirPath');
+
+  try {
+    const listed = await baiduApiListRootScript({ cookie: cookieRef.value, cookieRef });
+    const found = pickDirEntryFromApiList(listed, p);
+    if (found) {
+      return {
+        bdstoken: token,
+        cookie: cookieRef.value,
+        data: {
+          errno: 0,
+          existed: true,
+          path: String(found.path || p),
+          fs_id: found.fs_id,
+          isdir: 1,
+          mtime: found.mtime,
+          ctime: found.ctime,
+          server_filename: found.server_filename,
+        },
+      };
+    }
+  } catch {}
+
+  return await baiduCreateDirScript({ cookie: cookieRef.value, dirPath: p, bdstoken: token });
+}
+
+async function getBdstoken({ cookie, cookieRef }) {
+  return await getBdstokenScript({ cookie, cookieRef });
 }
 
 function parseShareUrl(urlStr) {
@@ -281,13 +388,16 @@ function parseShareUrl(urlStr) {
   return { kind: 'unknown', shareKey: '', surl: '', url: raw };
 }
 
-function extractSetCookiePairs(headers) {
-  const out = [];
-  try {
-    const any = headers && typeof headers.get === 'function' ? headers.get('set-cookie') : null;
-    if (any) out.push(String(any));
-  } catch {}
-  return out;
+function mergeCookieFromSetCookie(baseCookie, setCookieArr) {
+  const pairs = [];
+  for (const sc of Array.isArray(setCookieArr) ? setCookieArr : []) {
+    const s = String(sc || '').trim();
+    if (!s) continue;
+    const first = s.split(';')[0];
+    if (first && first.includes('=')) pairs.push(first);
+  }
+  if (!pairs.length) return String(baseCookie || '').trim();
+  return mergeCookies(baseCookie, pairs.join('; '));
 }
 
 function pickCookieValueFromSetCookie(setCookieArr, key) {
@@ -301,260 +411,250 @@ function pickCookieValueFromSetCookie(setCookieArr, key) {
   return '';
 }
 
-function extractYunData(html) {
-  const raw = String(html || '');
-  const idx = raw.indexOf('yunData.setData(');
-  if (idx < 0) return null;
-  const start = raw.indexOf('{', idx);
-  if (start < 0) return null;
-  let depth = 0;
-  let inStr = false;
-  let strCh = '';
-  let esc = false;
-  for (let i = start; i < raw.length; i += 1) {
-    const ch = raw[i];
-    if (inStr) {
-      if (esc) {
-        esc = false;
-      } else if (ch === '\\\\') {
-        esc = true;
-      } else if (ch === strCh) {
-        inStr = false;
-        strCh = '';
-      }
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      inStr = true;
-      strCh = ch;
-      continue;
-    }
-    if (ch === '{') depth += 1;
-    if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) {
-        const jsonLike = raw.slice(start, i + 1);
-        try {
-          return JSON.parse(jsonLike);
-        } catch {
-          return null;
-        }
-      }
-    }
+function parseSurlFromFlag(flag) {
+  const raw = String(flag || '').trim();
+  if (!raw) return '';
+  const m = raw.match(/百度[^-]*-([^#]+)/);
+  if (m && m[1]) return String(m[1]).trim();
+  const parts = raw.split('-');
+  if (parts.length >= 2) return String(parts[1] || '').split('#')[0].trim();
+  return '';
+}
+
+function decodePlayIdToJson(id) {
+  let raw = String(id || '').trim();
+  if (!raw) return null;
+  const dollar = raw.lastIndexOf('$');
+  if (dollar >= 0) raw = raw.slice(dollar + 1);
+  raw = raw.split('|||')[0] || raw;
+  raw = raw.trim();
+  if (!raw) return null;
+  try {
+    raw = decodeURIComponent(raw);
+  } catch {}
+  try {
+    const text = Buffer.from(raw, 'base64').toString('utf8');
+    const obj = JSON.parse(text);
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : null;
+  } catch {
+    return null;
   }
-  return null;
 }
 
-async function fetchSharePage({ url }) {
-  const parsed = parseShareUrl(url);
-  if (!parsed) throw new Error('invalid baidu share url');
-  const key = parsed.shareKey || (parsed.surl ? `1${parsed.surl}` : '');
-  const ref = `https://pan.baidu.com/s/${encodeURIComponent(key)}`;
-  const { res, text } = await fetchText(ref, {
-    method: 'GET',
-    headers: buildBaiduHeaders({ cookie: '', referer: ref }),
-  });
-  return { res, html: text, surl: parsed.surl || '', shareKey: key };
-}
-
-async function verifySharePwd({ surl, pwd }) {
+async function verifySharePwd({ surl, pwd, cookieRef }) {
   const p = String(pwd || '').trim();
   if (!surl) throw new Error('missing surl');
   if (!p) throw new Error('missing pwd');
+  const t = String(Date.now());
   const params = new URLSearchParams({
+    t,
     surl: String(surl),
-    web: '1',
-    clienttype: '0',
-    channel: 'chunlei',
   }).toString();
   const url = `https://pan.baidu.com/share/verify?${params}`;
   const body = new URLSearchParams({ pwd: p }).toString();
-  const { res, data } = await fetchJson(url, {
+  const baseCookie = cookieRef && typeof cookieRef.value === 'string' ? cookieRef.value : '';
+  const { data, setCookie } = await fetchJson(url, {
     method: 'POST',
     headers: {
-      ...buildBaiduHeaders({ cookie: '', referer: `https://pan.baidu.com/s/1${encodeURIComponent(surl)}` }),
-      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      ...buildBaiduScriptWebHeaders({ cookie: baseCookie }),
+      'Content-Type': 'application/x-www-form-urlencoded',
     },
     body,
   });
-  const setCookies = extractSetCookiePairs(res.headers);
-  const bdclnd = pickCookieValueFromSetCookie(setCookies, 'BDCLND');
-  return { data, bdclnd };
+  const bdclnd = pickCookieValueFromSetCookie(setCookie || [], 'BDCLND');
+  let merged = baseCookie;
+  try {
+    if (setCookie && setCookie.length) merged = mergeCookieFromSetCookie(baseCookie, setCookie);
+  } catch {}
+  try {
+    if (cookieRef) cookieRef.value = merged;
+  } catch {}
+  return { data, bdclnd, cookie: merged };
 }
 
-async function listShareDir({ surl, pwd, dir, page, num }) {
-  // 1) Fetch share page to get uk/shareid/sign/timestamp (when present)
-  const shareKey = surl ? `1${surl}` : '';
-  const { html } = await fetchSharePage({ url: `https://pan.baidu.com/s/${encodeURIComponent(shareKey)}` });
-  const yun = extractYunData(html) || {};
-  const uk = String(yun.uk || yun.share_uk || '').trim();
-  const shareid = String(yun.shareid || yun.share_id || '').trim();
-  const sign = String(yun.sign || '').trim();
-  const timestamp = String(yun.timestamp || yun.sign_timestamp || '').trim();
+async function shareListRootScript({ baseCookie, surl, pwd }) {
+  const shorturl = String(surl || '').trim();
+  if (!shorturl) throw new Error('missing surl');
+  const cookieRef = { value: String(baseCookie || '').trim() };
+  if (!cookieRef.value) throw new Error('missing baidu cookie');
+  const pass = String(pwd || '').trim();
+  if (pass) await verifySharePwd({ surl: shorturl, pwd: pass, cookieRef });
+  const qs = new URLSearchParams({
+    desc: '1',
+    showempty: '0',
+    page: '1',
+    num: '10000',
+    order: 'time',
+    shorturl,
+    root: '1',
+  }).toString();
+  const url = `https://pan.baidu.com/share/list?${qs}`;
+  const { data, setCookie } = await fetchJson(url, {
+    method: 'GET',
+    headers: {
+      ...buildBaiduScriptWebHeaders({ cookie: cookieRef.value }),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+  });
+  if (setCookie && setCookie.length) cookieRef.value = mergeCookieFromSetCookie(cookieRef.value, setCookie);
+  assertBaiduErrnoOk(data);
+  const shareid =
+    String((data && (data.shareid || data.share_id)) || '').trim() ||
+    String((data && data.data && (data.data.shareid || data.data.share_id)) || '').trim();
+  const uk =
+    String((data && (data.uk || data.share_uk)) || '').trim() ||
+    String((data && data.data && (data.data.uk || data.data.share_uk)) || '').trim();
+  return { cookie: cookieRef.value, data, ctx: { surl: shorturl, shareid, uk } };
+}
 
-  // 2) Verify password if provided to obtain BDCLND cookie (needed for encrypted shares)
-  let extraCookie = '';
-  if (pwd) {
-    const { bdclnd } = await verifySharePwd({ surl, pwd });
-    if (bdclnd) extraCookie = `BDCLND=${bdclnd}`;
-  }
-
-  const cookie = extraCookie;
-  const params = new URLSearchParams({
-    uk,
-    shareid,
-    dir: String(dir || ''),
-    page: String(Number.isFinite(Number(page)) ? Number(page) : 1),
-    num: String(Number.isFinite(Number(num)) ? Number(num) : 100),
+async function shareListDirScript({ cookie, shareid, uk, dir }) {
+  const d = String(dir || '').trim();
+  if (!d || !d.startsWith('/')) throw new Error('invalid dir');
+  const qs = new URLSearchParams({
+    uk: String(uk || '').trim(),
+    shareid: String(shareid || '').trim(),
     order: 'other',
     desc: '1',
     showempty: '0',
-    web: '1',
-    clienttype: '0',
-    channel: 'chunlei',
-  });
-  if (sign) params.set('sign', sign);
-  if (timestamp) params.set('timestamp', timestamp);
-
-  const url = `https://pan.baidu.com/share/list?${params.toString()}`;
+    page: '1',
+    num: '10000',
+    dir: d,
+    t: String(Date.now() * 1000),
+  }).toString();
+  const url = `https://pan.baidu.com/share/list?${qs}`;
   const { data } = await fetchJson(url, {
     method: 'GET',
-    headers: buildBaiduHeaders({ cookie, referer: `https://pan.baidu.com/s/${encodeURIComponent(shareKey)}` }),
-  });
-
-  return { data, ctx: { surl, uk, shareid, sign, timestamp, cookie: cookie || '' } };
-}
-
-async function shareDlink({ url, pwd, fsids, baseCookie }) {
-  const parsed = parseShareUrl(url);
-  if (!parsed || !parsed.surl) throw new Error('invalid baidu share url');
-  const surl = parsed.surl;
-
-  const { html } = await fetchSharePage({ url });
-  const yun = extractYunData(html) || {};
-  const uk = String(yun.uk || yun.share_uk || '').trim();
-  const shareid = String(yun.shareid || yun.share_id || '').trim();
-  const sign = String(yun.sign || '').trim();
-  const timestamp = String(yun.timestamp || yun.sign_timestamp || '').trim();
-  if (!uk || !shareid || !sign || !timestamp) throw new Error('share context missing (uk/shareid/sign/timestamp)');
-
-  let shareCookie = '';
-  if (pwd) {
-    const { bdclnd } = await verifySharePwd({ surl, pwd });
-    if (bdclnd) shareCookie = `BDCLND=${bdclnd}`;
-  }
-
-  const cookie = mergeCookies(baseCookie, shareCookie);
-  const bdstoken = await getBdstoken({ cookie });
-
-  const ids = Array.isArray(fsids) ? fsids : typeof fsids === 'string' ? [fsids] : [];
-  const cleaned = ids.map((x) => String(x || '').trim()).filter(Boolean);
-  if (!cleaned.length) throw new Error('missing fsids');
-
-  const qs = new URLSearchParams({
-    sign,
-    timestamp,
-    bdstoken,
-    channel: 'chunlei',
-    web: '1',
-    clienttype: '0',
-  }).toString();
-  const apiUrl = `https://pan.baidu.com/api/sharedownload?${qs}`;
-  const form = new URLSearchParams({
-    encrypt: '0',
-    product: 'share',
-    uk,
-    primaryid: shareid,
-    fid_list: JSON.stringify(cleaned.map((x) => (Number.isFinite(Number(x)) ? Number(x) : x))),
-  }).toString();
-
-  const { data } = await fetchJson(apiUrl, {
-    method: 'POST',
     headers: {
-      ...buildBaiduHeaders({ cookie, referer: `https://pan.baidu.com/s/${encodeURIComponent(parsed.shareKey || `1${surl}`)}` }),
-      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      ...buildBaiduScriptWebHeaders({ cookie }),
+      'Content-Type': 'application/x-www-form-urlencoded',
     },
-    body: form,
   });
-
-  return {
-    surl,
-    uk,
-    shareid,
-    sign,
-    timestamp,
-    bdstoken,
-    cookie,
-    data,
-  };
+  assertBaiduErrnoOk(data);
+  return data;
 }
 
-async function shareTransferToDir({ baseCookie, shareid, uk, surl, pwd, fs_id, destPath }) {
+function getShareListArray(data) {
+  if (!data || typeof data !== 'object') return [];
+  if (Array.isArray(data.list)) return data.list;
+  if (data.data && typeof data.data === 'object' && Array.isArray(data.data.list)) return data.data.list;
+  return [];
+}
+
+function findShareItemByName(list, name, isDir) {
+  const want = String(name || '').trim();
+  if (!want) return null;
+  const arr = Array.isArray(list) ? list : [];
+  return (
+    arr.find((it) => {
+      if (!it || typeof it !== 'object') return false;
+      const n = String(it.server_filename || it.filename || it.name || '').trim();
+      if (n !== want) return false;
+      const d = Number(it.isdir) === 1;
+      return isDir ? d : !d;
+    }) || null
+  );
+}
+
+async function shareResolveFsidByPathScript({ baseCookie, surl, pwd, path }) {
+  const full = String(path || '').trim();
+  if (!full || !full.startsWith('/')) throw new Error('invalid path');
+  const segs = full.split('/').filter(Boolean);
+  if (!segs.length) throw new Error('invalid path');
+  const fileName = segs[segs.length - 1];
+  const dirSegs = segs.slice(0, -1);
+
+  const root = await shareListRootScript({ baseCookie, surl, pwd });
+  const { shareid, uk } = root.ctx || {};
+  if (!shareid || !uk) throw new Error('share context missing (uk/shareid)');
+
+  let curDir = '';
+  for (const seg of dirSegs) {
+    curDir = `${curDir}/${seg}`;
+    const data = await shareListDirScript({ cookie: root.cookie, shareid, uk, dir: curDir });
+    const list = getShareListArray(data);
+    const found = findShareItemByName(list, seg, true);
+    if (!found) throw new Error(`dir not found: ${curDir}`);
+  }
+  const finalDir = dirSegs.length ? `/${dirSegs.join('/')}` : '';
+  const data = finalDir
+    ? await shareListDirScript({ cookie: root.cookie, shareid, uk, dir: finalDir })
+    : root.data;
+  const list = getShareListArray(data);
+  const file = findShareItemByName(list, fileName, false);
+  if (!file) throw new Error(`file not found: ${fileName}`);
+  const fsid = file.fs_id != null ? String(file.fs_id) : String(file.fsid || '');
+  if (!fsid) throw new Error('fsid not found');
+  return { cookie: root.cookie, uk, shareid, fsid, fileName, dir: finalDir || '/' };
+}
+
+async function shareTransferToDirScript({ baseCookie, shareid, uk, surl, pwd, fsid, destPath }) {
   const shareId = String(shareid || '').trim();
   const fromUk = String(uk || '').trim();
   const s = String(surl || '').trim();
   const pass = String(pwd || '').trim();
   const dest = String(destPath || '').trim();
-  const fsid = String(fs_id || '').trim();
-  if (!shareId || !fromUk || !s || !dest || !dest.startsWith('/') || !fsid) throw new Error('missing share transfer parameters');
+  const f = String(fsid || '').trim();
+  if (!shareId || !fromUk || !s || !dest || !dest.startsWith('/') || !f) throw new Error('missing share transfer parameters');
 
-  let extraCookie = '';
-  let sekey = '';
+  const cookieRef = { value: String(baseCookie || '').trim() };
+  if (!cookieRef.value) throw new Error('missing baidu cookie');
   if (pass) {
-    const { bdclnd } = await verifySharePwd({ surl: s, pwd: pass });
-    if (bdclnd) {
-      extraCookie = `BDCLND=${bdclnd}`;
-      sekey = bdclnd;
-    }
+    const v = await verifySharePwd({ surl: s, pwd: pass, cookieRef });
+    if (v && v.cookie) cookieRef.value = v.cookie;
   }
-
-  const cookie = mergeCookies(baseCookie, extraCookie);
-  const bdstoken = await getBdstoken({ cookie });
 
   const params = new URLSearchParams({
     shareid: shareId,
     from: fromUk,
-    ondup: 'overwrite',
-    async: '1',
-    web: '1',
-    clienttype: '0',
-    channel: 'chunlei',
-    bdstoken,
-  });
-  if (sekey) params.set('sekey', sekey);
-  const url = `https://pan.baidu.com/share/transfer?${params.toString()}`;
+    ondup: 'newcopy',
+  }).toString();
+  const url = `https://pan.baidu.com/share/transfer?${params}`;
 
   const form = new URLSearchParams({
-    fsidlist: JSON.stringify([Number.isFinite(Number(fsid)) ? Number(fsid) : fsid]),
+    fsidlist: JSON.stringify([Number.isFinite(Number(f)) ? Number(f) : f]),
     path: dest,
   }).toString();
-
-  const { data } = await fetchJson(url, {
+  const { data, setCookie } = await fetchJson(url, {
     method: 'POST',
     headers: {
-      ...buildBaiduHeaders({ cookie, referer: `https://pan.baidu.com/s/1${encodeURIComponent(s)}` }),
-      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      ...buildBaiduScriptWebHeaders({ cookie: cookieRef.value }),
+      'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: form,
   });
-
-  return { bdstoken, cookie, data };
+  if (setCookie && setCookie.length) cookieRef.value = mergeCookieFromSetCookie(cookieRef.value, setCookie);
+  assertBaiduErrnoOk(data);
+  return { bdstoken: '', cookie: cookieRef.value, data };
 }
 
-async function pickSavedFileInDir({ cookie, dirPath, fileName, bdstoken }) {
-  const listed = await listMyDir({ cookie, dir: dirPath, start: 0, limit: 200, order: 'time', desc: true, bdstoken });
-  const arr = listed && listed.data && Array.isArray(listed.data.list) ? listed.data.list : [];
-  const want = String(fileName || '').trim();
-  if (!arr.length) return null;
-  if (want) {
-    const found = arr.find((it) => it && typeof it === 'object' && String(it.server_filename || '').trim() === want);
-    if (found) return found;
-    const found2 = arr.find((it) => it && typeof it === 'object' && String(it.path || '').endsWith(`/${want}`));
-    if (found2) return found2;
-  }
-  // fallback: pick first file (prefer non-dir)
-  const file = arr.find((it) => it && typeof it === 'object' && Number(it.isdir) !== 1) || arr[0];
-  return file || null;
+async function baiduMediaInfoScript({ cookie, path }) {
+  const p = String(path || '').trim();
+  if (!p || !p.startsWith('/')) throw new Error('invalid path');
+  const qs = new URLSearchParams({
+    type: 'M3U8_FLV_264_480',
+    path: p,
+    origin: 'dlna',
+    check_blue: '1',
+    app_id: BAIDU_APP_ID,
+    devuid: 'kx1cK7VGweDrdrLiQpQRZduW5KTFvBHU|YyLyiRidC',
+    clienttype: '80',
+    channel: 'android_12_V2238A_bd-netdisk_1024266g',
+    network_type: 'wifi',
+    version: '12.11.9',
+  }).toString();
+  const url = `https://pan.baidu.com/api/mediainfo?${qs}`;
+  const { data } = await fetchJson(url, {
+    method: 'GET',
+    headers: {
+      Origin: 'https://pan.baidu.com',
+      Referer: 'https://pan.baidu.com/',
+      'User-Agent': BAIDU_SCRIPT_NETDISK_UA,
+      ...(cookie ? { Cookie: cookie } : {}),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+  });
+  assertBaiduErrnoOk(data);
+  return data;
 }
 
 export const apiPlugins = [
@@ -564,7 +664,7 @@ export const apiPlugins = [
       instance.get('/status', async (req) => {
         const root = await readDbRoot(req.server);
         const cookie = getBaiduCookieFromDbRoot(root);
-        return { ok: true, hasCookie: !!cookie };
+        return { ok: true, hasCookie: !!cookie, features: { transferSupportsFlagId: true } };
       });
 
       instance.get('/auth/bdstoken', async (req, reply) => {
@@ -577,93 +677,6 @@ export const apiPlugins = [
         try {
           const bdstoken = await getBdstoken({ cookie });
           return { ok: true, bdstoken };
-        } catch (e) {
-          reply.code(502);
-          return { ok: false, ...normalizeBaiduErr(e) };
-        }
-      });
-
-      instance.post('/file/list', async (req, reply) => {
-        const body = req && typeof req.body === 'object' ? req.body : {};
-        const root = await readDbRoot(req.server);
-        const cookie = getBaiduCookieFromDbRoot(root);
-        if (!cookie) {
-          reply.code(400);
-          return { ok: false, message: 'missing baidu cookie' };
-        }
-        try {
-          const out = await listMyDir({
-            cookie,
-            dir: body.dir,
-            start: body.start,
-            limit: body.limit,
-            order: body.order,
-            desc: body.desc,
-            bdstoken: body.bdstoken,
-          });
-          return { ok: true, ...out };
-        } catch (e) {
-          reply.code(502);
-          return { ok: false, ...normalizeBaiduErr(e) };
-        }
-      });
-
-      instance.post('/file/info', async (req, reply) => {
-        const body = req && typeof req.body === 'object' ? req.body : {};
-        const root = await readDbRoot(req.server);
-        const cookie = getBaiduCookieFromDbRoot(root);
-        if (!cookie) {
-          reply.code(400);
-          return { ok: false, message: 'missing baidu cookie' };
-        }
-        try {
-          const out = await fileMetas({
-            cookie,
-            fsids: body.fsids,
-            bdstoken: body.bdstoken,
-            dlink: body.dlink === true,
-          });
-          return {
-            ok: true,
-            ...out,
-          };
-        } catch (e) {
-          reply.code(502);
-          return { ok: false, ...normalizeBaiduErr(e) };
-        }
-      });
-
-      instance.post('/file/download', async (req, reply) => {
-        const body = req && typeof req.body === 'object' ? req.body : {};
-        const root = await readDbRoot(req.server);
-        const cookie = getBaiduCookieFromDbRoot(root);
-        if (!cookie) {
-          reply.code(400);
-          return { ok: false, message: 'missing baidu cookie' };
-        }
-        try {
-          const out = await fileMetas({
-            cookie,
-            fsids: body.fsids,
-            bdstoken: body.bdstoken,
-            dlink: true,
-          });
-          const list = out && out.data && out.data.list ? out.data.list : [];
-          const urls = Array.isArray(list)
-            ? list
-                .map((it) => (it && typeof it === 'object' ? String(it.dlink || '') : ''))
-                .filter((u) => /^https?:\/\//i.test(u))
-            : [];
-          return {
-            ok: true,
-            urls,
-            data: out.data,
-            headers: {
-              Cookie: cookie,
-              Referer: 'https://pan.baidu.com/disk/main',
-              'User-Agent': BAIDU_UA,
-            },
-          };
         } catch (e) {
           reply.code(502);
           return { ok: false, ...normalizeBaiduErr(e) };
@@ -693,12 +706,13 @@ export const apiPlugins = [
         }
       });
 
-      instance.post('/file/clear', async (req, reply) => {
+      instance.post('/file/delete', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
-        const dirPath = String(body.dirPath || body.dir || '').trim();
-        if (!dirPath || !dirPath.startsWith('/')) {
+        const rawPaths = Array.isArray(body.paths) ? body.paths : body.path != null ? [body.path] : [];
+        const paths = rawPaths.map((x) => String(x || '').trim()).filter((x) => x.startsWith('/'));
+        if (!paths.length) {
           reply.code(400);
-          return { ok: false, message: 'missing dirPath' };
+          return { ok: false, message: 'missing path(s)' };
         }
         const root = await readDbRoot(req.server);
         const cookie = getBaiduCookieFromDbRoot(root);
@@ -707,7 +721,7 @@ export const apiPlugins = [
           return { ok: false, message: 'missing baidu cookie' };
         }
         try {
-          const out = await baiduClearDir({ cookie, dirPath });
+          const out = await baiduFileManagerDeleteScript({ cookie, paths });
           return { ok: true, ...out };
         } catch (e) {
           reply.code(502);
@@ -715,22 +729,41 @@ export const apiPlugins = [
         }
       });
 
-      instance.post('/share/parse', async (req, reply) => {
-        const body = req && typeof req.body === 'object' ? req.body : {};
-        const url = String(body.url || '').trim();
-        if (!url) {
+      instance.post('/recycle/clear', async (req, reply) => {
+        const root = await readDbRoot(req.server);
+        const cookie = getBaiduCookieFromDbRoot(root);
+        if (!cookie) {
           reply.code(400);
-          return { ok: false, message: 'missing url' };
+          return { ok: false, message: 'missing baidu cookie' };
         }
         try {
-          const parsed = parseShareUrl(url);
-          if (!parsed || !parsed.surl) {
-            reply.code(400);
-            return { ok: false, message: 'invalid baidu share url' };
-          }
-          const { html } = await fetchSharePage({ url });
-          const yun = extractYunData(html);
-          return { ok: true, surl: parsed.surl, yun: yun || null };
+          const out = await baiduRecycleClearScript({ cookie });
+          return { ok: true, ...out };
+        } catch (e) {
+          reply.code(502);
+          return { ok: false, ...normalizeBaiduErr(e) };
+        }
+      });
+
+      instance.post('/file/clear', async (req, reply) => {
+        const body = req && typeof req.body === 'object' ? req.body : {};
+        const rawPaths = Array.isArray(body.paths) ? body.paths : body.path != null ? [body.path] : [];
+        const paths = rawPaths.map((x) => String(x || '').trim()).filter((x) => x.startsWith('/'));
+        const clearRecycle = body.clearRecycle == null ? true : !!body.clearRecycle;
+        if (!paths.length) {
+          reply.code(400);
+          return { ok: false, message: 'missing path(s)' };
+        }
+        const root = await readDbRoot(req.server);
+        const cookie = getBaiduCookieFromDbRoot(root);
+        if (!cookie) {
+          reply.code(400);
+          return { ok: false, message: 'missing baidu cookie' };
+        }
+        try {
+          const del = await baiduFileManagerDeleteScript({ cookie, paths });
+          const rec = clearRecycle ? await baiduRecycleClearScript({ cookie: del.cookie || cookie, bdstoken: del.bdstoken }) : null;
+          return { ok: true, delete: del.data, recycle: rec ? rec.data : null };
         } catch (e) {
           reply.code(502);
           return { ok: false, ...normalizeBaiduErr(e) };
@@ -755,8 +788,15 @@ export const apiPlugins = [
             reply.code(400);
             return { ok: false, message: 'invalid baidu share url' };
           }
-          const out = await verifySharePwd({ surl: parsed.surl, pwd });
-          return { ok: true, surl: parsed.surl, ...out };
+          const root = await readDbRoot(req.server);
+          const baseCookie = getBaiduCookieFromDbRoot(root);
+          if (!baseCookie) {
+            reply.code(400);
+            return { ok: false, message: 'missing baidu cookie' };
+          }
+          const cookieRef = { value: baseCookie };
+          const out = await verifySharePwd({ surl: parsed.surl, pwd, cookieRef });
+          return { ok: true, surl: parsed.surl, bdclnd: out.bdclnd };
         } catch (e) {
           reply.code(502);
           return { ok: false, ...normalizeBaiduErr(e) };
@@ -766,6 +806,7 @@ export const apiPlugins = [
       instance.post('/share/list', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
         const url = String(body.url || '').trim();
+        const dir = String(body.dir || '').trim();
         if (!url) {
           reply.code(400);
           return { ok: false, message: 'missing url' };
@@ -776,12 +817,108 @@ export const apiPlugins = [
             reply.code(400);
             return { ok: false, message: 'invalid baidu share url' };
           }
-          const out = await listShareDir({
+          const root = await readDbRoot(req.server);
+          const baseCookie = getBaiduCookieFromDbRoot(root);
+          if (!baseCookie) {
+            reply.code(400);
+            return { ok: false, message: 'missing baidu cookie' };
+          }
+          const pwd = body.pwd || body.pass;
+          const rootList = await shareListRootScript({ baseCookie, surl: parsed.surl, pwd });
+          const { shareid, uk } = rootList.ctx || {};
+          const data = dir
+            ? await shareListDirScript({ cookie: rootList.cookie, shareid, uk, dir })
+            : rootList.data;
+          return { ok: true, ctx: { surl: parsed.surl, shareid, uk }, data };
+        } catch (e) {
+          reply.code(502);
+          return { ok: false, ...normalizeBaiduErr(e) };
+        }
+      });
+
+      instance.post('/share/resolve', async (req, reply) => {
+        const body = req && typeof req.body === 'object' ? req.body : {};
+        const url = String(body.url || '').trim();
+        const filePath = String(body.path || '').trim();
+        if (!url || !filePath) {
+          reply.code(400);
+          return { ok: false, message: 'missing url/path' };
+        }
+        const parsed = parseShareUrl(url);
+        if (!parsed || !parsed.surl) {
+          reply.code(400);
+          return { ok: false, message: 'invalid baidu share url' };
+        }
+        const root = await readDbRoot(req.server);
+        const baseCookie = getBaiduCookieFromDbRoot(root);
+        if (!baseCookie) {
+          reply.code(400);
+          return { ok: false, message: 'missing baidu cookie' };
+        }
+        try {
+          const out = await shareResolveFsidByPathScript({
+            baseCookie,
             surl: parsed.surl,
             pwd: body.pwd || body.pass,
-            dir: body.dir,
-            page: body.page,
-            num: body.num,
+            path: filePath,
+          });
+          return { ok: true, surl: parsed.surl, ...out };
+        } catch (e) {
+          reply.code(502);
+          return { ok: false, ...normalizeBaiduErr(e) };
+        }
+      });
+
+      instance.post('/share/transfer', async (req, reply) => {
+        const body = req && typeof req.body === 'object' ? req.body : {};
+        const flag = String(body.flag || '').trim();
+        const id = String(body.id || '').trim();
+        const decoded = id ? decodePlayIdToJson(id) : null;
+
+        const surl =
+          String(body.surl || '').trim() ||
+          parseSurlFromFlag(flag) ||
+          String((decoded && decoded.surl) || '').trim();
+        const shareid =
+          String(body.shareid || body.shareId || '').trim() ||
+          String((decoded && (decoded.shareid ?? decoded.share_id)) || '').trim();
+        const uk =
+          String(body.uk || body.from || '').trim() ||
+          String((decoded && decoded.uk) || '').trim();
+        const fsid =
+          String(body.fsid || body.fs_id || '').trim() ||
+          String((decoded && (decoded.fs_id ?? decoded.fsid)) || '').trim();
+        const destPath = String(body.destPath || body.path || '').trim();
+        if (!surl || !shareid || !uk || !fsid || !destPath) {
+          reply.code(400);
+          return {
+            ok: false,
+            message: 'missing parameters',
+            parsed: {
+              surl: surl || '',
+              shareid: shareid || '',
+              uk: uk || '',
+              fsid: fsid || '',
+              destPath: destPath || '',
+              decodedKeys: decoded && typeof decoded === 'object' ? Object.keys(decoded).slice(0, 30) : [],
+            },
+          };
+        }
+        const root = await readDbRoot(req.server);
+        const baseCookie = getBaiduCookieFromDbRoot(root);
+        if (!baseCookie) {
+          reply.code(400);
+          return { ok: false, message: 'missing baidu cookie' };
+        }
+        try {
+          const out = await shareTransferToDirScript({
+            baseCookie,
+            shareid,
+            uk,
+            surl,
+            pwd: body.pwd || body.pass || (decoded && decoded.pwd),
+            fsid,
+            destPath,
           });
           return { ok: true, ...out };
         } catch (e) {
@@ -790,82 +927,22 @@ export const apiPlugins = [
         }
       });
 
-      instance.post('/share/download', async (req, reply) => {
+      instance.post('/file/mediainfo', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
-        const url = String(body.url || '').trim();
-        if (!url) {
+        const filePath = String(body.path || '').trim();
+        if (!filePath || !filePath.startsWith('/')) {
           reply.code(400);
-          return { ok: false, message: 'missing url' };
+          return { ok: false, message: 'missing path' };
         }
         const root = await readDbRoot(req.server);
-        const baseCookie = getBaiduCookieFromDbRoot(root);
-        if (!baseCookie) {
+        const cookie = getBaiduCookieFromDbRoot(root);
+        if (!cookie) {
           reply.code(400);
           return { ok: false, message: 'missing baidu cookie' };
         }
         try {
-          const out = await shareDlink({
-            url,
-            pwd: body.pwd || body.pass,
-            fsids: body.fsids || body.fs_id || body.fsid,
-            baseCookie,
-          });
-          return {
-            ok: true,
-            ...out,
-            headers: {
-              Cookie: out.cookie,
-              Referer: `https://pan.baidu.com/s/${encodeURIComponent(out.surl)}`,
-              'User-Agent': BAIDU_UA,
-            },
-          };
-        } catch (e) {
-          reply.code(502);
-          return { ok: false, ...normalizeBaiduErr(e) };
-        }
-      });
-
-      instance.post('/share/save', async (req, reply) => {
-        const body = req && typeof req.body === 'object' ? req.body : {};
-        const shareid = body.shareid || body.shareId || body.share_id;
-        const uk = body.uk;
-        const surl = body.surl;
-        const pwd = body.pwd || body.pass;
-        const fs_id = body.fs_id || body.fsId || body.fsid;
-        const destPath = String(body.destPath || body.path || '').trim();
-        const fileName = String(body.fileName || body.realName || body.server_filename || '').trim();
-        if (!shareid || !uk || !surl || !fs_id || !destPath) {
-          reply.code(400);
-          return { ok: false, message: 'missing parameters' };
-        }
-        const root = await readDbRoot(req.server);
-        const baseCookie = getBaiduCookieFromDbRoot(root);
-        if (!baseCookie) {
-          reply.code(400);
-          return { ok: false, message: 'missing baidu cookie' };
-        }
-        try {
-          const ensured = await baiduEnsureDir({ cookie: baseCookie, dirPath: destPath });
-          const tr = await shareTransferToDir({
-            baseCookie,
-            shareid,
-            uk,
-            surl,
-            pwd,
-            fs_id,
-            destPath,
-          });
-          const picked = await pickSavedFileInDir({ cookie: tr.cookie || baseCookie, dirPath: destPath, fileName, bdstoken: tr.bdstoken });
-          const saved = picked
-            ? {
-                fs_id: picked.fs_id,
-                path: picked.path,
-                server_filename: picked.server_filename,
-                isdir: picked.isdir,
-                size: picked.size,
-              }
-            : null;
-          return { ok: true, dirPath: destPath, ensured, transfer: tr.data, saved, cookie: tr.cookie || baseCookie, bdstoken: tr.bdstoken };
+          const data = await baiduMediaInfoScript({ cookie, path: filePath });
+          return { ok: true, data };
         } catch (e) {
           reply.code(502);
           return { ok: false, ...normalizeBaiduErr(e) };
