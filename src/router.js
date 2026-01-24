@@ -14,6 +14,7 @@ import { getCurrentTvUser, getTvUserFromRequest, hasExplicitTvUser, sanitizeTvUs
 const spiderPrefix = '/spider';
 
 const BAIDU_PLAY_UA = 'com.android.chrome/131.0.6778.200 (Linux;Android 10) AndroidXMedia3/1.5.1';
+let panBuiltinResolverEnabledCache = false;
 
 function getEmbeddedRootDir() {
     // When bundled by esbuild (cjs), `__dirname` points to `dist/`.
@@ -112,6 +113,15 @@ function readDirectLinkEnabledFromConfigRoot(root) {
         cfg && cfg.directLink && typeof cfg.directLink === 'object' && !Array.isArray(cfg.directLink) ? cfg.directLink : null;
     if (directLink && Object.prototype.hasOwnProperty.call(directLink, 'enabled')) return !!directLink.enabled;
     return true;
+}
+
+function readPanBuiltinResolverEnabledFromConfigRoot(root) {
+    const cfg = root && typeof root === 'object' && !Array.isArray(root) ? root : {};
+    const panResolver =
+        cfg && cfg.panResolver && typeof cfg.panResolver === 'object' && !Array.isArray(cfg.panResolver) ? cfg.panResolver : null;
+    if (panResolver && Object.prototype.hasOwnProperty.call(panResolver, 'builtinEnabled')) return !!panResolver.builtinEnabled;
+    if (Object.prototype.hasOwnProperty.call(cfg, 'panBuiltinResolverEnabled')) return !!cfg.panBuiltinResolverEnabled;
+    return false;
 }
 
 function getConfigJsonPath() {
@@ -273,8 +283,7 @@ function getGlobalPanDirNameForCurrentUser() {
         .trim()
         .replace(/[^a-zA-Z0-9._-]+/g, '_')
         .replace(/^_+|_+$/g, '') || 'TV_Server';
-    const user = sanitizeTvUsername(getCurrentTvUser());
-    return `${base}_${user}`;
+    return base;
 }
 
 function decodeTvServerPlayId(rawId) {
@@ -324,6 +333,7 @@ export default async function router(fastify) {
         if (root && typeof root.proxy === 'string') {
             await setGlobalProxy(root.proxy);
         }
+        panBuiltinResolverEnabledCache = readPanBuiltinResolverEnabledFromConfigRoot(root);
     } catch (_) {}
 
     // Propagate TV_Server user identity through the async call chain so custom-script VM wrappers
@@ -343,6 +353,53 @@ export default async function router(fastify) {
             tvUserStorage.enterWith({ user });
         } catch (_) {}
         done();
+    });
+
+    fastify.addHook('preHandler', async (request, reply) => {
+        try {
+            const urlPath = (request && request.raw && request.raw.url) || request.url || '';
+            if (!isSpiderPlayPath(urlPath)) return;
+            if (!panBuiltinResolverEnabledCache) return;
+            if (String(request.method || '').toUpperCase() !== 'POST') return;
+
+            const body = request && request.body != null ? request.body : null;
+            let parsed = body;
+            if (typeof parsed === 'string') {
+                try {
+                    parsed = parsed.trim() ? JSON.parse(parsed) : {};
+                } catch (_) {
+                    parsed = {};
+                }
+            }
+            if (!parsed || typeof parsed !== 'object') parsed = {};
+
+            const flag = typeof parsed.flag === 'string' ? parsed.flag : '';
+            const id = typeof parsed.id === 'string' ? parsed.id : '';
+            if (!flag.includes('百度') || !id) return;
+
+            const destName = getGlobalPanDirNameForCurrentUser();
+            const tvUser = getTvUserFromRequest(request);
+            const injected = await fastify.inject({
+                method: 'POST',
+                url: '/api/baidu/play',
+                headers: {
+                    'content-type': 'application/json',
+                    ...(tvUser ? { 'x-tv-user': tvUser } : {}),
+                },
+                payload: { flag, id, destName },
+            });
+            const text = injected && typeof injected.payload === 'string' ? injected.payload : '';
+            let out = {};
+            try {
+                out = text ? JSON.parse(text) : {};
+            } catch (_) {
+                out = { ok: false, message: 'builtin baidu play returned non-json payload' };
+            }
+            return reply.code(injected.statusCode || 200).send(out);
+        } catch (e) {
+            const msg = e && e.message ? String(e.message) : 'builtin baidu play failed';
+            return reply.code(502).send({ ok: false, message: msg });
+        }
     });
 
     // Rewrite play response URLs like `http://127.0.0.1:PORT/...` into the externally accessed origin.
@@ -611,6 +668,7 @@ export default async function router(fastify) {
             settings: {
                 proxy: getGlobalProxy() || '',
                 directLinkEnabled: readDirectLinkEnabledFromConfigRoot(root),
+                panBuiltinResolverEnabled: readPanBuiltinResolverEnabledFromConfigRoot(root),
             },
         });
     });
@@ -624,6 +682,8 @@ export default async function router(fastify) {
         const proxy = hasProxy && typeof body.proxy === 'string' ? body.proxy : getGlobalProxy() || '';
         const hasDirect = Object.prototype.hasOwnProperty.call(body, 'directLinkEnabled');
         const directLinkEnabled = hasDirect ? !!body.directLinkEnabled : readDirectLinkEnabledFromConfigRoot(prev);
+        const hasPanBuiltin = Object.prototype.hasOwnProperty.call(body, 'panBuiltinResolverEnabled');
+        const panBuiltinResolverEnabled = hasPanBuiltin ? !!body.panBuiltinResolverEnabled : readPanBuiltinResolverEnabledFromConfigRoot(prev);
 
         let applied = proxy;
         try {
@@ -640,6 +700,10 @@ export default async function router(fastify) {
                 ...(prev && prev.directLink && typeof prev.directLink === 'object' ? prev.directLink : {}),
                 enabled: !!directLinkEnabled,
             },
+            panResolver: {
+                ...(prev && prev.panResolver && typeof prev.panResolver === 'object' ? prev.panResolver : {}),
+                builtinEnabled: !!panBuiltinResolverEnabled,
+            },
         };
         // Drop deprecated keys.
         try {
@@ -655,9 +719,11 @@ export default async function router(fastify) {
             return reply.code(500).send({ success: false, message: msg });
         }
 
+        panBuiltinResolverEnabledCache = !!panBuiltinResolverEnabled;
+
         return reply.send({
             success: true,
-            settings: { proxy: applied || '', directLinkEnabled: !!directLinkEnabled },
+            settings: { proxy: applied || '', directLinkEnabled: !!directLinkEnabled, panBuiltinResolverEnabled: !!panBuiltinResolverEnabled },
         });
     });
 

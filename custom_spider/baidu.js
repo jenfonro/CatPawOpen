@@ -8,6 +8,7 @@ import zlib from 'node:zlib';
 const BAIDU_SCRIPT_WEB_UA =
   'Mozilla/5.0 (Linux; Android 12; V2238A) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.40 Safari/537.36';
 const BAIDU_SCRIPT_NETDISK_UA = 'netdisk;12.11.9;V2238A;android-android;12;JSbridge4.4.0;jointBridge;1.1.0;';
+const BAIDU_PLAY_UA = 'com.android.chrome/131.0.6778.200 (Linux;Android 10) AndroidXMedia3/1.5.1';
 const BAIDU_APP_ID = '250528';
 
 const baiduHttp = axios.create({
@@ -384,6 +385,35 @@ function decodePlayIdToJson(id) {
   }
 }
 
+function extractNameFromTvServerId(rawId) {
+  const idStr = String(rawId || '');
+  if (!idStr) return '';
+  const delims = ['|||', '######', '@@@', '***', '___'];
+  for (const d of delims) {
+    const idx = idStr.indexOf(d);
+    if (idx >= 0) return String(idStr.slice(idx + d.length) || '').trim();
+  }
+  return '';
+}
+
+async function resolveBaiduFinalUrlFromDlink(dlink) {
+  const url = String(dlink || '').trim();
+  if (!url) throw new Error('missing dlink');
+  const res = await baiduHttp.request({
+    url,
+    method: 'GET',
+    headers: { 'User-Agent': BAIDU_PLAY_UA, Range: 'bytes=0-0' },
+    maxRedirects: 5,
+  });
+  const status = res && typeof res.status === 'number' ? res.status : 0;
+  if (!(status >= 200 && status < 400)) throw new Error(`baidu dlink resolve http ${status || 0}`);
+  const finalUrl =
+    (res && res.request && res.request.res && res.request.res.responseUrl) ||
+    (res && res.request && res.request._redirectable && res.request._redirectable._currentUrl) ||
+    url;
+  return String(finalUrl || url);
+}
+
 async function verifySharePwd({ surl, pwd, cookieRef }) {
   const p = String(pwd || '').trim();
   if (!surl) throw new Error('missing surl');
@@ -643,6 +673,88 @@ export const apiPlugins = [
         try {
           const out = await baiduEnsureDir({ cookie, dirPath });
           return { ok: true, dirPath, ...out };
+        } catch (e) {
+          reply.code(502);
+          return { ok: false, ...normalizeBaiduErr(e) };
+        }
+      });
+
+      instance.post('/play', async (req, reply) => {
+        const body = req && typeof req.body === 'object' ? req.body : {};
+        const flag = String(body.flag || '').trim();
+        const id = String(body.id || '').trim();
+        const destName = String(body.destName || '').trim().replace(/^\/+|\/+$/g, '');
+        const destPathRaw = String(body.destPath || '').trim();
+
+        if (!flag || !id) {
+          reply.code(400);
+          return { ok: false, message: 'missing flag/id' };
+        }
+
+        const dirPath = destPathRaw
+          ? destPathRaw.startsWith('/') ? destPathRaw : `/${destPathRaw}`
+          : destName ? `/${destName}` : '';
+        if (!dirPath || !dirPath.startsWith('/')) {
+          reply.code(400);
+          return { ok: false, message: 'missing destPath/destName' };
+        }
+
+        const root = await readDbRoot(req.server);
+        const baseCookie = getBaiduCookieFromDbRoot(root);
+        if (!baseCookie) {
+          reply.code(400);
+          return { ok: false, message: 'missing baidu cookie' };
+        }
+
+        try {
+          const decoded = decodePlayIdToJson(id);
+          if (!decoded) {
+            reply.code(400);
+            return { ok: false, message: 'invalid id' };
+          }
+          const shareid = String(decoded.shareid || decoded.share_id || decoded.shareId || '').trim();
+          const uk = String(decoded.uk || decoded.share_uk || decoded.uk_str || '').trim();
+          const fsid = String(decoded.fs_id || decoded.fsid || decoded.fsId || '').trim();
+          const surl = parseSurlFromFlag(flag) || String(decoded.surl || '').trim();
+          const pwd = String(decoded.pwd || decoded.pass || '').trim();
+          const nameHint = extractNameFromTvServerId(id);
+          const fileName = String(decoded.realName || decoded.server_filename || decoded.serverFilename || nameHint || '').trim();
+
+          if (!shareid || !uk || !fsid) {
+            reply.code(400);
+            return { ok: false, message: 'missing shareid/uk/fsid' };
+          }
+          if (!fileName) {
+            reply.code(400);
+            return { ok: false, message: 'missing filename' };
+          }
+
+          const ensured = await baiduEnsureDir({ cookie: baseCookie, dirPath });
+          const transfer = await shareTransferToDirScript({
+            baseCookie: ensured.cookie || baseCookie,
+            shareid,
+            uk,
+            surl,
+            pwd,
+            fsid,
+            destPath: dirPath,
+          });
+
+          const safeName = fileName.replace(/^\/+/, '');
+          const fullPath = `${dirPath.replace(/\/+$/g, '')}/${safeName}`.replace(/\/{2,}/g, '/');
+          const media = await baiduMediaInfoScript({ cookie: transfer.cookie || ensured.cookie || baseCookie, path: fullPath });
+          const dlink =
+            media &&
+            typeof media === 'object' &&
+            media.info &&
+            typeof media.info === 'object' &&
+            typeof media.info.dlink === 'string'
+              ? media.info.dlink
+              : '';
+          if (!dlink) throw new Error('mediainfo missing dlink');
+
+          const finalUrl = await resolveBaiduFinalUrlFromDlink(dlink);
+          return { ok: true, parse: 0, url: finalUrl, header: { 'User-Agent': BAIDU_PLAY_UA } };
         } catch (e) {
           reply.code(502);
           return { ok: false, ...normalizeBaiduErr(e) };

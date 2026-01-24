@@ -342,16 +342,27 @@ async function quarkDirectDownload({ fid, fidToken, cookie, want }) {
   if (!fId) throw new Error('missing fid');
   const wantMode = String(want || 'download_url').trim() || 'download_url';
   const url = 'https://drive.quark.cn/1/clouddrive/file/download?pr=ucpro&fr=pc';
-  const body = { fid: fId };
+  // Quark API variants:
+  // - some deployments accept `{ fid }`
+  // - others require `{ fids: [...] }` and return 400 "Bad Parameter: [fids is empty!]" when missing.
+  const body = { fid: fId, fids: [fId] };
   if (fToken) {
     body.fid_token = fToken;
     body.fid_token_list = [fToken];
   }
   const resp = await fetchJson(url, { method: 'POST', headers, body: JSON.stringify(body) });
-  const out =
-    (resp && resp.data && (resp.data[wantMode] || resp.data.download_url || resp.data.play_url)) ||
-    (resp && resp.data && typeof resp.data.url === 'string' ? resp.data.url : '') ||
-    '';
+  const data = resp && resp.data;
+  let out = '';
+  if (Array.isArray(data)) {
+    for (const it of data) {
+      if (!it || typeof it !== 'object') continue;
+      out = it[wantMode] || it.download_url || it.play_url || it.url || '';
+      if (typeof out === 'string' && out.trim()) break;
+      out = '';
+    }
+  } else if (data && typeof data === 'object') {
+    out = data[wantMode] || data.download_url || data.play_url || data.url || '';
+  }
   const dl = String(out || '').trim();
   if (!dl) throw new Error('direct download url not found');
   return dl;
