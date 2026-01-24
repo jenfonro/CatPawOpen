@@ -2,9 +2,6 @@ import fs from 'fs';
 import path from 'path';
 import vm from 'vm';
 import crypto from 'node:crypto';
-import http from 'node:http';
-import https from 'node:https';
-import zlib from 'node:zlib';
 import { createRequire } from 'module';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { getCurrentTvUser, sanitizeTvUsername } from './tvUserContext.js';
@@ -54,6 +51,87 @@ function isBaiduLikeHost(host) {
         hostname === 'pcs.baidu.com' ||
         hostname.endsWith('.pcs.baidu.com')
     );
+}
+function isQuarkLikeHost(host) {
+    const h = String(host || '').trim().toLowerCase();
+    if (!h) return false;
+    const hostname = h.split(':')[0];
+    return hostname === 'pan.quark.cn' || hostname === 'drive.quark.cn' || hostname.endsWith('.quark.cn');
+}
+function isUcLikeHost(host) {
+    const h = String(host || '').trim().toLowerCase();
+    if (!h) return false;
+    const hostname = h.split(':')[0];
+    return hostname === 'drive.uc.cn' || hostname.endsWith('.uc.cn') || hostname === 'open-api-drive.uc.cn' || hostname.endsWith('.open-api-drive.uc.cn');
+}
+function getUrlHostForCookieFix(urlStr) {
+    const raw = typeof urlStr === 'string' ? urlStr.trim() : '';
+    if (!raw) return '';
+    try {
+        const u = new URL(raw, 'http://0.0.0.0');
+        return u.host || u.hostname || '';
+    } catch (_) {
+        return '';
+    }
+}
+function getCookieHeaderAny(headers) {
+    if (!headers) return '';
+    try {
+        if (typeof headers.get === 'function') return String(headers.get('cookie') || headers.get('Cookie') || '');
+    } catch (_) {}
+    if (typeof headers !== 'object') return '';
+    return pickHeaderValue(headers, 'cookie');
+}
+function setCookieHeaderAny(headers, cookieValue) {
+    if (!headers) return;
+    const v = typeof cookieValue === 'string' ? cookieValue.trim() : '';
+    if (!v) return;
+    try {
+        if (typeof headers.set === 'function') {
+            headers.set('Cookie', v);
+            return;
+        }
+    } catch (_) {}
+    if (typeof headers !== 'object') return;
+    for (const k of Object.keys(headers)) {
+        if (String(k || '').toLowerCase() === 'cookie') delete headers[k];
+    }
+    headers.Cookie = v;
+}
+function maybeFixPanCookieHeader({ host, headers }) {
+    const hostname = String(host || '').trim().toLowerCase();
+    if (!hostname) return;
+    try {
+        if (isQuarkLikeHost(hostname)) {
+            const cookieFromDb = findPanCookieInDbJson('quark');
+            if (!cookieFromDb) return;
+            const existingCookie = getCookieHeaderAny(headers);
+            if (!String(existingCookie || '').trim()) {
+                setCookieHeaderAny(headers, cookieFromDb);
+                return;
+            }
+            const s = String(existingCookie || '');
+            const hasVideoAuth = /(?:^|;\s*)video-auth=/i.test(s);
+            const hasLoginMarkers = /(?:^|;\s*)(ctoken|__uid|b-user-id|__puus|__pus|tfstk|isg)=/i.test(s);
+            if (hasVideoAuth && !hasLoginMarkers) {
+                const pairs = s.match(/(?:^|;\s*)video-auth=[^;]*/gi) || [];
+                const mergedCookie = [String(cookieFromDb || '').trim()]
+                    .concat(pairs.map((p) => String(p || '').trim()).filter(Boolean))
+                    .filter(Boolean)
+                    .join('; ');
+                if (mergedCookie) setCookieHeaderAny(headers, mergedCookie);
+            }
+            return;
+        }
+    } catch (_) {}
+    try {
+        if (isUcLikeHost(hostname)) {
+            const existingCookie = getCookieHeaderAny(headers);
+            if (String(existingCookie || '').trim()) return;
+            const cookieFromDb = findPanCookieInDbJson('uc');
+            if (cookieFromDb) setCookieHeaderAny(headers, cookieFromDb);
+        }
+    } catch (_) {}
 }
 function looksLikeIpHost(host) {
     const h = String(host || '').trim();
@@ -122,7 +200,6 @@ function isBaiduLikeUrl(urlStr) {
 }
 function wrapFetchForTrace(fetchImpl, filePath) {
     const enabled = process.env.NET_DEBUG === '1';
-    if (!enabled) return fetchImpl;
     if (typeof fetchImpl !== 'function') return fetchImpl;
     if (fetchImpl.__cp_traced) return fetchImpl;
     const tag = `[trace:${path.basename(String(filePath || 'custom'))}]`;
@@ -139,9 +216,13 @@ function wrapFetchForTrace(fetchImpl, filePath) {
             const headers = (init && init.headers) || (input && input.headers) || {};
             if (headers && typeof headers === 'object') headersObj = headers;
         } catch (_) {}
+        try {
+            const host = getUrlHostForCookieFix(full);
+            if (host) maybeFixPanCookieHeader({ host, headers: headersObj });
+        } catch (_) {}
         const hostHeader = pickHeaderValue(headersObj, 'host');
-        const shouldLog = true;
-        if (shouldLog) {
+        const shouldLog = enabled;
+        if (enabled) {
             try {
                 // eslint-disable-next-line no-console
                 console.log(tag, 'fetch', method, full, {
@@ -157,7 +238,7 @@ function wrapFetchForTrace(fetchImpl, filePath) {
         }
         try {
             const res = await fetchImpl(input, init);
-            if (shouldLog) {
+            if (enabled) {
                 try {
                     const status = res && typeof res.status === 'number' ? res.status : 0;
                     // eslint-disable-next-line no-console
@@ -171,7 +252,7 @@ function wrapFetchForTrace(fetchImpl, filePath) {
             }
             return res;
         } catch (err) {
-            if (shouldLog) {
+            if (enabled) {
                 try {
                     const message = (err && err.message) || String(err);
                     // eslint-disable-next-line no-console
@@ -188,7 +269,6 @@ function wrapFetchForTrace(fetchImpl, filePath) {
 }
 function wrapAxiosForTrace(axios, filePath) {
     const enabled = process.env.NET_DEBUG === '1';
-    if (!enabled) return axios;
     if (!axios || typeof axios !== 'function') return axios;
     if (axios.__cp_traced) return axios;
     const tag = `[trace:${path.basename(String(filePath || 'custom'))}]`;
@@ -211,6 +291,11 @@ function wrapAxiosForTrace(axios, filePath) {
             inst.interceptors.request.use((cfg) => {
                 try {
                     const full = safeUrlFromConfig(cfg);
+                    try {
+                        const headers = (cfg && cfg.headers && typeof cfg.headers === 'object') ? cfg.headers : {};
+                        const host = getUrlHostForCookieFix(full);
+                        if (host) maybeFixPanCookieHeader({ host, headers });
+                    } catch (_) {}
                     const method = String((cfg && cfg.method) || 'GET').toUpperCase();
                     const headers = (cfg && cfg.headers && typeof cfg.headers === 'object') ? cfg.headers : {};
                     const hostHeader = pickHeaderValue(headers, 'host') || (() => {
@@ -228,16 +313,19 @@ function wrapAxiosForTrace(axios, filePath) {
                         else if (d && typeof d === 'object') dataInfo = `Object(${Object.keys(d).slice(0, 10).join(',')})`;
                     } catch (_) {}
                     // eslint-disable-next-line no-console
-                    console.log(tag, 'req', method, full, {
-                        ...pickHeadersForLog(headers, hostHeader),
-                        data: dataInfo,
-                    });
+                    if (enabled) {
+                        console.log(tag, 'req', method, full, {
+                            ...pickHeadersForLog(headers, hostHeader),
+                            data: dataInfo,
+                        });
+                    }
                 } catch (_) {}
                 return cfg;
             });
             inst.interceptors.response.use(
                 (res) => {
                     try {
+                        if (!enabled) return res;
                         const cfg = res && res.config ? res.config : null;
                         const full = safeUrlFromConfig(cfg);
                         const headers = (cfg && cfg.headers && typeof cfg.headers === 'object') ? cfg.headers : {};
@@ -262,6 +350,7 @@ function wrapAxiosForTrace(axios, filePath) {
                 },
                 (err) => {
                     try {
+                        if (!enabled) return Promise.reject(err);
                         const cfg = err && err.config ? err.config : null;
                         const full = safeUrlFromConfig(cfg);
                         const headers = (cfg && cfg.headers && typeof cfg.headers === 'object') ? cfg.headers : {};
@@ -1440,571 +1529,7 @@ async function loadOneFile(filePath) {
         } catch (_) {}
         return fn;
     })();
-    if (false) {
-    const BAIDU_DEBUG = process.env.NET_DEBUG === '1';
-    const baiduLog = (...args) => {
-        if (!BAIDU_DEBUG) return;
-        // eslint-disable-next-line no-console
-        console.log('[baidu]', ...args);
-    };
-    const baiduDebugState = { ts: 0 };
-    const buildHttpProxy = (mod, scheme) => {
-        const normalizeOpts = (opts) => {
-            const o = opts && typeof opts === 'object' ? opts : {};
-            const headers = (o.headers && typeof o.headers === 'object' ? o.headers : {});
-            const getHeader = (name) => {
-                const lower = String(name || '').toLowerCase();
-                for (const [k, v] of Object.entries(headers)) {
-                    if (String(k || '').toLowerCase() === lower) return v;
-                }
-                return undefined;
-            };
-            const deleteHeader = (name) => {
-                const lower = String(name || '').toLowerCase();
-                for (const k of Object.keys(headers)) {
-                    if (String(k || '').toLowerCase() === lower) delete headers[k];
-                }
-            };
-            const hasCookie = () => {
-                const v = getHeader('cookie');
-                return typeof v === 'string' && !!v.trim();
-            };
-            const setHeaderIfMissing = (name, value) => {
-                if (!value) return;
-                const cur = getHeader(name);
-                if (typeof cur === 'string' && cur.trim()) return;
-                headers[name] = value;
-            };
-            const host =
-                (typeof o.hostname === 'string' && o.hostname) ||
-                (typeof o.host === 'string' && o.host) ||
-                (typeof o.servername === 'string' && o.servername) ||
-                '';
-            const hostname = String(host).split(':')[0].trim().toLowerCase();
-            const isBaidu = hostname === 'pan.baidu.com' || hostname.endsWith('.pan.baidu.com');
-            const isBaiduPcs = hostname === 'pcs.baidu.com' || hostname.endsWith('.pcs.baidu.com');
-            const isQuark = hostname === 'pan.quark.cn' || hostname === 'drive.quark.cn' || hostname.endsWith('.quark.cn');
-            const isUc = hostname === 'drive.uc.cn' || hostname.endsWith('.uc.cn');
-            const parseCookie = (cookieStr) => {
-                const out = {};
-                const raw = String(cookieStr || '').trim();
-                if (!raw) return out;
-                for (const part of raw.split(';')) {
-                    const s = String(part || '').trim();
-                    if (!s) continue;
-                    const idx = s.indexOf('=');
-                    if (idx <= 0) continue;
-                    const k = s.slice(0, idx).trim();
-                    const v = s.slice(idx + 1).trim();
-                    if (!k) continue;
-                    out[k] = v;
-                }
-                return out;
-            };
-            const stringifyCookie = (cookieObj) => {
-                if (!cookieObj || typeof cookieObj !== 'object') return '';
-                const parts = [];
-                for (const [k, v] of Object.entries(cookieObj)) {
-                    const key = String(k || '').trim();
-                    if (!key) continue;
-                    parts.push(`${key}=${String(v == null ? '' : v).trim()}`);
-                }
-                return parts.join('; ');
-            };
-            const mergeCookiePreferDb = (existingCookie, dbCookie) => {
-                const existingMap = parseCookie(existingCookie);
-                const dbMap = parseCookie(dbCookie);
-                const preferDbKeys = new Set([
-                    'BDUSS',
-                    'STOKEN',
-                    'BAIDUID',
-                    'PSTM',
-                    'PANWEB',
-                    'HOSUPPORT',
-                    'USERID',
-                    'UID',
-                    'BDUSS_BFESS',
-                ]);
-                const merged = { ...existingMap };
-                for (const [k, v] of Object.entries(dbMap)) {
-                    if (!k) continue;
-                    if (preferDbKeys.has(k) || !(k in merged)) merged[k] = v;
-                }
-                return stringifyCookie(merged);
-            };
-            // Ensure Quark/UC cookies exist. Some bundles:
-            // - omit Cookie entirely (guest)
-            // - or accidentally keep only playback cookie (Video-Auth) after a /play flow
-            // The latter breaks directory APIs like `/1/clouddrive/file/sort` and causes outer HTTP 500.
-            try {
-                if (isQuark) {
-                    const cookieFromDb = findPanCookieInDbJson('quark');
-                    if (cookieFromDb) {
-                        const existingCookie = getHeader('cookie') || headers.Cookie || '';
-                        if (!String(existingCookie || '').trim()) {
-                            setHeaderIfMissing('Cookie', cookieFromDb);
-                        } else {
-                            // After /play, some flows keep only `Video-Auth=...` and lose login cookies.
-                            // Fix: merge the configured login cookie back, while preserving Video-Auth pairs.
-                            const s = String(existingCookie || '');
-                            const hasVideoAuth = /(?:^|;\s*)video-auth=/i.test(s);
-                            const hasLoginMarkers = /(?:^|;\s*)(ctoken|__uid|b-user-id|__puus|__pus|tfstk|isg)=/i.test(s);
-                            if (hasVideoAuth && !hasLoginMarkers) {
-                                const pairs = s.match(/(?:^|;\s*)video-auth=[^;]*/gi) || [];
-                                const mergedCookie = [String(cookieFromDb || '').trim()]
-                                    .concat(pairs.map((p) => String(p || '').trim()).filter(Boolean))
-                                    .filter(Boolean)
-                                    .join('; ');
-                                if (mergedCookie) {
-                                    deleteHeader('cookie');
-                                    headers.Cookie = mergedCookie;
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (_) {}
-            try {
-                if (!hasCookie() && isUc) {
-                    const cookieFromDb = findPanCookieInDbJson('uc');
-                    if (cookieFromDb) setHeaderIfMissing('Cookie', cookieFromDb);
-                }
-            } catch (_) {}
-            if (isBaidu || isBaiduPcs) {
-                // Ensure Baidu account cookie exists (BDUSS/STOKEN). Also preserve share-session cookies (e.g. BDCLND).
-                const cookieFromDb = findPanCookieInDbJson('baidu');
-                if (cookieFromDb) {
-                    const existingCookie = getHeader('cookie');
-                    const mergedCookie = mergeCookiePreferDb(existingCookie, cookieFromDb);
-                    if (mergedCookie) {
-                        deleteHeader('cookie');
-                        headers.Cookie = mergedCookie;
-                    }
-                }
-                if (BAIDU_DEBUG) {
-                    const now = Date.now();
-                    if (now - baiduDebugState.ts > 60_000) {
-                        baiduDebugState.ts = now;
-                        const dbPath = getDbJsonPath();
-                        const dbExists = (() => {
-                            try {
-                                return !!(dbPath && fs.existsSync(dbPath));
-                            } catch (_) {
-                                return false;
-                            }
-                        })();
-                        const curCookie = getHeader('cookie') || headers.Cookie || '';
-                        baiduLog('cookie', {
-                            dbPath,
-                            dbExists,
-                            hasDbCookie: !!cookieFromDb,
-                            dbHasBduss: /(?:^|;\\s*)BDUSS=/.test(cookieFromDb),
-                            dbHasStoken: /(?:^|;\\s*)STOKEN=/.test(cookieFromDb),
-                            mergedHasBduss: /(?:^|;\\s*)BDUSS=/.test(String(curCookie || '')),
-                            mergedHasStoken: /(?:^|;\\s*)STOKEN=/.test(String(curCookie || '')),
-                        });
-                    }
-                }
-                // Baidu often checks Referer/Origin + UA.
-                if (isBaidu) {
-                    setHeaderIfMissing('Referer', 'https://pan.baidu.com/disk/main');
-                    setHeaderIfMissing('Origin', 'https://pan.baidu.com');
-                    setHeaderIfMissing('X-Requested-With', 'XMLHttpRequest');
-                }
-                setHeaderIfMissing(
-                    'User-Agent',
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                );
-                setHeaderIfMissing('Accept', 'application/json, text/plain, */*');
-            }
-            // Some Baidu endpoints rely on common query params; add them when missing.
-            try {
-                if (isBaidu && typeof o.path === 'string' && o.path) {
-                    const [pathname, query] = o.path.split('?');
-                    const p = String(pathname || '');
-                    // Force loginStatus to use params that typically return `bdstoken`.
-                    if (p === '/api/loginStatus') {
-                        const params = new URLSearchParams(query || '');
-                        params.set('web', '1');
-                        params.set('clienttype', '0');
-                        params.set('channel', 'chunlei');
-                        if (!params.has('version')) params.set('version', '0');
-                        const qs = params.toString();
-                        o.path = qs ? `${p}?${qs}` : p;
-                    } else if (p.includes('/api/') || p.includes('/share/') || p.includes('/rest/') || p.includes('/xpan/')) {
-                        const params = new URLSearchParams(query || '');
-                        if (!params.has('web')) params.set('web', '1');
-                        if (!params.has('clienttype')) params.set('clienttype', '0');
-                        if (!params.has('channel')) params.set('channel', 'chunlei');
-                        const qs = params.toString();
-                        o.path = qs ? `${p}?${qs}` : p;
-                    }
-                }
-            } catch (_) {}
-            o.headers = headers;
-            return o;
-        };
-        const normalizeArgs = (args) => {
-            const list = Array.from(args || []);
-            let cb = null;
-            if (list.length && typeof list[list.length - 1] === 'function') cb = list.pop();
-            let url = null;
-            let opts = null;
-            if (list.length && (typeof list[0] === 'string' || list[0] instanceof URL)) {
-                url = list.shift();
-            }
-            if (list.length && list[0] && typeof list[0] === 'object') opts = list.shift();
-            // Remaining args are ignored (node supports more forms, but axios uses opts+cb).
-            return { url, opts, cb };
-        };
-        const request = (...args) => {
-            const { url, opts, cb } = normalizeArgs(args);
-            let finalOpts = opts && typeof opts === 'object' ? { ...opts } : {};
-            try {
-                if (url) {
-                    const u = url instanceof URL ? url : new URL(String(url));
-                    finalOpts = {
-                        ...finalOpts,
-                        protocol: finalOpts.protocol || u.protocol,
-                        hostname: finalOpts.hostname || u.hostname,
-                        port: finalOpts.port || (u.port || undefined),
-                        path: finalOpts.path || `${u.pathname || ''}${u.search || ''}`,
-                    };
-                }
-            } catch (_) {}
-            if (!finalOpts.protocol) finalOpts.protocol = `${scheme}:`;
-            const patched = normalizeOpts(finalOpts);
-            if (BAIDU_DEBUG) {
-                const host = String(patched.hostname || patched.host || '').split(':')[0];
-                if (host.endsWith('baidu.com')) {
-                    const headers = patched.headers && typeof patched.headers === 'object' ? patched.headers : {};
-                    const cookieStr = Object.keys(headers)
-                        .filter((k) => String(k).toLowerCase() === 'cookie')
-                        .map((k) => String(headers[k] || ''))
-                        .join('; ');
-                    const hasCookie = !!cookieStr.trim();
-                    const hasBduss = /(?:^|;\\s*)BDUSS=/.test(cookieStr);
-                    const hasStoken = /(?:^|;\\s*)STOKEN=/.test(cookieStr);
-                    baiduLog('request', {
-                        method: String(patched.method || 'GET').toUpperCase(),
-                        host,
-                        path: String(patched.path || ''),
-                        hasCookie,
-                        hasBduss,
-                        hasStoken,
-                    });
-                }
-            }
-            const req = cb ? mod.request(patched, cb) : mod.request(patched);
-            try {
-                if (BAIDU_DEBUG) {
-                    req.on('response', (res) => {
-                        try {
-                            const host = String(patched.hostname || patched.host || '').split(':')[0];
-                            if (!host.endsWith('baidu.com')) return;
-                            baiduLog('response', {
-                                host,
-                                path: String(patched.path || ''),
-                                statusCode: res && res.statusCode,
-                            });
-                            // Best-effort JSON errno logging for debugging token/transfer issues.
-                            try {
-                                const p = String(patched.path || '');
-                                const shouldLogBody =
-                                    p.startsWith('/api/loginStatus') ||
-                                    p.startsWith('/share/transfer') ||
-                                    p.startsWith('/api/gettemplatevariable') ||
-                                    p.startsWith('/api/share') ||
-                                    p.startsWith('/api/mediainfo');
-                                if (!shouldLogBody) return;
-                                const chunks = [];
-                                let total = 0;
-                                let truncated = false;
-                                const LIMIT = 128 * 1024;
-                                res.on('data', (c) => {
-                                    try {
-                                        if (!c) return;
-                                        const buf = Buffer.isBuffer(c) ? c : Buffer.from(String(c));
-                                        total += buf.length;
-                                        if (total > LIMIT) {
-                                            truncated = true;
-                                            return;
-                                        }
-                                        chunks.push(buf);
-                                    } catch (_) {}
-                                });
-                                res.on('end', () => {
-                                    try {
-                                        if (truncated) return;
-                                        if (!chunks.length) return;
-                                        const enc = String((res && res.headers && (res.headers['content-encoding'] || res.headers['Content-Encoding'])) || '')
-                                            .trim()
-                                            .toLowerCase();
-                                        const buf = Buffer.concat(chunks);
-                                        let rawBuf = buf;
-                                        try {
-                                            if (enc === 'gzip') rawBuf = zlib.gunzipSync(buf);
-                                            else if (enc === 'deflate') rawBuf = zlib.inflateSync(buf);
-                                            else if (enc === 'br') rawBuf = zlib.brotliDecompressSync(buf);
-                                        } catch (_) {
-                                            rawBuf = buf;
-                                        }
-                                        const raw = rawBuf.toString('utf8');
-                                        const trimmed = raw.trim();
-                                        if (!trimmed) return;
-                                        let json = null;
-                                        try {
-                                            json = JSON.parse(trimmed);
-                                        } catch (_) {
-                                            return;
-                                        }
-                                        const errno =
-                                            json && json.errno != null ? json.errno : json && json.error_code != null ? json.error_code : json && json.error != null ? json.error : undefined;
-                                        const msg =
-                                            json && json.msg != null ? json.msg : json && json.message != null ? json.message : json && json.error_msg != null ? json.error_msg : undefined;
-                                        const hasBdstoken = !!(json && (json.bdstoken || (json.data && json.data.bdstoken)));
-                                        baiduLog('json', {
-                                            path: p,
-                                            errno: typeof errno === 'number' || typeof errno === 'string' ? errno : undefined,
-                                            msg: typeof msg === 'string' ? msg : undefined,
-                                            hasBdstoken,
-                                        });
-                                    } catch (_) {}
-                                });
-                            } catch (_) {}
-                        } catch (_) {}
-                    });
-                }
-            } catch (_) {}
-            return req;
-        };
-        const get = (...args) => {
-            const req = request(...args);
-            try {
-                req.end();
-            } catch (_) {}
-            return req;
-        };
-        return new Proxy(mod, {
-            get(target, prop, receiver) {
-                if (prop === 'request') return request;
-                if (prop === 'get') return get;
-                return Reflect.get(target, prop, receiver);
-            },
-        });
-    };
-    let wrappedHttp = null;
-    let wrappedHttps = null;
-    try {
-        const httpMod = baseRequire('node:http');
-        wrappedHttp = buildHttpProxy(httpMod, 'http');
-    } catch (_) {
-        try {
-            const httpMod = baseRequire('http');
-            wrappedHttp = buildHttpProxy(httpMod, 'http');
-        } catch (_) {
-            wrappedHttp = null;
-        }
-    }
-    try {
-        const httpsMod = baseRequire('node:https');
-        wrappedHttps = buildHttpProxy(httpsMod, 'https');
-    } catch (_) {
-        try {
-            const httpsMod = baseRequire('https');
-            wrappedHttps = buildHttpProxy(httpsMod, 'https');
-        } catch (_) {
-            wrappedHttps = null;
-        }
-    }
-    const requireFunc = (() => {
-        const fn = (id) => {
-            const key = String(id || '');
-            if (wrappedHttp && (key === 'http' || key === 'node:http')) return wrappedHttp;
-            if (wrappedHttps && (key === 'https' || key === 'node:https')) return wrappedHttps;
-            return baseRequire(id);
-        };
-        // Preserve common require properties for compatibility.
-        try {
-            fn.resolve = baseRequire.resolve;
-            fn.main = baseRequire.main;
-            fn.extensions = baseRequire.extensions;
-            fn.cache = baseRequire.cache;
-        } catch (_) {}
-        return fn;
-    })();
-    }
     const context = buildVmContext(requireFunc, filePath);
-    if (false) {
-    const quarkStateByUser = new Map();
-    let quarkActiveUser = '';
-    const quarkInitByUser = new Map(); // user -> { ts, promise }
-    const QUARK_INIT_COOLDOWN_MS = (() => {
-        const v = Number.parseInt(process.env.CATPAW_QUARK_INIT_COOLDOWN_MS || '', 10);
-        return Number.isFinite(v) && v >= 0 ? v : 60_000;
-    })();
-    const QUARK_DEBUG = process.env.NET_DEBUG === '1';
-    const quarkMask = (v) => {
-        const s = String(v || '').trim();
-        if (!s) return '';
-        if (s.length <= 12) return s;
-        return `${s.slice(0, 6)}...${s.slice(-6)}`;
-    };
-    const quarkLog = (...args) => {
-        if (!QUARK_DEBUG) return;
-        // eslint-disable-next-line no-console
-        console.log('[quark]', ...args);
-    };
-    const syncCookieFromRawHeader = (rawHeader) => {
-        if (!rawHeader || typeof rawHeader !== 'object') return;
-        const ck = rawHeader.Cookie || rawHeader.cookie;
-        if (typeof ck !== 'string' || !ck.trim()) return;
-        try {
-            context.Wo = ck.trim();
-            if (context.globalThis) context.globalThis.Wo = context.Wo;
-        } catch (_) {}
-    };
-    const getPanDirNameForCurrentUser = () => getGlobalPanDirNameForCurrentUser();
-    const syncQuarkVarsForCurrentUser = () => {
-        const hasQuarkBindings =
-            typeof context.WKt === 'function' || typeof context.KBe === 'function' || typeof context.fKt === 'function' || typeof context.MBe === 'function';
-        const user = sanitizeTvUsername(getCurrentTvUser());
-        if (!hasQuarkBindings) return user;
-        const dirName = getPanDirNameForCurrentUser();
-        try {
-            context.LBe = dirName;
-            if (context.globalThis) context.globalThis.LBe = dirName;
-        } catch (_) {}
-        try {
-            context.DBe = dirName;
-            if (context.globalThis) context.globalThis.DBe = dirName;
-        } catch (_) {}
-        // Some bundles use different global names for the folder.
-        try {
-            if (typeof context.mBe === 'string') {
-                context.mBe = dirName;
-                if (context.globalThis) context.globalThis.mBe = dirName;
-            }
-        } catch (_) {}
-        try {
-            if (typeof context.gBe === 'string') {
-                context.gBe = dirName;
-                if (context.globalThis) context.globalThis.gBe = dirName;
-            }
-        } catch (_) {}
-        const prev = quarkStateByUser.get(user) || null;
-        // Only overwrite fid state when:
-        // - switching users (to avoid leaking folder fids across users), or
-        // - we already have persisted state for this user.
-        const switchingUser = !!(quarkActiveUser && quarkActiveUser !== user);
-        if (switchingUser || (prev && (prev.s8 || prev.UW))) {
-            if (prev && prev.s8) {
-                try {
-                    context.s8 = prev.s8;
-                    if (context.globalThis) context.globalThis.s8 = prev.s8;
-                } catch (_) {}
-            } else {
-                try {
-                    context.s8 = undefined;
-                    if (context.globalThis) context.globalThis.s8 = undefined;
-                } catch (_) {}
-            }
-            if (prev && prev.UW) {
-                try {
-                    context.UW = prev.UW;
-                    if (context.globalThis) context.globalThis.UW = prev.UW;
-                } catch (_) {}
-            } else {
-                try {
-                    context.UW = undefined;
-                    if (context.globalThis) context.globalThis.UW = undefined;
-                } catch (_) {}
-            }
-        }
-        quarkActiveUser = user;
-        return user;
-    };
-    const persistQuarkVarsForUser = (user) => {
-        if (!user) return;
-        try {
-            const s8 = context.s8;
-            const UW = context.UW;
-            const prev = quarkStateByUser.get(user) || {};
-            const next = { ...prev };
-            if (s8) next.s8 = String(s8);
-            if (UW) next.UW = String(UW);
-            quarkStateByUser.set(user, next);
-        } catch (_) {}
-    };
-    const ensureQuarkDestForCurrentUser = () => {
-        const user = syncQuarkVarsForCurrentUser();
-        // IMPORTANT: do NOT auto-run `fKt()` here.
-        // `fKt()` and related init flows can trigger many Quark API requests (and lots of 401/404 logs)
-        // especially when the user cookie isn't ready yet.
-        // Let the script decide when it needs to init; we only bind per-user vars and restore cached fids.
-        try {
-            if ((!context.UW || String(context.UW) === '0') && context.s8 && String(context.s8) !== '0') {
-                context.UW = String(context.s8);
-                if (context.globalThis) context.globalThis.UW = context.UW;
-            }
-        } catch (_) {}
-        persistQuarkVarsForUser(user);
-    };
-    const maybeInitQuarkDestForCurrentUser = async (rawHeader) => {
-        try {
-            syncCookieFromRawHeader(rawHeader);
-        } catch (_) {}
-        // If cookie is missing from headers, try to load it from db.json (TV_Server persists it there).
-        try {
-            const ck = typeof context.Wo === 'string' ? context.Wo.trim() : '';
-            if (!ck) {
-                const fromDb = findPanCookieInDbJson('quark');
-                if (fromDb) syncCookieFromRawHeader({ Cookie: fromDb });
-            }
-        } catch (_) {}
-        try {
-            ensureQuarkDestForCurrentUser();
-        } catch (_) {}
-        // Without a cookie, Quark init cannot succeed; avoid noisy retries.
-        try {
-            const ck = typeof context.Wo === 'string' ? context.Wo.trim() : '';
-            if (!ck) return;
-        } catch (_) {}
-        // Only init if we have Quark bindings and no destination fid yet.
-        const hasInitFn = typeof context.fKt === 'function';
-        if (!hasInitFn) return;
-        const curUw = context.UW ? String(context.UW) : '';
-        const curS8 = context.s8 ? String(context.s8) : '';
-        if ((curUw && curUw !== '0') || (curS8 && curS8 !== '0')) return;
-        const user = sanitizeTvUsername(getCurrentTvUser());
-        const now = Date.now();
-        const prev = quarkInitByUser.get(user) || null;
-        if (prev && prev.promise) {
-            await prev.promise;
-            return;
-        }
-        if (prev && prev.ts && now - prev.ts < QUARK_INIT_COOLDOWN_MS) return;
-        const promise = (async () => {
-            try {
-                // Let the script perform its own Quark folder init (should set UW/s8).
-                quarkLog('init start', { user, file: path.basename(filePath), dir: getGlobalPanDirNameForCurrentUser() });
-                await context.fKt();
-                quarkLog('init done', {
-                    user,
-                    UW: quarkMask(context.UW),
-                    s8: quarkMask(context.s8),
-                });
-            } finally {
-                quarkInitByUser.set(user, { ts: Date.now(), promise: null });
-            }
-        })();
-        quarkInitByUser.set(user, { ts: now, promise });
-        await promise;
-        try {
-            ensureQuarkDestForCurrentUser();
-        } catch (_) {}
-    };
-    }
     const script = new vm.Script(code, { filename: filePath });
     const timeoutMs = Number.parseInt(process.env.CATPAW_CUSTOM_SOURCE_TIMEOUT_MS || '', 10);
     script.runInContext(context, { timeout: Number.isFinite(timeoutMs) ? timeoutMs : 120000 });
@@ -2038,17 +1563,6 @@ async function loadOneFile(filePath) {
             }
         }
     } catch (_) {}
-    if (false) {
-        try {
-            syncQuarkVarsForCurrentUser();
-        } catch (_) {}
-        try {
-            if (typeof context.WKt === 'function') {
-                quarkRuntime.ctx = context;
-                quarkRuntime.fromFile = path.basename(filePath);
-            }
-        } catch (_) {}
-    }
     const apiPlugins = [];
     let apiError = '';
     try {
@@ -2074,39 +1588,6 @@ async function loadOneFile(filePath) {
         }
     } catch (e) {
         apiError = (e && e.message) || String(e);
-    }
-    if (false) {
-        try {
-            let currentHl = context.hl;
-            const normalizeHl = (v) => {
-                if (!v || typeof v !== 'object') return v;
-                if (!Array.isArray(v.baiduuk)) v.baiduuk = [];
-                return v;
-            };
-            currentHl = normalizeHl(currentHl);
-            Object.defineProperty(context, 'hl', {
-                configurable: true,
-                enumerable: true,
-                get() {
-                    return currentHl;
-                },
-                set(v) {
-                    currentHl = normalizeHl(v);
-                },
-            });
-            if (context.globalThis) {
-                Object.defineProperty(context.globalThis, 'hl', {
-                    configurable: true,
-                    enumerable: true,
-                    get() {
-                        return currentHl;
-                    },
-                    set(v) {
-                        currentHl = normalizeHl(v);
-                    },
-                });
-            }
-        } catch (_) {}
     }
     // Quark directory init: when folder already exists Quark may return "same name conflict" (23008).
     // Do not fail hard; let the script proceed (it may list/resolve afterwards).
@@ -2271,133 +1752,6 @@ async function loadOneFile(filePath) {
             if (context.globalThis) context.globalThis.VBe = context.VBe;
         }
     } catch (_) {}
-    if (false) {
-    // Some scripts run a Quark "self-check/refresh" task (`MBe`) that may delete files in the
-    // configured destination folder. If the destination folder fid (`s8`) is missing, some APIs default to root.
-    // Guard against accidental root cleanup by skipping the task when a safe folder fid cannot be resolved.
-    try {
-        if (typeof context.fKt === 'function') {
-            const original = context.fKt;
-            context.fKt = async (...args) => {
-                const user = syncQuarkVarsForCurrentUser();
-                const res = await original(...args);
-                try {
-                    if ((!context.UW || String(context.UW) === '0') && context.s8 && String(context.s8) !== '0') {
-                        context.UW = String(context.s8);
-                        if (context.globalThis) context.globalThis.UW = context.UW;
-                    }
-                } catch (_) {}
-                persistQuarkVarsForUser(user);
-                return res;
-            };
-            if (context.globalThis) context.globalThis.fKt = context.fKt;
-        }
-    } catch (_) {}
-    try {
-        if (typeof context.fKt === 'function' && typeof context.MBe === 'function') {
-            const original = context.MBe;
-            context.MBe = async (...args) => {
-                try {
-                    syncQuarkVarsForCurrentUser();
-                } catch (_) {}
-                if (!context.s8 || String(context.s8) === '0') return;
-                return await original(...args);
-            };
-            if (context.globalThis) context.globalThis.MBe = context.MBe;
-        }
-    } catch (_) {}
-    // Normalize Quark proxy errors so callers can distinguish "stoken expired" from generic failures.
-    // Applies ONLY to Quark proxy handler (`KBe`), other pans have different error codes.
-    try {
-                if (typeof context.KBe === 'function') {
-                    const original = context.KBe;
-                    context.KBe = async (req, reply, ...rest) => {
-                // Ensure per-user Quark work directory (e.g. /TV_Server/admin) is selected for this request.
-                // Pass username via header `X-TV-User` or query `__tvuser`.
-                    try {
-                        syncCookieFromRawHeader(req && req.headers ? req.headers : null);
-                        await maybeInitQuarkDestForCurrentUser(req && req.headers ? req.headers : null);
-                        ensureQuarkDestForCurrentUser();
-                    } catch (_) {}
-                const normalizeMsg = (e) => {
-                    const resp = e && typeof e === 'object' ? e.response : null;
-                    const data = resp && typeof resp === 'object' ? resp.data : null;
-                    const message =
-                        (data && typeof data === 'object' && typeof data.message === 'string' && data.message) ||
-                        (e && e.message) ||
-                        String(e);
-                    const code = data && typeof data === 'object' ? String(data.code || '') : '';
-                    return { code, message };
-                };
-                const isStokenExpired = (e) => {
-                    const { code, message } = normalizeMsg(e);
-                    return code === '41016' || String(message || '').includes('分享的stoken过期');
-                };
-                const sendStokenExpired = () => {
-                    try {
-                        reply.code(410);
-                        reply.send({
-                            statusCode: 410,
-                            error: 'Gone',
-                            pan: 'quark',
-                            code: 41016,
-                            message: 'stoken 过期，需要重新 detail/play 获取新的链接（或检查夸克 Cookie 是否有效）',
-                        });
-                    } catch (_) {}
-                };
-                try {
-                    return await original(req, reply, ...rest);
-                } catch (err) {
-                    // Retry once: blank the embedded stoken so the script can re-fetch a fresh one internally.
-                    if (isStokenExpired(err)) {
-                        try {
-                            const fileId = String(req && req.params ? req.params.fileId || '' : '');
-                            if (fileId && !fileId.startsWith('*')) {
-                                const parts = fileId.split('*');
-                                if (parts.length >= 3) req.params.fileId = `*${parts.slice(1).join('*')}`;
-                            }
-                        } catch (_) {}
-                        try {
-                            return await original(req, reply, ...rest);
-                        } catch (err2) {
-                            if (isStokenExpired(err2)) {
-                                sendStokenExpired();
-                                return;
-                            }
-                            const { message } = normalizeMsg(err2);
-                            try {
-                                reply.code(502);
-                                reply.send({
-                                    statusCode: 502,
-                                    error: 'Bad Gateway',
-                                    pan: 'quark',
-                                    message: `Quark proxy failed after stoken refresh retry: ${message}`,
-                                });
-                            } catch (_) {}
-                            return;
-                        }
-                    }
-                    const { message } = normalizeMsg(err);
-                    if (String(message || '').includes('download_url')) {
-                        try {
-                            reply.code(502);
-                            reply.send({
-                                statusCode: 502,
-                                error: 'Bad Gateway',
-                                pan: 'quark',
-                                message:
-                                    'Quark proxy failed to derive download_url (likely missing/expired quark cookie or quark API init failed)',
-                            });
-                        } catch (_) {}
-                        return;
-                    }
-                    throw err;
-                }
-            };
-            if (context.globalThis) context.globalThis.KBe = context.KBe;
-        }
-    } catch (_) {}
-    }
     const spiders = collectSpidersDeep(Object.values(context)).map((spider) => {
         try {
             if (spider && typeof spider.api === 'function') {
