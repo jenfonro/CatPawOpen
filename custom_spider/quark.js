@@ -841,6 +841,34 @@ export const apiPlugins = [
           ms: Date.now() - tStart,
           toPdirFid: maskForLog(toPdirFid),
         });
+
+        const pickFirstFileInDir = async () => {
+          const sortResp = await quarkListDir({ pdirFid: toPdirFid, cookie, size: 200 });
+          const list =
+            (sortResp && sortResp.data && (sortResp.data.list || sortResp.data.items || sortResp.data.files)) ||
+            (sortResp && sortResp.list) ||
+            [];
+          if (!Array.isArray(list)) return null;
+          for (const it of list) {
+            if (!it || typeof it !== 'object') continue;
+            const isDir = it.dir === true || it.file_type === 0 || it.type === 'folder' || it.kind === 'folder';
+            if (isDir) continue;
+            return it;
+          }
+          return null;
+        };
+        const waitForFirstFileInDir = async () => {
+          const delays = [0, 300, 700, 1200];
+          for (let i = 0; i < delays.length; i += 1) {
+            if (delays[i]) await new Promise((r) => setTimeout(r, delays[i]));
+            try {
+              const picked = await pickFirstFileInDir();
+              if (picked) return picked;
+            } catch (_) {}
+          }
+          return null;
+        };
+
         let saveOut = null;
         if (!isTvFallback) {
           try {
@@ -871,31 +899,22 @@ export const apiPlugins = [
           }
 
           if (isTvPrepare) {
+            stage = 'list_saved';
+            const picked = await waitForFirstFileInDir();
+            const pickedFid = picked ? String(picked.fid || picked.file_id || picked.id || '').trim() : '';
+            if (!pickedFid) {
+              panLog(`quark play failed id=${reqId}`, { stage: 'empty', ms: Date.now() - tStart, message: 'destination folder is empty' });
+              reply.code(502);
+              return { ok: false, message: 'destination folder is empty' };
+            }
             panLog(`quark play done id=${reqId}`, { stage: 'saved', ms: Date.now() - tStart, toPdirFid: maskForLog(toPdirFid) });
             return {
               ok: true,
               parse: 0,
               url: '',
-              header: playHeader,
             };
           }
         }
-
-        const pickFirstFileInDir = async () => {
-          const sortResp = await quarkListDir({ pdirFid: toPdirFid, cookie, size: 200 });
-          const list =
-            (sortResp && sortResp.data && (sortResp.data.list || sortResp.data.items || sortResp.data.files)) ||
-            (sortResp && sortResp.list) ||
-            [];
-          if (!Array.isArray(list)) return null;
-          for (const it of list) {
-            if (!it || typeof it !== 'object') continue;
-            const isDir = it.dir === true || it.file_type === 0 || it.type === 'folder' || it.kind === 'folder';
-            if (isDir) continue;
-            return it;
-          }
-          return null;
-        };
 
         // List destination folder and request a direct url for the first saved file.
         let picked = null;
