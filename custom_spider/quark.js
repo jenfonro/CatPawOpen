@@ -789,11 +789,6 @@ export const apiPlugins = [
         }
       });
 
-      // TV_Server play adapter:
-      // - ensure Quark dir TV_Server/<X-TV-User> exists
-      // - when quark_tv is missing: clear + save + resolve direct url
-      // - when quark_tv=1: clear + save only
-      // - when quark_tv=0: resolve direct url only (fallback; do NOT clear/save)
       instance.post('/play', async (req, reply) => {
         const reqId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
         const tStart = Date.now();
@@ -879,13 +874,9 @@ export const apiPlugins = [
             panLog(`quark play done id=${reqId}`, { stage: 'saved', ms: Date.now() - tStart, toPdirFid: maskForLog(toPdirFid) });
             return {
               ok: true,
-              stage: 'saved',
-              toPdirFid,
-              save: saveOut,
               parse: 0,
               url: '',
               header: playHeader,
-              headers: playHeader,
             };
           }
         }
@@ -971,9 +962,6 @@ export const apiPlugins = [
             url,
             parse: 0,
             header: playHeader,
-            headers: playHeader,
-            saved: { toPdirFid, fid: pickedFid, fidToken: pickedToken, name: parsed.name || '' },
-            save: saveOut || undefined,
           };
         } catch (e) {
           const msg = ((e && e.message) || String(e)).slice(0, 400);

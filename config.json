@@ -1,6 +1,4 @@
 {
   "proxy": "",
-  "panResolver": {
-    "builtinEnabled": false
-  }
+  "panResolver": false
 }

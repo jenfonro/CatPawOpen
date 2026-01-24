@@ -109,6 +109,7 @@ function isSpiderPlayPath(urlPath) {
 
 function readPanBuiltinResolverEnabledFromConfigRoot(root) {
     const cfg = root && typeof root === 'object' && !Array.isArray(root) ? root : {};
+    if (Object.prototype.hasOwnProperty.call(cfg, 'panResolver') && typeof cfg.panResolver === 'boolean') return cfg.panResolver;
     const panResolver =
         cfg && cfg.panResolver && typeof cfg.panResolver === 'object' && !Array.isArray(cfg.panResolver) ? cfg.panResolver : null;
     if (panResolver && Object.prototype.hasOwnProperty.call(panResolver, 'builtinEnabled')) return !!panResolver.builtinEnabled;
@@ -369,7 +370,7 @@ export default async function router(fastify) {
             const id = typeof parsed.id === 'string' ? parsed.id : '';
             if (!id) return;
             const isBaidu = flag.includes('百度');
-            const isQuark = flag.includes('夸克') || flag.toLowerCase().includes('quark');
+            const isQuark = flag.includes('夸克') || flag.includes('夸父') || flag.toLowerCase().includes('quark');
             if (!isBaidu && !isQuark) return;
 
             const rawUrl = (request && request.raw && request.raw.url) || request.url || '';
@@ -690,10 +691,7 @@ export default async function router(fastify) {
         const next = {
             ...prev,
             proxy: applied || '',
-            panResolver: {
-                ...(prev && prev.panResolver && typeof prev.panResolver === 'object' ? prev.panResolver : {}),
-                builtinEnabled: !!panBuiltinResolverEnabled,
-            },
+            panResolver: !!panBuiltinResolverEnabled,
         };
         // Drop deprecated keys.
         try {
@@ -701,6 +699,7 @@ export default async function router(fastify) {
             delete next.interceptPans;
             delete next.goProxy;
             delete next.directLink;
+            delete next.panBuiltinResolverEnabled;
         } catch (_) {}
 
         try {
