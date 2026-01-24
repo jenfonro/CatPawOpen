@@ -271,63 +271,6 @@ function pickDirEntryFromApiList(data, dirPath) {
   return candidates[0] || null;
 }
 
-async function baiduFileManagerDeleteScript({ cookie, paths, bdstoken }) {
-  const cookieRef = { value: String(cookie || '').trim() };
-  const token = bdstoken || (await getBdstokenScript({ cookie: cookieRef.value, cookieRef }));
-  const list = Array.isArray(paths) ? paths.map((x) => String(x || '').trim()).filter((x) => x.startsWith('/')) : [];
-  if (!list.length) return { bdstoken: token, cookie: cookieRef.value, data: null };
-
-  const qs = new URLSearchParams({
-    async: '2',
-    onnest: 'fail',
-    opera: 'delete',
-    bdstoken: token,
-    newVerify: '1',
-    clienttype: '0',
-    web: '1',
-  }).toString();
-  const url = `https://pan.baidu.com/api/filemanager?${qs}`;
-  const form = new URLSearchParams({
-    filelist: JSON.stringify(list),
-  }).toString();
-  const { data, setCookie } = await fetchJson(url, {
-    method: 'POST',
-    headers: {
-      ...buildBaiduScriptWebHeaders({ cookie: cookieRef.value }),
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: form,
-  });
-  if (setCookie && setCookie.length) cookieRef.value = mergeCookieFromSetCookie(cookieRef.value, setCookie);
-  assertBaiduErrnoOk(data);
-  return { bdstoken: token, cookie: cookieRef.value, data };
-}
-
-async function baiduRecycleClearScript({ cookie, bdstoken }) {
-  const cookieRef = { value: String(cookie || '').trim() };
-  const token = bdstoken || (await getBdstokenScript({ cookie: cookieRef.value, cookieRef }));
-  const qs = new URLSearchParams({
-    async: '1',
-    channel: 'chunlei',
-    bdstoken: token,
-    clienttype: '0',
-    app_id: BAIDU_APP_ID,
-    web: '1',
-  }).toString();
-  const url = `https://pan.baidu.com/api/recycle/clear?${qs}`;
-  const { data, setCookie } = await fetchJson(url, {
-    method: 'POST',
-    headers: {
-      ...buildBaiduScriptWebHeaders({ cookie: cookieRef.value }),
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: '',
-  });
-  if (setCookie && setCookie.length) cookieRef.value = mergeCookieFromSetCookie(cookieRef.value, setCookie);
-  assertBaiduErrnoOk(data);
-  return { bdstoken: token, cookie: cookieRef.value, data };
-}
-
 async function baiduEnsureDir({ cookie, dirPath, bdstoken }) {
   const cookieRef = { value: String(cookie || '').trim() };
   const token = bdstoken || (await getBdstokenScript({ cookie: cookieRef.value, cookieRef }));
@@ -700,70 +643,6 @@ export const apiPlugins = [
         try {
           const out = await baiduEnsureDir({ cookie, dirPath });
           return { ok: true, dirPath, ...out };
-        } catch (e) {
-          reply.code(502);
-          return { ok: false, ...normalizeBaiduErr(e) };
-        }
-      });
-
-      instance.post('/file/delete', async (req, reply) => {
-        const body = req && typeof req.body === 'object' ? req.body : {};
-        const rawPaths = Array.isArray(body.paths) ? body.paths : body.path != null ? [body.path] : [];
-        const paths = rawPaths.map((x) => String(x || '').trim()).filter((x) => x.startsWith('/'));
-        if (!paths.length) {
-          reply.code(400);
-          return { ok: false, message: 'missing path(s)' };
-        }
-        const root = await readDbRoot(req.server);
-        const cookie = getBaiduCookieFromDbRoot(root);
-        if (!cookie) {
-          reply.code(400);
-          return { ok: false, message: 'missing baidu cookie' };
-        }
-        try {
-          const out = await baiduFileManagerDeleteScript({ cookie, paths });
-          return { ok: true, ...out };
-        } catch (e) {
-          reply.code(502);
-          return { ok: false, ...normalizeBaiduErr(e) };
-        }
-      });
-
-      instance.post('/recycle/clear', async (req, reply) => {
-        const root = await readDbRoot(req.server);
-        const cookie = getBaiduCookieFromDbRoot(root);
-        if (!cookie) {
-          reply.code(400);
-          return { ok: false, message: 'missing baidu cookie' };
-        }
-        try {
-          const out = await baiduRecycleClearScript({ cookie });
-          return { ok: true, ...out };
-        } catch (e) {
-          reply.code(502);
-          return { ok: false, ...normalizeBaiduErr(e) };
-        }
-      });
-
-      instance.post('/file/clear', async (req, reply) => {
-        const body = req && typeof req.body === 'object' ? req.body : {};
-        const rawPaths = Array.isArray(body.paths) ? body.paths : body.path != null ? [body.path] : [];
-        const paths = rawPaths.map((x) => String(x || '').trim()).filter((x) => x.startsWith('/'));
-        const clearRecycle = body.clearRecycle == null ? true : !!body.clearRecycle;
-        if (!paths.length) {
-          reply.code(400);
-          return { ok: false, message: 'missing path(s)' };
-        }
-        const root = await readDbRoot(req.server);
-        const cookie = getBaiduCookieFromDbRoot(root);
-        if (!cookie) {
-          reply.code(400);
-          return { ok: false, message: 'missing baidu cookie' };
-        }
-        try {
-          const del = await baiduFileManagerDeleteScript({ cookie, paths });
-          const rec = clearRecycle ? await baiduRecycleClearScript({ cookie: del.cookie || cookie, bdstoken: del.bdstoken }) : null;
-          return { ok: true, delete: del.data, recycle: rec ? rec.data : null };
         } catch (e) {
           reply.code(502);
           return { ok: false, ...normalizeBaiduErr(e) };
