@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    name: build-${{ matrix.goos }}-${{ matrix.goarch }}
+    name: build-${{ matrix.asset_os }}-${{ matrix.goarch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -21,15 +21,27 @@ jobs:
           - goos: linux
             goarch: amd64
             pkg_target: node18-linux-x64
+            asset_os: linux
           - goos: linux
             goarch: arm64
             pkg_target: node18-linux-arm64
+            asset_os: linux
+          - goos: linux
+            goarch: amd64
+            pkg_target: node18-alpine-x64
+            asset_os: linux-musl
+          - goos: linux
+            goarch: arm64
+            pkg_target: node18-alpine-arm64
+            asset_os: linux-musl
           - goos: windows
             goarch: amd64
             pkg_target: node18-win-x64
+            asset_os: windows
           - goos: windows
             goarch: arm64
             pkg_target: node18-win-arm64
+            asset_os: windows
 
     steps:
       - uses: actions/checkout@v4
@@ -124,12 +136,13 @@ jobs:
           PKG_TARGET: ${{ matrix.pkg_target }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          ASSET_OS: ${{ matrix.asset_os }}
         run: |
           set -euo pipefail
           mkdir -p dist
           ext=""
           if [[ "${GOOS}" == "windows" ]]; then ext=".exe"; fi
-          out="dist/catpawopen_${{ inputs.version }}_${GOOS}_${GOARCH}${ext}"
+          out="dist/catpawopen_${{ inputs.version }}_${ASSET_OS}_${GOARCH}${ext}"
           npx --yes pkg@5.8.1 dist/standalone.cjs \
             --targets "${PKG_TARGET}" \
             --output "${out}" \
@@ -141,8 +154,8 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: catpawopen_${{ inputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}
-          path: dist/catpawopen_${{ inputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}*
+          name: catpawopen_${{ inputs.version }}_${{ matrix.asset_os }}_${{ matrix.goarch }}
+          path: dist/catpawopen_${{ inputs.version }}_${{ matrix.asset_os }}_${{ matrix.goarch }}*
           if-no-files-found: error
 
   release:
