@@ -2,6 +2,8 @@ import * as esbuild from 'esbuild';
 import fs from 'fs';
 import { createHash } from 'crypto';
 
+const buildVersion = typeof process.env.CATPAWOPEN_VERSION === 'string' ? process.env.CATPAWOPEN_VERSION.trim() : '';
+
 esbuild.build({
     entryPoints: ['src/index.js'],
     outfile: 'dist/index.js',
@@ -12,6 +14,9 @@ esbuild.build({
     platform: 'node',
     target: 'node14',
     sourcemap: process.env.NODE_ENV === 'development' ? 'inline' : false,
+    define: {
+        'globalThis.__CATPAWOPEN_BUILD_VERSION__': JSON.stringify(buildVersion),
+    },
     plugins: [genMd5()],
 });
 

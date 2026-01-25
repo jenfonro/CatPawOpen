@@ -86,6 +86,8 @@ jobs:
 
       - name: Build bundle
         shell: bash
+        env:
+          CATPAWOPEN_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           npm run build
@@ -97,38 +99,6 @@ jobs:
           cat > dist/package.json <<'EOF'
           { "type": "commonjs" }
           EOF
-          cat > dist/standalone.cjs <<'EOF'
-          const { createServer } = require('http');
-
-          globalThis.catServerFactory = (handle) => {
-            let port = 0;
-            const server = createServer((req, res) => handle(req, res));
-            server.on('listening', () => {
-              port = server.address().port;
-              console.log('Run on ' + port);
-            });
-            server.on('close', () => {
-              console.log('Close on ' + port);
-            });
-            return server;
-          };
-
-          globalThis.catDartServerPort = () => 0;
-
-          const mod = require('./index.js');
-          const cfgMod = require('./index.config.js');
-          const cfg = cfgMod && (cfgMod.default || cfgMod);
-
-          const start = mod && mod.start ? mod.start : null;
-          if (typeof start !== 'function') {
-            console.error('start() not found');
-            process.exit(1);
-          }
-          Promise.resolve(start(cfg)).catch((err) => {
-            console.error(err);
-            process.exit(1);
-          });
-          EOF
 
       - name: Package executable
         shell: bash
@@ -137,14 +107,18 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           ASSET_OS: ${{ matrix.asset_os }}
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist
           ext=""
           if [[ "${GOOS}" == "windows" ]]; then ext=".exe"; fi
-          out="dist/catpawopen_${{ inputs.version }}_${ASSET_OS}_${GOARCH}${ext}"
-          npx --yes pkg@5.8.1 dist/standalone.cjs \
+          out="dist/catpawopen_${ASSET_OS}_${GOARCH}${ext}"
+          npx --yes pkg@5.8.1 standalone.cjs \
             --targets "${PKG_TARGET}" \
+            --public \
+            --public-packages "*" \
+            --no-bytecode \
             --output "${out}" \
             --assets "dist/package.json" \
             --assets "package.json" \
@@ -154,8 +128,8 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: catpawopen_${{ inputs.version }}_${{ matrix.asset_os }}_${{ matrix.goarch }}
-          path: dist/catpawopen_${{ inputs.version }}_${{ matrix.asset_os }}_${{ matrix.goarch }}*
+          name: catpawopen_${{ matrix.asset_os }}_${{ matrix.goarch }}
+          path: dist/catpawopen_${{ matrix.asset_os }}_${{ matrix.goarch }}*
           if-no-files-found: error
 
   release:

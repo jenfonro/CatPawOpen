@@ -3,6 +3,7 @@ import router from './router.js';
 import { JsonDB, Config } from 'node-json-db';
 import axios from 'axios';
 import path from 'node:path';
+import { getCatPawOpenVersion } from './util/version.js';
 
 let server = null;
 
@@ -105,6 +106,7 @@ function ensureConfigDefaults(config) {
  * @return {void}
  */
 export async function start(config) {
+    console.log(`catpawopen version : ${getCatPawOpenVersion()}`);
     ensureFetchPolyfill();
     /**
      * @type {import('fastify').FastifyInstance}

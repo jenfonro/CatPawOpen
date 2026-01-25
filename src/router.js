@@ -10,6 +10,7 @@ import {
 } from './util/customSourceSpiders.js';
 import { getGlobalProxy, setGlobalProxy } from './util/proxy.js';
 import { getCurrentTvUser, getTvUserFromRequest, hasExplicitTvUser, sanitizeTvUsername, tvUserStorage } from './util/tvUserContext.js';
+import { getCatPawOpenVersion } from './util/version.js';
 
 const spiderPrefix = '/spider';
 
@@ -798,6 +799,7 @@ export default async function router(fastify) {
                 async function (_request, reply) {
                     // 与 /config 返回保持一致（不做 enable 过滤）
                     const config = {
+                        version: getCatPawOpenVersion(),
                         video: { sites: [] },
                         read: { sites: [] },
                         comic: { sites: [] },
