@@ -592,14 +592,23 @@ async function resolveBaiduFinalUrlFromDlink(dlink) {
   const url = String(dlink || '').trim();
   if (!url) throw new Error('missing dlink');
   if (fetchFn) {
-    const resp = await fetchFn(url, {
-      method: 'GET',
-      redirect: 'follow',
-      headers: { 'User-Agent': BAIDU_PLAY_UA, Range: 'bytes=0-0' },
-    });
-    const status = resp && typeof resp.status === 'number' ? resp.status : 0;
-    if (!(status >= 200 && status < 400)) throw new Error(`baidu dlink resolve http ${status || 0}`);
-    return String((resp && resp.url) || url);
+    try {
+      const resp = await fetchFn(url, {
+        method: 'GET',
+        redirect: 'follow',
+        headers: { 'User-Agent': BAIDU_PLAY_UA, Range: 'bytes=0-0' },
+      });
+      const status = resp && typeof resp.status === 'number' ? resp.status : 0;
+      if (!(status >= 200 && status < 400)) throw new Error(`baidu dlink resolve http ${status || 0}`);
+      return String((resp && resp.url) || url);
+    } catch (e) {
+      try {
+        const msg = (e && e.message) ? String(e.message) : String(e);
+        const cause = e && e.cause ? (e.cause.message ? String(e.cause.message) : String(e.cause)) : '';
+        panLog('baidu play resolve_final fetch failed', { message: msg.slice(0, 200), cause: cause.slice(0, 200) });
+      } catch {}
+      // Fall back to built-in http/https client for better tolerance on some redirect chains.
+    }
   }
   const resp = await httpRequestFollow(url, {
     method: 'GET',
