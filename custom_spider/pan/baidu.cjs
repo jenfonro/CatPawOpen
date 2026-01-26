@@ -591,32 +591,55 @@ function extractNameFromTvServerId(rawId) {
 async function resolveBaiduFinalUrlFromDlink(dlink) {
   const url = String(dlink || '').trim();
   if (!url) throw new Error('missing dlink');
+  const headers = { 'User-Agent': BAIDU_PLAY_UA, Range: 'bytes=0-0' };
+  const safeResolveLocation = (locRaw) => {
+    const loc = String(locRaw || '').trim();
+    if (!loc) return '';
+    try {
+      return new URL(loc, url).toString();
+    } catch {
+      try {
+        return new URL(encodeURI(loc), url).toString();
+      } catch {
+        return loc;
+      }
+    }
+  };
+
+  // Prefer extracting a single 302 Location and returning it to the client.
   if (fetchFn) {
     try {
-      const resp = await fetchFn(url, {
-        method: 'GET',
-        redirect: 'follow',
-        headers: { 'User-Agent': BAIDU_PLAY_UA, Range: 'bytes=0-0' },
-      });
+      const resp = await fetchFn(url, { method: 'GET', redirect: 'manual', headers });
       const status = resp && typeof resp.status === 'number' ? resp.status : 0;
-      if (!(status >= 200 && status < 400)) throw new Error(`baidu dlink resolve http ${status || 0}`);
-      return String((resp && resp.url) || url);
+      if (status >= 300 && status < 400) {
+        const loc = resp && resp.headers && typeof resp.headers.get === 'function' ? resp.headers.get('location') : '';
+        const next = safeResolveLocation(loc);
+        if (next) return next;
+      }
+      if (status >= 200 && status < 300) return String((resp && resp.url) || url);
+      throw new Error(`baidu dlink resolve http ${status || 0}`);
     } catch (e) {
       try {
         const msg = (e && e.message) ? String(e.message) : String(e);
         const cause = e && e.cause ? (e.cause.message ? String(e.cause.message) : String(e.cause)) : '';
         panLog('baidu play resolve_final fetch failed', { message: msg.slice(0, 200), cause: cause.slice(0, 200) });
       } catch {}
-      // Fall back to built-in http/https client for better tolerance on some redirect chains.
     }
   }
-  const resp = await httpRequestFollow(url, {
-    method: 'GET',
-    headers: { 'User-Agent': BAIDU_PLAY_UA, Range: 'bytes=0-0' },
-    maxRedirects: 5,
-    timeoutMs: 30000,
-    maxBytes: 1024 * 1024,
-  });
+
+  try {
+    const once = await httpRequestOnce(url, { method: 'GET', headers, timeoutMs: 30000, maxBytes: 1024 * 1024 });
+    const status = Number(once && once.status) || 0;
+    if (status >= 300 && status < 400) {
+      const loc = (once.headers && (once.headers.location || once.headers.Location)) || '';
+      const next = safeResolveLocation(loc);
+      if (next) return next;
+    }
+    if (status >= 200 && status < 300) return url;
+  } catch (_e) {}
+
+  // Fallback: follow redirects until we can compute the final URL.
+  const resp = await httpRequestFollow(url, { method: 'GET', headers, maxRedirects: 5, timeoutMs: 30000, maxBytes: 1024 * 1024 });
   const status = Number(resp && resp.status) || 0;
   if (!(status >= 200 && status < 400)) throw new Error(`baidu dlink resolve http ${status || 0}`);
   return String(resp.url || url);
