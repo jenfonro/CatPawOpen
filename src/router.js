@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
+import crypto from 'node:crypto';
 import {
     getCustomSourceStatus,
     getCustomSourceApiPlugins,
@@ -138,6 +139,454 @@ function readConfigJsonSafe(configPath) {
 function writeConfigJsonSafe(configPath, obj) {
     const root = obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
     fs.writeFileSync(configPath, `${JSON.stringify(root, null, 2)}\n`, 'utf8');
+}
+
+function sanitizeOnlineScriptFileName(inputUrl, suggestedName) {
+    const rawName = typeof suggestedName === 'string' && suggestedName.trim() ? suggestedName.trim() : '';
+    let base = rawName;
+    if (!base) {
+        try {
+            const u = new URL(String(inputUrl || '').trim());
+            base = path.basename(u.pathname || '');
+        } catch (_) {
+            base = '';
+        }
+    }
+    base = String(base || '').trim();
+    if (!base || base === '/' || base === '.' || base === '..') base = 'online.cjs';
+    base = path.basename(base);
+    base = base.replace(/[^a-zA-Z0-9._-]/g, '_');
+    if (!base) base = 'online.cjs';
+    const lower = base.toLowerCase();
+    if (!(lower.endsWith('.js') || lower.endsWith('.mjs') || lower.endsWith('.cjs'))) base = `${base}.cjs`;
+    return base;
+}
+
+function atomicWriteFileWithRollback(filePath, content) {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const suffix = `${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
+    const tmpPath = path.resolve(dir, `.${path.basename(filePath)}.tmp.${suffix}`);
+    const bakPath = fs.existsSync(filePath) ? `${filePath}.bak.${suffix}` : '';
+
+    fs.writeFileSync(tmpPath, content, 'utf8');
+    try {
+        if (bakPath) fs.renameSync(filePath, bakPath);
+        fs.renameSync(tmpPath, filePath);
+    } catch (e) {
+        try {
+            if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+        } catch (_) {}
+        try {
+            if (bakPath && fs.existsSync(bakPath)) fs.renameSync(bakPath, filePath);
+        } catch (_) {}
+        throw e;
+    }
+    try {
+        if (bakPath && fs.existsSync(bakPath)) fs.unlinkSync(bakPath);
+    } catch (_) {}
+    return true;
+}
+
+function readJsonFileSafe(filePath) {
+    try {
+        if (!filePath || !fs.existsSync(filePath)) return null;
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function writeJsonFileAtomic(filePath, obj) {
+    const root = obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
+    atomicWriteFileWithRollback(filePath, `${JSON.stringify(root, null, 2)}\n`);
+    return true;
+}
+
+function normalizeOnlineConfigListInput(body) {
+    const b = body && typeof body === 'object' ? body : {};
+    const pick = (k) => (Object.prototype.hasOwnProperty.call(b, k) ? b[k] : undefined);
+    const v =
+        pick('onlineConfigs') ??
+        pick('online_configs') ??
+        pick('configs') ??
+        pick('configList') ??
+        pick('config_list') ??
+        pick('spiderConfigs') ??
+        pick('spider_configs');
+    if (v === undefined) return { provided: false, list: [] };
+    if (v == null) return { provided: true, list: [] };
+    if (!Array.isArray(v)) return { provided: true, list: null };
+    return { provided: true, list: v };
+}
+
+function normalizeOnlineConfigItem(raw, index) {
+    if (typeof raw === 'string') {
+        const url = raw.trim();
+        return { key: url, id: '', name: '', url, index };
+    }
+    const it = raw && typeof raw === 'object' ? raw : {};
+    const url =
+        (typeof it.url === 'string' && it.url.trim()) ||
+        (typeof it.addr === 'string' && it.addr.trim()) ||
+        (typeof it.address === 'string' && it.address.trim()) ||
+        (typeof it.link === 'string' && it.link.trim()) ||
+        '';
+    const id = (typeof it.id === 'string' && it.id.trim()) || '';
+    const name = (typeof it.name === 'string' && it.name.trim()) || (typeof it.title === 'string' && it.title.trim()) || '';
+    const key = id || url;
+    return { key: String(key || '').trim(), id, name, url: String(url || '').trim(), index };
+}
+
+function stableHashShort(input) {
+    const s = String(input || '');
+    return crypto.createHash('sha256').update(s).digest('hex').slice(0, 10);
+}
+
+function pickFileBaseNameFromUrl(urlStr) {
+    try {
+        const u = new URL(String(urlStr || '').trim());
+        const base = path.basename(u.pathname || '');
+        return base && base !== '/' ? base : '';
+    } catch (_) {
+        return '';
+    }
+}
+
+function buildOnlineConfigFileName(key, urlStr) {
+    const baseFromUrl = pickFileBaseNameFromUrl(urlStr);
+    const base = sanitizeOnlineScriptFileName(urlStr, baseFromUrl || 'online.cjs');
+    const ext = base.toLowerCase().endsWith('.cjs') || base.toLowerCase().endsWith('.mjs') || base.toLowerCase().endsWith('.js') ? '' : '.cjs';
+    const hash = stableHashShort(key || urlStr);
+    const name = base.replace(/\.(cjs|mjs|js)$/i, '');
+    return `${name}.${hash}${ext || '.cjs'}`.replace(/\.{2,}/g, '.');
+}
+
+async function headRemoteMeta(url, options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const timeoutMs = Number.isFinite(Number(opts.timeoutMs)) ? Math.max(100, Math.trunc(Number(opts.timeoutMs))) : 8000;
+
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+        const res = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: controller ? controller.signal : undefined });
+        const ok = !!(res && res.ok);
+        const getHeader = (k) => {
+            try {
+                return res && res.headers && typeof res.headers.get === 'function' ? res.headers.get(k) : '';
+            } catch (_) {
+                return '';
+            }
+        };
+        return {
+            ok,
+            status: res ? Number(res.status || 0) : 0,
+            etag: ok ? String(getHeader('etag') || '') : '',
+            lastModified: ok ? String(getHeader('last-modified') || '') : '',
+        };
+    } catch (_) {
+        return { ok: false, status: 0, etag: '', lastModified: '' };
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
+function getCustomSourceErrorForFile(status, relName) {
+    const s = status && typeof status === 'object' ? status : {};
+    const errors = s.errors || {};
+    const webErrors = s.webErrors || {};
+    const apiErrors = s.apiErrors || {};
+    const websiteErrors = s.websiteErrors || {};
+    return errors[relName] || webErrors[relName] || apiErrors[relName] || websiteErrors[relName] || '';
+}
+
+async function ensureCustomSourceDirReady() {
+    try {
+        if (!getCustomSourceStatus().dirPath) await loadCustomSourceSpiders();
+    } catch (_) {}
+    const customDir = String(getCustomSourceStatus().dirPath || '');
+    return customDir;
+}
+
+async function reconcileOnlineConfigs(nextListRaw, prevPersisted, customDir) {
+    const prevList = Array.isArray(prevPersisted) ? prevPersisted : [];
+    const prevById = new Map();
+    const prevByUrl = new Map();
+    prevList.forEach((r) => {
+        if (!r || typeof r !== 'object') return;
+        const id = typeof r.id === 'string' && r.id.trim() ? r.id.trim() : '';
+        const url = typeof r.url === 'string' && r.url.trim() ? r.url.trim() : '';
+        if (id) prevById.set(id, r);
+        if (url) prevByUrl.set(url, r);
+    });
+
+    const rawArr = Array.isArray(nextListRaw) ? nextListRaw : [];
+    const normalized = rawArr
+        .map((it, idx) => normalizeOnlineConfigItem(it, idx))
+        .filter((it) => it && typeof it.key === 'string' && it.key.trim());
+
+    // De-dup by key while keeping order.
+    const seenKeys = new Set();
+    const nextItems = [];
+    normalized.forEach((it) => {
+        const k = it.key.trim();
+        if (!k || seenKeys.has(k)) return;
+        seenKeys.add(k);
+        nextItems.push(it);
+    });
+
+    const onlineDir = path.resolve(customDir, 'online');
+    try {
+        if (!fs.existsSync(onlineDir)) fs.mkdirSync(onlineDir, { recursive: true });
+    } catch (_) {}
+
+    const actions = {
+        downloaded: 0,
+        updated: 0,
+        deleted: 0,
+        unchanged: 0,
+    };
+    let deletedAny = false;
+
+    // Delete removed configs (and their files/meta).
+    prevList.forEach((r) => {
+        if (!r || typeof r !== 'object') return;
+        const prevId = typeof r.id === 'string' && r.id.trim() ? r.id.trim() : '';
+        const prevUrl = typeof r.url === 'string' && r.url.trim() ? r.url.trim() : '';
+        const identity = prevId || prevUrl;
+        if (!identity || seenKeys.has(identity)) return;
+        const fileName = typeof r.fileName === 'string' ? r.fileName.trim() : '';
+        if (!fileName) return;
+        const destPath = path.resolve(onlineDir, fileName);
+        const metaPath = path.resolve(onlineDir, `.${fileName}.remote.json`);
+        try {
+            if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+        } catch (_) {}
+        try {
+            if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
+        } catch (_) {}
+        deletedAny = true;
+        actions.deleted += 1;
+    });
+
+    const persistedNext = [];
+    const results = nextItems.map((it) => ({
+        key: it.key,
+        id: it.id,
+        name: it.name,
+        url: it.url,
+        fileName: '',
+        ok: false,
+        status: 'error',
+        _downloadError: '',
+        _action: '',
+    }));
+
+    for (let i = 0; i < results.length; i += 1) {
+        const item = results[i];
+
+        let parsed;
+        try {
+            parsed = new URL(String(item.url || '').trim());
+        } catch (_) {
+            parsed = null;
+        }
+        if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+            item._downloadError = 'invalid url';
+            continue;
+        }
+
+        const prev = item.id ? prevById.get(item.id) : prevByUrl.get(parsed.toString());
+        const fileName = prev && typeof prev.fileName === 'string' && prev.fileName.trim() ? prev.fileName.trim() : buildOnlineConfigFileName(item.key, parsed.toString());
+        item.fileName = fileName;
+
+        const destPath = path.resolve(onlineDir, fileName);
+        const metaPath = path.resolve(onlineDir, `.${fileName}.remote.json`);
+
+        const relName = path.relative(customDir, destPath).split(path.sep).join('/');
+        if (!relName || !relName.startsWith(`online/`)) {
+            item._downloadError = 'invalid dest';
+            continue;
+        }
+
+        const exists = (() => {
+            try {
+                return fs.existsSync(destPath);
+            } catch (_) {
+                return false;
+            }
+        })();
+
+        const localMeta = readJsonFileSafe(metaPath) || {};
+        let shouldDownload = !exists;
+        let headMeta = null;
+
+        const prevUrl = prev && typeof prev.url === 'string' ? prev.url.trim() : '';
+        if (!shouldDownload && prevUrl && prevUrl !== parsed.toString()) {
+            shouldDownload = true;
+        }
+
+        if (!shouldDownload) {
+            headMeta = await headRemoteMeta(parsed.toString(), { timeoutMs: 8000 });
+            if (headMeta && headMeta.ok) {
+                const remoteEtag = String(headMeta.etag || '').trim();
+                const remoteLm = String(headMeta.lastModified || '').trim();
+                const localEtag = typeof localMeta.etag === 'string' ? localMeta.etag.trim() : '';
+                const localLm = typeof localMeta.lastModified === 'string' ? localMeta.lastModified.trim() : '';
+                const hasRemote = !!(remoteEtag || remoteLm);
+                if (hasRemote) {
+                    const etagChanged = remoteEtag && localEtag && remoteEtag !== localEtag;
+                    const lmChanged = remoteLm && localLm && remoteLm !== localLm;
+                    if (etagChanged || lmChanged) shouldDownload = true;
+                }
+
+                // Persist meta headers if missing locally (quietly).
+                const hasLocal = !!(localEtag || localLm);
+                if (!hasLocal && (remoteEtag || remoteLm)) {
+                    try {
+                        writeJsonFileAtomic(metaPath, {
+                            url: parsed.toString(),
+                            etag: remoteEtag,
+                            lastModified: remoteLm,
+                            savedAt: Date.now(),
+                        });
+                    } catch (_) {}
+                }
+            }
+        }
+
+        if (shouldDownload) {
+            try {
+                const downloaded = await downloadTextFile(parsed.toString(), { maxBytes: 5 * 1024 * 1024, timeoutMs: 20000 });
+                atomicWriteFileWithRollback(destPath, downloaded.text || '');
+                const etag =
+                    downloaded && downloaded.res && downloaded.res.headers && typeof downloaded.res.headers.get === 'function'
+                        ? downloaded.res.headers.get('etag') || (headMeta ? headMeta.etag : '')
+                        : headMeta
+                          ? headMeta.etag
+                          : '';
+                const lastModified =
+                    downloaded && downloaded.res && downloaded.res.headers && typeof downloaded.res.headers.get === 'function'
+                        ? downloaded.res.headers.get('last-modified') || (headMeta ? headMeta.lastModified : '')
+                        : headMeta
+                          ? headMeta.lastModified
+                          : '';
+                try {
+                    writeJsonFileAtomic(metaPath, {
+                        url: parsed.toString(),
+                        etag: typeof etag === 'string' ? etag : '',
+                        lastModified: typeof lastModified === 'string' ? lastModified : '',
+                        savedAt: Date.now(),
+                    });
+                } catch (_) {}
+                if (!exists) {
+                    actions.downloaded += 1;
+                    item._action = 'downloaded';
+                } else {
+                    actions.updated += 1;
+                    item._action = 'updated';
+                }
+            } catch (_) {
+                item._downloadError = 'download failed';
+                continue;
+            }
+        } else {
+            actions.unchanged += 1;
+            item._action = 'unchanged';
+        }
+
+        persistedNext.push({
+            url: parsed.toString(),
+            fileName,
+            name: item.name || '',
+            id: item.id && item.id !== parsed.toString() ? item.id : '',
+        });
+    }
+
+    // Preload once and then map errors per file.
+    try {
+        await loadCustomSourceSpiders();
+    } catch (_) {}
+    const status = getCustomSourceStatus();
+    let passedCount = 0;
+    results.forEach((item) => {
+        if (!item.fileName || item._downloadError) {
+            item.ok = false;
+            item.status = 'error';
+            return;
+        }
+        const relName = `online/${item.fileName}`;
+        const err = getCustomSourceErrorForFile(status, relName);
+        if (err) {
+            item.ok = false;
+            item.status = 'error';
+            return;
+        }
+        item.ok = true;
+        item.status = 'pass';
+        passedCount += 1;
+    });
+
+    const changedAny = deletedAny || actions.downloaded > 0 || actions.updated > 0;
+    const shouldExit = changedAny && (passedCount > 0 || deletedAny || results.length === 0);
+
+    // Strip internal fields for API output.
+    const publicResults = results.map((r) => ({
+        id: r.id,
+        name: r.name,
+        url: r.url,
+        fileName: r.fileName,
+        status: r.status === 'pass' ? 'pass' : 'error',
+    }));
+
+    return {
+        results: publicResults,
+        persisted: persistedNext,
+        actions,
+        changedAny,
+        deletedAny,
+        passedCount,
+        shouldExit,
+    };
+}
+
+async function downloadTextFile(url, options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const maxBytes = Number.isFinite(Number(opts.maxBytes)) ? Math.max(1, Math.trunc(Number(opts.maxBytes))) : 2 * 1024 * 1024;
+    const timeoutMs = Number.isFinite(Number(opts.timeoutMs)) ? Math.max(100, Math.trunc(Number(opts.timeoutMs))) : 15000;
+
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+        const res = await fetch(url, {
+            method: 'GET',
+            headers: { accept: 'text/plain,application/javascript,*/*' },
+            signal: controller ? controller.signal : undefined,
+        });
+        if (!res || !res.ok) {
+            const status = res ? Number(res.status) : 0;
+            throw new Error(`download failed: status=${status || 'unknown'}`);
+        }
+        const len = res.headers && typeof res.headers.get === 'function' ? Number(res.headers.get('content-length') || 0) : 0;
+        if (len && Number.isFinite(len) && len > maxBytes) throw new Error(`download too large: ${len} bytes`);
+
+        let buf;
+        if (res.arrayBuffer) {
+            const ab = await res.arrayBuffer();
+            // eslint-disable-next-line no-undef
+            buf = Buffer.from(ab);
+        } else {
+            const text = await res.text();
+            // eslint-disable-next-line no-undef
+            buf = Buffer.from(String(text || ''), 'utf8');
+        }
+        if (buf.length > maxBytes) throw new Error(`download too large: ${buf.length} bytes`);
+        return { text: buf.toString('utf8'), res };
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
 }
 
 // NOTE: CORS is intentionally handled by the reverse proxy (e.g. Nginx) in production.
@@ -662,12 +1111,14 @@ export default async function router(fastify) {
     fastify.get('/admin/settings', async function (_request, reply) {
         const cfgPath = getConfigJsonPath();
         const root = readConfigJsonSafe(cfgPath);
+        const onlineConfigs = root && Array.isArray(root.onlineConfigs) ? root.onlineConfigs : [];
         return reply.send({
             success: true,
             settings: {
                 proxy: getGlobalProxy() || '',
                 panBuiltinResolverEnabled: readPanBuiltinResolverEnabledFromConfigRoot(root),
             },
+            onlineConfigs,
         });
     });
 
@@ -703,6 +1154,19 @@ export default async function router(fastify) {
             delete next.panBuiltinResolverEnabled;
         } catch (_) {}
 
+        const onlineInput = normalizeOnlineConfigListInput(body);
+        let onlineResult = null;
+        if (onlineInput.provided) {
+            if (onlineInput.list === null) {
+                return reply.code(400).send({ success: false, message: 'onlineConfigs must be an array' });
+            }
+            const customDir = await ensureCustomSourceDirReady();
+            if (!customDir) return reply.code(500).send({ success: false, message: 'custom_spider dir not resolved' });
+            const prevPersisted = prev && Array.isArray(prev.onlineConfigs) ? prev.onlineConfigs : [];
+            onlineResult = await reconcileOnlineConfigs(onlineInput.list, prevPersisted, customDir);
+            next.onlineConfigs = onlineResult.persisted;
+        }
+
         try {
             writeConfigJsonSafe(cfgPath, next);
         } catch (e) {
@@ -712,10 +1176,26 @@ export default async function router(fastify) {
 
         panBuiltinResolverEnabledCache = !!panBuiltinResolverEnabled;
 
-        return reply.send({
+        const payload = {
             success: true,
             settings: { proxy: applied || '', panBuiltinResolverEnabled: !!panBuiltinResolverEnabled },
-        });
+            ...(onlineResult
+                ? {
+                      onlineConfigs: onlineResult.results,
+                      actions: onlineResult.actions,
+                      restart: !!onlineResult.shouldExit,
+                  }
+                : {}),
+        };
+
+        reply.send(payload);
+        if (onlineResult && onlineResult.shouldExit) {
+            setTimeout(() => {
+                // eslint-disable-next-line no-undef
+                process.exit(1);
+            }, 300);
+        }
+        return;
     });
 
     const spiders = mergeSpiders(effectiveBaseSpiders, customSpiders);
