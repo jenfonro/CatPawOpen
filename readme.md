@@ -4,6 +4,11 @@ Dev：`npm run dev`
 
 Build：`npm run build`
 
+### GitHub Actions（云构建）
+
+- `release`：手动触发，需要输入版本号（例如 `v1.0.0`），并发布正式 Release。
+- `beta`：`main` 有新提交会自动触发（也支持手动触发）；自动生成 `v0.0.0-beta.<run_id>.<run_attempt>` 作为构建版本号，并发布名为 `beta` 的 Pre-release（滚动更新最新产物）。
+
 说明：不同平台的 Node runtime 可能会缺少部分能力（例如 `wasm`、macOS/iOS 的 `jit` 等）。
 
 ### Docker（开发模式：直接用当前目录代码）
