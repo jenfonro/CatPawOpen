@@ -1133,6 +1133,33 @@ function writeJsonFileSafe(filePath, obj) {
     }
 }
 
+function normalizeDownloadProxyPrefix(raw) {
+    if (typeof raw !== 'string') return '';
+    const trimmed = raw.trim();
+    if (!trimmed) return '';
+    try {
+        const u = new URL(trimmed);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+    } catch (_) {
+        return '';
+    }
+    const noTrailing = trimmed.replace(/\/+$/g, '');
+    return noTrailing ? `${noTrailing}/` : '';
+}
+
+function getDownloadProxyPrefixFromConfig() {
+    try {
+        const root = readJsonFileSafe(getConfigJsonPath()) || {};
+        const raw =
+            (typeof root.downloadProxy === 'string' && root.downloadProxy) ||
+            (typeof root.download_proxy === 'string' && root.download_proxy) ||
+            '';
+        return normalizeDownloadProxyPrefix(raw);
+    } catch (_) {
+        return '';
+    }
+}
+
 async function fetchCompat(url, init = {}) {
     const fetchImpl = globalThis.fetch;
     if (typeof fetchImpl === 'function') return fetchImpl(url, init);
@@ -1243,6 +1270,9 @@ async function ensurePanRuntimeScripts(customSpiderDir) {
         return { action: 'none' };
     }
 
+    const downloadProxyPrefix = getDownloadProxyPrefixFromConfig();
+    const resolveDownloadUrl = (url) => (downloadProxyPrefix ? `${downloadProxyPrefix}${url}` : url);
+
     const items = PAN_RUNTIME_SCRIPTS.map((it) => ({
         name: String(it.name || '').trim(),
         url: String(it.url || '').trim(),
@@ -1257,7 +1287,7 @@ async function ensurePanRuntimeScripts(customSpiderDir) {
         const staged = [];
         try {
             for (const it of items) {
-                const res = await fetchCompat(it.url, { method: 'GET', headers: {} });
+                const res = await fetchCompat(resolveDownloadUrl(it.url), { method: 'GET', headers: {} });
                 if (!res || Number(res.status) < 200 || Number(res.status) >= 300) throw new Error(`status=${res ? res.status : 'unknown'}`);
                 const text = await res.text();
                 if (!text) throw new Error('empty body');
@@ -1300,7 +1330,7 @@ async function ensurePanRuntimeScripts(customSpiderDir) {
         process.exit(1);
     }
 
-    // Exists: ensure we have meta headers without being noisy.
+        // Exists: ensure we have meta headers without being noisy.
     for (const it of items) {
         const meta = readJsonFileSafe(it.metaPath);
         const hasMeta =
@@ -1309,7 +1339,7 @@ async function ensurePanRuntimeScripts(customSpiderDir) {
             ((typeof meta.etag === 'string' && meta.etag.trim()) || (typeof meta.lastModified === 'string' && meta.lastModified.trim()));
         if (hasMeta) continue;
         try {
-            const res = await fetchCompat(it.url, { method: 'HEAD', headers: {} });
+            const res = await fetchCompat(resolveDownloadUrl(it.url), { method: 'HEAD', headers: {} });
             if (!res || Number(res.status) < 200 || Number(res.status) >= 300) continue;
             const etag = getHeaderLower(res, 'etag');
             const lastModified = getHeaderLower(res, 'last-modified');
@@ -1332,7 +1362,7 @@ async function ensurePanRuntimeScripts(customSpiderDir) {
             if (typeof meta.etag === 'string' && meta.etag.trim()) headers['if-none-match'] = meta.etag.trim();
             if (typeof meta.lastModified === 'string' && meta.lastModified.trim()) headers['if-modified-since'] = meta.lastModified.trim();
 
-            const res = await fetchCompat(it.url, { method: 'GET', headers });
+            const res = await fetchCompat(resolveDownloadUrl(it.url), { method: 'GET', headers });
             if (!res) continue;
             const code = Number(res.status);
             if (code === 304) continue;

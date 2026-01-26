@@ -1,4 +1,6 @@
 {
   "proxy": "",
-  "panResolver": false
+  "panResolver": false,
+  "listen": 3006,
+  "downloadProxy": ""
 }
