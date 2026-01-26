@@ -5,6 +5,17 @@ import crypto from 'node:crypto';
 import { createRequire } from 'module';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { getCurrentTvUser, sanitizeTvUsername } from './tvUserContext.js';
+
+const PAN_RUNTIME_SCRIPTS = [
+    {
+        name: 'baidu.cjs',
+        url: 'https://raw.githubusercontent.com/jenfonro/CatPawOpen/refs/heads/main/custom_spider/pan/baidu.cjs',
+    },
+    {
+        name: 'quark.cjs',
+        url: 'https://raw.githubusercontent.com/jenfonro/CatPawOpen/refs/heads/main/custom_spider/pan/quark.cjs',
+    },
+];
 let cache = {
     dirPath: '',
     files: [],
@@ -1091,6 +1102,294 @@ function resolveCustomSourceDirCandidates() {
     candidates.push(path.resolve(process.cwd(), 'custom_spider'));
     return Array.from(new Set(candidates.filter(Boolean)));
 }
+
+function isPkgRuntime() {
+    try {
+        // eslint-disable-next-line no-undef
+        return !!(process && process.pkg);
+    } catch (_) {
+        return false;
+    }
+}
+
+function readJsonFileSafe(filePath) {
+    try {
+        if (!filePath || !fs.existsSync(filePath)) return null;
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function writeJsonFileSafe(filePath, obj) {
+    try {
+        const root = obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
+        fs.writeFileSync(filePath, `${JSON.stringify(root, null, 2)}\n`, 'utf8');
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function fetchCompat(url, init = {}) {
+    const fetchImpl = globalThis.fetch;
+    if (typeof fetchImpl === 'function') return fetchImpl(url, init);
+
+    const axiosMod = await import('axios');
+    const axios = axiosMod && (axiosMod.default || axiosMod);
+    const method = (init && init.method) || 'GET';
+    const headers = (init && init.headers) || {};
+    const resp = await axios.request({
+        url,
+        method,
+        headers,
+        responseType: 'text',
+        transformResponse: [(v) => v],
+        maxRedirects: 0,
+        validateStatus: () => true,
+    });
+    const dataText = typeof resp.data === 'string' ? resp.data : Buffer.isBuffer(resp.data) ? resp.data.toString('utf8') : String(resp.data || '');
+    return {
+        ok: resp.status >= 200 && resp.status < 300,
+        status: resp.status,
+        text: async () => dataText,
+        headers: {
+            get: (key) => {
+                if (!key) return null;
+                const k = String(key).toLowerCase();
+                const v = resp.headers ? resp.headers[k] : undefined;
+                return typeof v === 'string' ? v : Array.isArray(v) ? v.join(', ') : v != null ? String(v) : null;
+            },
+        },
+    };
+}
+
+function getHeaderLower(resp, key) {
+    try {
+        if (resp && resp.headers && typeof resp.headers.get === 'function') return resp.headers.get(key) || resp.headers.get(String(key || '').toLowerCase());
+    } catch (_) {}
+    return null;
+}
+
+function commitStagedFilesWithRollback(staged, options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const keepCreatedOnFail = !!opts.keepCreatedOnFail;
+
+    const backups = [];
+    const created = [];
+    const backupSuffix = `.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
+
+    const rollback = () => {
+        backups
+            .slice()
+            .reverse()
+            .forEach((b) => {
+                try {
+                    if (fs.existsSync(b.filePath)) fs.unlinkSync(b.filePath);
+                } catch (_) {}
+                try {
+                    if (fs.existsSync(b.bakPath)) fs.renameSync(b.bakPath, b.filePath);
+                } catch (_) {}
+            });
+        if (!keepCreatedOnFail) {
+            created.forEach((p) => {
+                try {
+                    if (fs.existsSync(p)) fs.unlinkSync(p);
+                } catch (_) {}
+            });
+        }
+        staged.forEach((s) => {
+            try {
+                if (s && s.tmpPath && fs.existsSync(s.tmpPath)) fs.unlinkSync(s.tmpPath);
+            } catch (_) {}
+        });
+    };
+
+    try {
+        staged.forEach((s) => {
+            const existed = fs.existsSync(s.filePath);
+            if (existed) {
+                const bakPath = `${s.filePath}.bak${backupSuffix}`;
+                fs.renameSync(s.filePath, bakPath);
+                backups.push({ filePath: s.filePath, bakPath });
+            }
+            fs.renameSync(s.tmpPath, s.filePath);
+            if (!existed) created.push(s.filePath);
+        });
+    } catch (e) {
+        rollback();
+        throw e;
+    }
+
+    // Best-effort cleanup backups after success.
+    backups.forEach((b) => {
+        try {
+            if (fs.existsSync(b.bakPath)) fs.unlinkSync(b.bakPath);
+        } catch (_) {}
+    });
+    return true;
+}
+
+async function ensurePanRuntimeScripts(customSpiderDir) {
+    if (!isPkgRuntime()) return { action: 'none' };
+    if (!customSpiderDir) return { action: 'none' };
+
+    const panDir = path.resolve(customSpiderDir, 'pan');
+    try {
+        if (!fs.existsSync(panDir)) fs.mkdirSync(panDir, { recursive: true });
+    } catch (_) {
+        return { action: 'none' };
+    }
+
+    const items = PAN_RUNTIME_SCRIPTS.map((it) => ({
+        name: String(it.name || '').trim(),
+        url: String(it.url || '').trim(),
+        filePath: path.resolve(panDir, String(it.name || '').trim()),
+        metaPath: path.resolve(panDir, `.${String(it.name || '').trim()}.remote.json`),
+    })).filter((it) => it.name && it.url);
+
+    const anyMissing = items.some((it) => !fs.existsSync(it.filePath));
+    if (anyMissing) {
+        // eslint-disable-next-line no-console
+        console.log('检测到运行环境环境缺失,开始下载....');
+        const staged = [];
+        try {
+            for (const it of items) {
+                const res = await fetchCompat(it.url, { method: 'GET', headers: {} });
+                if (!res || Number(res.status) < 200 || Number(res.status) >= 300) throw new Error(`status=${res ? res.status : 'unknown'}`);
+                const text = await res.text();
+                if (!text) throw new Error('empty body');
+                // eslint-disable-next-line no-undef
+                const tmpPath = path.resolve(panDir, `.${it.name}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`);
+                fs.writeFileSync(tmpPath, text, 'utf8');
+                staged.push({ ...it, tmpPath, res });
+            }
+        } catch (_) {
+            staged.forEach((s) => {
+                try {
+                    fs.unlinkSync(s.tmpPath);
+                } catch (_e) {}
+            });
+            // eslint-disable-next-line no-console
+            console.log('下载失败,请检查网络');
+            return { action: 'missing_failed' };
+        }
+        try {
+            commitStagedFilesWithRollback(staged);
+            staged.forEach((s) => {
+                const etag = getHeaderLower(s.res, 'etag');
+                const lastModified = getHeaderLower(s.res, 'last-modified');
+                writeJsonFileSafe(s.metaPath, {
+                    url: s.url,
+                    etag: typeof etag === 'string' ? etag : '',
+                    lastModified: typeof lastModified === 'string' ? lastModified : '',
+                    savedAt: Date.now(),
+                });
+            });
+        } catch (_) {
+            // eslint-disable-next-line no-console
+            console.log('下载失败,请检查网络');
+            return { action: 'missing_failed' };
+        }
+
+        // eslint-disable-next-line no-console
+        console.log('下载完成,请重启程序,');
+        // eslint-disable-next-line no-undef
+        process.exit(1);
+    }
+
+    // Exists: ensure we have meta headers without being noisy.
+    for (const it of items) {
+        const meta = readJsonFileSafe(it.metaPath);
+        const hasMeta =
+            meta &&
+            typeof meta === 'object' &&
+            ((typeof meta.etag === 'string' && meta.etag.trim()) || (typeof meta.lastModified === 'string' && meta.lastModified.trim()));
+        if (hasMeta) continue;
+        try {
+            const res = await fetchCompat(it.url, { method: 'HEAD', headers: {} });
+            if (!res || Number(res.status) < 200 || Number(res.status) >= 300) continue;
+            const etag = getHeaderLower(res, 'etag');
+            const lastModified = getHeaderLower(res, 'last-modified');
+            writeJsonFileSafe(it.metaPath, {
+                url: it.url,
+                etag: typeof etag === 'string' ? etag : '',
+                lastModified: typeof lastModified === 'string' ? lastModified : '',
+                savedAt: Date.now(),
+            });
+        } catch (_) {}
+    }
+
+    // Check updates using conditional GET; only print if an update is actually needed.
+    const updates = [];
+    let updateMode = false;
+    try {
+        for (const it of items) {
+            const meta = readJsonFileSafe(it.metaPath) || {};
+            const headers = {};
+            if (typeof meta.etag === 'string' && meta.etag.trim()) headers['if-none-match'] = meta.etag.trim();
+            if (typeof meta.lastModified === 'string' && meta.lastModified.trim()) headers['if-modified-since'] = meta.lastModified.trim();
+
+            const res = await fetchCompat(it.url, { method: 'GET', headers });
+            if (!res) continue;
+            const code = Number(res.status);
+            if (code === 304) continue;
+            if (code < 200 || code >= 300) continue;
+
+            if (!updateMode) {
+                updateMode = true;
+                // eslint-disable-next-line no-console
+                console.log('检测到新的运行环境,开始下载...');
+            }
+
+            const text = await res.text();
+            if (!text) throw new Error('empty body');
+            // eslint-disable-next-line no-undef
+            const tmpPath = path.resolve(panDir, `.${it.name}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`);
+            fs.writeFileSync(tmpPath, text, 'utf8');
+            updates.push({ ...it, tmpPath, res });
+        }
+    } catch (_) {
+        updates.forEach((u) => {
+            try {
+                fs.unlinkSync(u.tmpPath);
+            } catch (_e) {}
+        });
+        if (updateMode) {
+            // eslint-disable-next-line no-console
+            console.log('更新失败,请检查网络,将使用旧运行环境,');
+        }
+        return { action: updateMode ? 'update_failed' : 'none' };
+    }
+
+    if (!updates.length) return { action: 'none' };
+
+    try {
+        commitStagedFilesWithRollback(updates, { keepCreatedOnFail: true });
+        updates.forEach((u) => {
+            const etag = getHeaderLower(u.res, 'etag');
+            const lastModified = getHeaderLower(u.res, 'last-modified');
+            writeJsonFileSafe(u.metaPath, {
+                url: u.url,
+                etag: typeof etag === 'string' ? etag : '',
+                lastModified: typeof lastModified === 'string' ? lastModified : '',
+                savedAt: Date.now(),
+            });
+        });
+    } catch (_) {
+        // eslint-disable-next-line no-console
+        console.log('更新失败,请检查网络,将使用旧运行环境,');
+        return { action: 'update_failed' };
+    }
+
+    // eslint-disable-next-line no-console
+    console.log('更新完成,请重启程序');
+    // eslint-disable-next-line no-undef
+    process.exit(1);
+}
+
 function listCustomScriptFiles(dirPath) {
     if (!dirPath || !fs.existsSync(dirPath)) return [];
     const out = [];
@@ -1979,6 +2278,15 @@ export async function loadCustomSourceSpiders() {
             return [];
         }
     }
+
+    // pkg runtime bootstrap for pan scripts: ensure `custom_spider/pan/{baidu,quark}.cjs` exists and is up-to-date.
+    // - Missing: download, ask to restart, and exit(1)
+    // - Update: download, ask to restart, and exit(1)
+    // - Update failed: keep old scripts and continue
+    try {
+        await ensurePanRuntimeScripts(dirPath);
+    } catch (_) {}
+
     const scriptPaths = listCustomScriptFiles(dirPath);
     const files = collectFileStats(scriptPaths);
     if (cache.dirPath === dirPath && sameFiles(cache.files, files)) {

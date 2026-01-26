@@ -3,5 +3,4 @@ generated
 node_modules
 db.json
 custom_spider/*
-!custom_spider/baidu.cjs
-!custom_spider/quark.cjs
+!custom_spider/pan

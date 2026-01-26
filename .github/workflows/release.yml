@@ -66,7 +66,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       # pkg may need to compile Node.js from sources for 32-bit targets,
       # and Node.js configure requires Python <= 3.10.

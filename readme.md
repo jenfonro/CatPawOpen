@@ -1,15 +1,11 @@
 ## CatPawOpen（TV_Server Node 服务）
 
+### 运行
+
 Dev：`npm run dev`
 
 Build：`npm run build`
 
-### GitHub Actions（云构建）
-
-- `release`：手动触发，需要输入版本号（例如 `v1.0.0`），并发布正式 Release。
-- `beta`：`main` 有新提交会自动触发（也支持手动触发）；自动生成 `v0.0.0-beta.<run_id>.<run_attempt>` 作为构建版本号，并发布名为 `beta` 的 Pre-release（滚动更新最新产物）。
-
-说明：不同平台的 Node runtime 可能会缺少部分能力（例如 `wasm`、macOS/iOS 的 `jit` 等）。
 
 ### Docker（开发模式：直接用当前目录代码）
 
@@ -42,11 +38,6 @@ Build：`npm run build`
 - 启动时会加载该目录下脚本（忽略 `_` 开头文件）
 - 查看加载状态：`/custom_source`
 
-支持两类脚本：
-
-- **spider 脚本**：注册 `/spider/<key>/<type>/...`
-- **api plugin 脚本**：导出 `apiPlugins = [{ prefix, plugin }]`，注册 `/api/...`（例如 `/api/baidu`、`/api/quark`）
-
 
 ### Debug 环境变量
 
@@ -56,13 +47,11 @@ Build：`npm run build`
 - `PAN_DEBUG=1`：输出内置网盘解析的 play 流程日志（`[pan] ...`）
 
 
-## Nginx反代配置
+## Nginx反代配置（跨域配置）
 
-需要确保把外部访问域名信息转发给 CatPawOpen（用于播放地址改写）：
 
 - `proxy_set_header Host $http_host;`
 - `proxy_set_header X-Forwarded-Proto $scheme;`
 - `proxy_set_header X-Forwarded-Host $host;`
 - `proxy_set_header X-Forwarded-Port $server_port;`
 
-（如需 CORS，可按你的 TV_Server 前端场景配置 `Access-Control-Allow-*`。）

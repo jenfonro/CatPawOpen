@@ -7,8 +7,39 @@ import { getCatPawOpenVersion } from './util/version.js';
 
 let server = null;
 
-function ensureFetchPolyfill() {
-    if (typeof globalThis.fetch === 'function') return;
+async function ensureFetchPolyfill() {
+    const isPkg = (() => {
+        try {
+            return !!(process && process.pkg);
+        } catch (_) {
+            return false;
+        }
+    })();
+
+    // In some pkg-bundled Node runtimes, global fetch may emit ExperimentalWarning.
+    // Prefer undici.fetch in pkg to avoid the warning.
+    if (isPkg) {
+        try {
+            const undici = await import('undici');
+            if (undici && typeof undici.fetch === 'function') {
+                globalThis.fetch = undici.fetch;
+                if (undici.Headers && !globalThis.Headers) globalThis.Headers = undici.Headers;
+                if (undici.Request && !globalThis.Request) globalThis.Request = undici.Request;
+                if (undici.Response && !globalThis.Response) globalThis.Response = undici.Response;
+                if (undici.FormData && !globalThis.FormData) globalThis.FormData = undici.FormData;
+                if (undici.Blob && !globalThis.Blob) globalThis.Blob = undici.Blob;
+                if (undici.AbortController && !globalThis.AbortController) globalThis.AbortController = undici.AbortController;
+                if (undici.AbortSignal && !globalThis.AbortSignal) globalThis.AbortSignal = undici.AbortSignal;
+                if (undici.DOMException && !globalThis.DOMException) globalThis.DOMException = undici.DOMException;
+                return;
+            }
+        } catch (_) {
+            // fall back to axios polyfill below
+        }
+    }
+
+    if (!isPkg && typeof globalThis.fetch === 'function') return;
+
     globalThis.fetch = async (input, init = {}) => {
         const url = typeof input === 'string' ? input : input && typeof input.url === 'string' ? input.url : String(input);
         const method = init && init.method ? String(init.method).toUpperCase() : 'GET';
@@ -21,19 +52,24 @@ function ensureFetchPolyfill() {
             method,
             headers,
             data: body,
-            responseType: 'text',
+            responseType: 'arraybuffer',
             transformResponse: [(v) => v],
             maxRedirects: redirect === 'manual' ? 0 : 5,
             validateStatus: () => true,
         });
 
-        const dataText =
-            typeof resp.data === 'string' ? resp.data : Buffer.isBuffer(resp.data) ? resp.data.toString('utf8') : JSON.stringify(resp.data);
+        const buf = Buffer.isBuffer(resp.data) ? resp.data : Buffer.from(resp.data || []);
+        const dataText = buf.toString('utf8');
         return {
             ok: resp.status >= 200 && resp.status < 300,
             status: resp.status,
             url: url,
             text: async () => dataText,
+            json: async () => {
+                const t = dataText;
+                return t ? JSON.parse(t) : null;
+            },
+            arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
             headers: {
                 get: (key) => {
                     if (!key) return null;
@@ -107,7 +143,7 @@ function ensureConfigDefaults(config) {
  */
 export async function start(config) {
     console.log(`catpawopen version : ${getCatPawOpenVersion()}`);
-    ensureFetchPolyfill();
+    await ensureFetchPolyfill();
     /**
      * @type {import('fastify').FastifyInstance}
      */
