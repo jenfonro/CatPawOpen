@@ -253,6 +253,20 @@ function ensureConfigDefaults(config) {
 export async function start(config) {
     console.log(`catpawopen version : ${getCatPawOpenVersion()}`);
     await ensureFetchPolyfill();
+    const timeoutRaw =
+        (typeof process.env.CATPAW_PLUGIN_TIMEOUT_MS === 'string' && process.env.CATPAW_PLUGIN_TIMEOUT_MS) ||
+        (typeof process.env.CATPAWOPEN_PLUGIN_TIMEOUT_MS === 'string' && process.env.CATPAWOPEN_PLUGIN_TIMEOUT_MS) ||
+        '';
+    const parsedTimeout = timeoutRaw && timeoutRaw.trim() ? Number.parseInt(timeoutRaw.trim(), 10) : Number.NaN;
+    const envPluginTimeoutMs = Number.isFinite(parsedTimeout) ? Math.max(0, parsedTimeout) : 0;
+    const defaultPluginTimeoutMs = (() => {
+        try {
+            return process && process.pkg ? 60 * 1000 : 0;
+        } catch (_) {
+            return 0;
+        }
+    })();
+    const pluginTimeoutMs = envPluginTimeoutMs > 0 ? envPluginTimeoutMs : defaultPluginTimeoutMs;
     /**
      * @type {import('fastify').FastifyInstance}
      */
@@ -261,6 +275,7 @@ export async function start(config) {
         forceCloseConnections: true,
         logger: !!(process.env.NODE_ENV !== 'development'),
         maxParamLength: 10240,
+        ...(pluginTimeoutMs > 0 ? { pluginTimeout: pluginTimeoutMs } : {}),
     });
     server.messageToDart = async (data, inReq) => {
         try {

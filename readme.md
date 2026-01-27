@@ -25,11 +25,19 @@ Build：`npm run build`
 
 - `proxy`: string，全局出站代理地址（为空表示不启用）。
 - `panResolver`: boolean，是否启用“内置网盘解析”（拦截百度/夸克的 `play`）。
+- `corsAllowOrigins`: 允许跨域的 Origin（字符串或数组），支持：`*`、`*.example.com`、`https://*.example.com`、以及精确匹配 `https://movie.zelt.cn`
+- `corsAllowCredentials`: 是否允许携带凭证（默认 `false`）
+  - 未配置 `corsAllowOrigins` 时默认放开所有 Origin（等价于 `["*"]`，且 `corsAllowCredentials=false`）
 
 运行时也可通过接口读写：
 
 - `GET /admin/settings`：读取（返回 `proxy` + `panBuiltinResolverEnabled`）
-- `PUT /admin/settings`：写入（body：`{ proxy, panBuiltinResolverEnabled }`）
+- `PUT /admin/settings`：写入（body：`{ proxy, panBuiltinResolverEnabled, corsAllowOrigins, corsAllowCredentials }`）
+
+环境变量（优先级高于 `config.json`）：
+
+- `CATPAW_CORS_ALLOW_ORIGINS`：逗号分隔
+- `CATPAW_CORS_ALLOW_CREDENTIALS`：`1/true/yes/on`
 
 ### Custom Source（自定义脚本）
 
@@ -54,4 +62,3 @@ Build：`npm run build`
 - `proxy_set_header X-Forwarded-Proto $scheme;`
 - `proxy_set_header X-Forwarded-Host $host;`
 - `proxy_set_header X-Forwarded-Port $server_port;`
-

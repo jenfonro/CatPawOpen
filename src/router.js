@@ -17,6 +17,8 @@ const spiderPrefix = '/spider';
 
 const BAIDU_PLAY_UA = 'com.android.chrome/131.0.6778.200 (Linux;Android 10) AndroidXMedia3/1.5.1';
 let panBuiltinResolverEnabledCache = false;
+let corsAllowOriginsCache = [];
+let corsAllowCredentialsCache = false;
 
 function getEmbeddedRootDir() {
     // When bundled by esbuild (cjs), `__dirname` points to `dist/`.
@@ -589,10 +591,181 @@ async function downloadTextFile(url, options = {}) {
     }
 }
 
-// NOTE: CORS is intentionally handled by the reverse proxy (e.g. Nginx) in production.
-// Avoid emitting any CORS headers here to prevent duplicate `Access-Control-Allow-Origin`
-// (which browsers treat as a CORS failure).
-function setAdminCors(_reply, _origin) {}
+function normalizeCorsAllowOrigins(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) return value.map((v) => String(v || '').trim()).filter(Boolean);
+    const s = String(value || '').trim();
+    if (!s) return [];
+    return s
+        .split(',')
+        .map((v) => String(v || '').trim())
+        .filter(Boolean);
+}
+
+function readCorsAllowOriginsFromEnv() {
+    const raw =
+        (typeof process.env.CATPAW_CORS_ALLOW_ORIGINS === 'string' && process.env.CATPAW_CORS_ALLOW_ORIGINS) ||
+        (typeof process.env.CATPAWOPEN_CORS_ALLOW_ORIGINS === 'string' && process.env.CATPAWOPEN_CORS_ALLOW_ORIGINS) ||
+        '';
+    return normalizeCorsAllowOrigins(raw);
+}
+
+function readCorsAllowCredentialsFromEnv() {
+    const raw =
+        (typeof process.env.CATPAW_CORS_ALLOW_CREDENTIALS === 'string' && process.env.CATPAW_CORS_ALLOW_CREDENTIALS) ||
+        (typeof process.env.CATPAWOPEN_CORS_ALLOW_CREDENTIALS === 'string' &&
+            process.env.CATPAWOPEN_CORS_ALLOW_CREDENTIALS) ||
+        '';
+    const s = String(raw || '').trim().toLowerCase();
+    return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+}
+
+function readCorsAllowOriginsFromConfigRoot(root) {
+    const cfg = root && typeof root === 'object' ? root : {};
+    if (Object.prototype.hasOwnProperty.call(cfg, 'corsAllowOrigins')) return normalizeCorsAllowOrigins(cfg.corsAllowOrigins);
+    if (Object.prototype.hasOwnProperty.call(cfg, 'corsOrigins')) return normalizeCorsAllowOrigins(cfg.corsOrigins);
+    if (Object.prototype.hasOwnProperty.call(cfg, 'cors')) return normalizeCorsAllowOrigins(cfg.cors);
+    return [];
+}
+
+function readCorsAllowCredentialsFromConfigRoot(root) {
+    const cfg = root && typeof root === 'object' ? root : {};
+    const v =
+        Object.prototype.hasOwnProperty.call(cfg, 'corsAllowCredentials')
+            ? cfg.corsAllowCredentials
+            : Object.prototype.hasOwnProperty.call(cfg, 'corsCredentials')
+              ? cfg.corsCredentials
+              : null;
+    if (v == null) return false;
+    if (typeof v === 'boolean') return v;
+    const s = String(v || '').trim().toLowerCase();
+    return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+}
+
+function isLocalhostOrigin(origin) {
+    try {
+        const u = new URL(String(origin || ''));
+        const host = String(u.hostname || '').toLowerCase();
+        return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+    } catch (_) {
+        return false;
+    }
+}
+
+function originMatchesRule(origin, rule) {
+    const o = String(origin || '').trim();
+    const r = String(rule || '').trim();
+    if (!o || !r) return false;
+    if (r === '*') return true;
+
+    let ou;
+    try {
+        ou = new URL(o);
+    } catch (_) {
+        return false;
+    }
+    const oProto = String(ou.protocol || '');
+    const oHost = String(ou.hostname || '').toLowerCase();
+    const oOrigin = `${oProto}//${String(ou.host || '')}`;
+
+    if (r.includes('://')) {
+        if (r.includes('*')) {
+            let ru;
+            try {
+                ru = new URL(r.replace('*.', 'placeholder.'));
+            } catch (_) {
+                return false;
+            }
+            if (ru.protocol && ru.protocol !== ou.protocol) return false;
+            const suffix = String(ru.hostname || '').replace(/^placeholder\./, '').toLowerCase();
+            return oHost.endsWith(`.${suffix}`);
+        }
+        try {
+            const ru = new URL(r);
+            const rOrigin = `${ru.protocol}//${String(ru.host || '')}`;
+            return rOrigin === oOrigin;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    if (r.startsWith('*.')) {
+        const suffix = r.slice(2).toLowerCase();
+        return oHost.endsWith(`.${suffix}`);
+    }
+    return oHost === r.toLowerCase();
+}
+
+function mergeVaryHeader(reply, value) {
+    try {
+        const cur = typeof reply.getHeader === 'function' ? String(reply.getHeader('Vary') || '') : '';
+        const parts = cur
+            ? cur
+                  .split(',')
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+            : [];
+        const wanted = String(value || '').trim();
+        if (!wanted) return;
+        if (parts.some((p) => p.toLowerCase() === wanted.toLowerCase())) return;
+        parts.push(wanted);
+        reply.header('Vary', parts.join(', '));
+    } catch (_) {}
+}
+
+function setCorsHeaders(reply, origin, requestHeaders) {
+    if (!reply || typeof reply.header !== 'function') return false;
+    const o = String(origin || '').trim();
+    if (!o) return false;
+
+    const envOrigins = readCorsAllowOriginsFromEnv();
+    const envCreds = readCorsAllowCredentialsFromEnv();
+    const allowOrigins = envOrigins.length ? envOrigins : corsAllowOriginsCache && corsAllowOriginsCache.length ? corsAllowOriginsCache : ['*'];
+    const allowCreds = envOrigins.length ? envCreds : corsAllowOriginsCache && corsAllowOriginsCache.length ? corsAllowCredentialsCache : false;
+
+    const already = (() => {
+        try {
+            if (typeof reply.getHeader !== 'function') return false;
+            return !!(reply.getHeader('access-control-allow-origin') || reply.getHeader('Access-Control-Allow-Origin'));
+        } catch (_) {
+            return false;
+        }
+    })();
+    if (already) return false;
+
+    let allowed = false;
+    let allowOriginValue = '';
+    if (allowOrigins && allowOrigins.length) {
+        if (allowOrigins.some((v) => String(v || '').trim() === '*')) {
+            allowed = true;
+            allowOriginValue = allowCreds ? o : '*';
+        } else if (allowOrigins.some((rule) => originMatchesRule(o, rule))) {
+            allowed = true;
+            allowOriginValue = o;
+        }
+    } else if (isLocalhostOrigin(o)) {
+        allowed = true;
+        allowOriginValue = o;
+    }
+    if (!allowed || !allowOriginValue) return false;
+
+    reply.header('Access-Control-Allow-Origin', allowOriginValue);
+    mergeVaryHeader(reply, 'Origin');
+    reply.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+    reply.header('Access-Control-Max-Age', '600');
+
+    const reqH =
+        (requestHeaders && (requestHeaders['access-control-request-headers'] || requestHeaders['Access-Control-Request-Headers'])) ||
+        '';
+    const allowHeaders = String(reqH || '').trim() || 'content-type,x-tv-user';
+    reply.header('Access-Control-Allow-Headers', allowHeaders);
+    if (allowCreds) reply.header('Access-Control-Allow-Credentials', 'true');
+    return true;
+}
+
+function setAdminCors(reply, origin, requestHeaders) {
+    return setCorsHeaders(reply, origin, requestHeaders);
+}
 
 function isSpiderLike(value) {
     if (!value || typeof value !== 'object') return false;
@@ -769,6 +942,17 @@ function decodeTvServerPlayId(rawId) {
  * @return {Promise<void>} - A Promise that resolves when the router is initialized
  */
 export default async function router(fastify) {
+    const startupProfile =
+        (typeof process.env.CATPAW_STARTUP_PROFILE === 'string' && process.env.CATPAW_STARTUP_PROFILE.trim() === '1') ||
+        (typeof process.env.CATPAWOPEN_STARTUP_PROFILE === 'string' && process.env.CATPAWOPEN_STARTUP_PROFILE.trim() === '1');
+    const t0 = Date.now();
+    const mark = (label) => {
+        if (!startupProfile) return;
+        const ms = Date.now() - t0;
+        // eslint-disable-next-line no-console
+        console.log(`[startup] ${ms}ms ${label}`);
+    };
+
     // Load persisted settings from config.json on startup.
     try {
         const cfgPath = getConfigJsonPath();
@@ -777,7 +961,26 @@ export default async function router(fastify) {
             await setGlobalProxy(root.proxy);
         }
         panBuiltinResolverEnabledCache = readPanBuiltinResolverEnabledFromConfigRoot(root);
+        corsAllowOriginsCache = readCorsAllowOriginsFromConfigRoot(root);
+        corsAllowCredentialsCache = readCorsAllowCredentialsFromConfigRoot(root);
     } catch (_) {}
+    mark('config loaded');
+
+    fastify.addHook('onRequest', (request, reply, done) => {
+        try {
+            const origin = request && request.headers ? request.headers.origin : '';
+            setCorsHeaders(reply, origin, request && request.headers ? request.headers : {});
+        } catch (_) {}
+        done();
+    });
+
+    fastify.options('/*', async function (request, reply) {
+        try {
+            const origin = request && request.headers ? request.headers.origin : '';
+            setCorsHeaders(reply, origin, request && request.headers ? request.headers : {});
+        } catch (_) {}
+        reply.code(204).send();
+    });
 
     // Propagate TV_Server user identity through the async call chain so custom-script VM wrappers
     // (e.g. Quark folder init) can resolve per-user working directories safely.
@@ -881,14 +1084,18 @@ export default async function router(fastify) {
         }
     });
 
-    // CORS is handled by reverse proxy (Nginx); do not add CORS hooks here.
+    // CORS is handled by this service via an allowlist (config/env). Reverse proxy CORS is optional.
 
     // 默认站点：动态 import src/spider 下所有 js（含子目录），不再写死列表
     const spiderRootDir = resolveSpiderRootDir();
+    mark(`spider root resolved: ${spiderRootDir}`);
     const baseFiles = listSpiderJsFiles(spiderRootDir);
+    mark(`spider files listed: ${baseFiles.length}`);
     const baseSpiders = await loadSpidersFromFiles(baseFiles, { logPrefix: '[builtin]' });
+    mark(`builtin spiders loaded: ${(baseSpiders || []).length}`);
 
     const customSpiders = await loadCustomSourceSpiders();
+    mark(`custom spiders loaded: ${(customSpiders || []).length}`);
     const customStatus = getCustomSourceStatus();
     const customIds = new Set(
         (customSpiders || [])
@@ -898,6 +1105,7 @@ export default async function router(fastify) {
     const effectiveBaseSpiders = (baseSpiders || []).filter(
         (s) => !(s && s.meta && customIds.has(`${s.meta.key}:${String(s.meta.type)}`))
     );
+    mark(`effective builtin spiders: ${(effectiveBaseSpiders || []).length}`);
 
     // 1) 先注册默认 spiders
     effectiveBaseSpiders.forEach((spider) => {
@@ -906,6 +1114,7 @@ export default async function router(fastify) {
         // eslint-disable-next-line no-console
         console.log('Register spider: ' + routePath);
     });
+    mark('builtin spiders registered');
 
     // 2) 输出自定义脚本的加载统计（按文件拆分）
     const byFile = (customStatus && customStatus.byFile) || {};
@@ -927,6 +1136,7 @@ export default async function router(fastify) {
         // eslint-disable-next-line no-console
         console.log(`Register custom spider ${fileName} : ${routePath}`);
     });
+    mark('custom spiders registered');
 
     // 4) 补全 /website：直接输出自定义脚本的 websiteBundle()（浏览器执行），不改写任何路由
     // 优先：注册自定义脚本提供的 Fastify 插件（例如 my.js 的 Yne），确保 /website 下所有子路由都存在
@@ -939,6 +1149,7 @@ export default async function router(fastify) {
             // eslint-disable-next-line no-console
             console.log(`Register api plugin: ${p.prefix} (from ${from})`);
         });
+    mark(`api plugins registered: ${(apiPlugins || []).length}`);
 
     const webPlugins = getCustomSourceWebPlugins();
     // Register other extracted web prefixes first (optional helpers used by some website UIs)
@@ -950,6 +1161,7 @@ export default async function router(fastify) {
             // eslint-disable-next-line no-console
             console.log(`Register web plugin: ${p.prefix} (from ${from})`);
         });
+    mark(`web plugins registered: ${(webPlugins || []).length}`);
 
     const websitePlugin =
         (webPlugins || []).find((p) => p && p.prefix === '/website' && typeof p.plugin === 'function') || null;
@@ -1112,11 +1324,15 @@ export default async function router(fastify) {
         const cfgPath = getConfigJsonPath();
         const root = readConfigJsonSafe(cfgPath);
         const onlineConfigs = root && Array.isArray(root.onlineConfigs) ? root.onlineConfigs : [];
+        const envCorsOrigins = readCorsAllowOriginsFromEnv();
+        const envCorsCreds = readCorsAllowCredentialsFromEnv();
         return reply.send({
             success: true,
             settings: {
                 proxy: getGlobalProxy() || '',
                 panBuiltinResolverEnabled: readPanBuiltinResolverEnabledFromConfigRoot(root),
+                corsAllowOrigins: envCorsOrigins.length ? envCorsOrigins : readCorsAllowOriginsFromConfigRoot(root),
+                corsAllowCredentials: envCorsOrigins.length ? envCorsCreds : readCorsAllowCredentialsFromConfigRoot(root),
             },
             onlineConfigs,
         });
@@ -1132,6 +1348,15 @@ export default async function router(fastify) {
         const hasPanBuiltin = Object.prototype.hasOwnProperty.call(body, 'panBuiltinResolverEnabled');
         const panBuiltinResolverEnabled = hasPanBuiltin ? !!body.panBuiltinResolverEnabled : readPanBuiltinResolverEnabledFromConfigRoot(prev);
 
+        const hasCorsAllowOrigins = Object.prototype.hasOwnProperty.call(body, 'corsAllowOrigins');
+        const corsAllowOrigins = hasCorsAllowOrigins
+            ? normalizeCorsAllowOrigins(body.corsAllowOrigins)
+            : readCorsAllowOriginsFromConfigRoot(prev);
+        const hasCorsAllowCredentials = Object.prototype.hasOwnProperty.call(body, 'corsAllowCredentials');
+        const corsAllowCredentials = hasCorsAllowCredentials
+            ? !!body.corsAllowCredentials
+            : readCorsAllowCredentialsFromConfigRoot(prev);
+
         let applied = proxy;
         try {
             applied = await setGlobalProxy(proxy);
@@ -1144,6 +1369,8 @@ export default async function router(fastify) {
             ...prev,
             proxy: applied || '',
             panResolver: !!panBuiltinResolverEnabled,
+            corsAllowOrigins,
+            corsAllowCredentials,
         };
         // Drop deprecated keys.
         try {
@@ -1175,10 +1402,17 @@ export default async function router(fastify) {
         }
 
         panBuiltinResolverEnabledCache = !!panBuiltinResolverEnabled;
+        corsAllowOriginsCache = corsAllowOrigins;
+        corsAllowCredentialsCache = !!corsAllowCredentials;
 
         const payload = {
             success: true,
-            settings: { proxy: applied || '', panBuiltinResolverEnabled: !!panBuiltinResolverEnabled },
+            settings: {
+                proxy: applied || '',
+                panBuiltinResolverEnabled: !!panBuiltinResolverEnabled,
+                corsAllowOrigins,
+                corsAllowCredentials: !!corsAllowCredentials,
+            },
             ...(onlineResult
                 ? {
                       onlineConfigs: onlineResult.results,
