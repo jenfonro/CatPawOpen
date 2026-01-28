@@ -1024,31 +1024,38 @@ export default async function router(fastify) {
             if (!id) return;
             const isBaidu = flag.includes('百度');
             const isQuark = flag.includes('夸克') || flag.includes('夸父') || flag.toLowerCase().includes('quark');
-            if (!isBaidu && !isQuark) return;
+            const is139 =
+                flag.includes('139') ||
+                flag.includes('逸动') ||
+                flag.includes('和彩云') ||
+                flag.includes('移动云盘') ||
+                flag.toLowerCase().includes('yun139');
+            if (!isBaidu && !isQuark && !is139) return;
 
             const rawUrl = (request && request.raw && request.raw.url) || request.url || '';
             const queryStr = rawUrl.includes('?') ? rawUrl.slice(rawUrl.indexOf('?')) : '';
             const destName = getGlobalPanDirNameForCurrentUser();
             const tvUser = getTvUserFromRequest(request);
+            const injectedUrl = isBaidu ? `/api/baidu/play${queryStr}` : isQuark ? `/api/quark/play${queryStr}` : `/api/139/play${queryStr}`;
             const injected = await fastify.inject({
                 method: 'POST',
-                url: isBaidu ? `/api/baidu/play${queryStr}` : `/api/quark/play${queryStr}`,
+                url: injectedUrl,
                 headers: {
                     'content-type': 'application/json',
                     ...(tvUser ? { 'x-tv-user': tvUser } : {}),
                 },
-                payload: { flag, id, destName },
+                payload: is139 ? { flag, id } : { flag, id, destName },
             });
             const text = injected && typeof injected.payload === 'string' ? injected.payload : '';
             let out = {};
             try {
                 out = text ? JSON.parse(text) : {};
             } catch (_) {
-                out = { ok: false, message: 'builtin baidu play returned non-json payload' };
+                out = { ok: false, message: 'builtin pan play returned non-json payload' };
             }
             return reply.code(injected.statusCode || 200).send(out);
         } catch (e) {
-            const msg = e && e.message ? String(e.message) : 'builtin baidu play failed';
+            const msg = e && e.message ? String(e.message) : 'builtin pan play failed';
             return reply.code(502).send({ ok: false, message: msg });
         }
     });

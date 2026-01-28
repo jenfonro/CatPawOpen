@@ -15,6 +15,10 @@ const PAN_RUNTIME_SCRIPTS = [
         name: 'quark.cjs',
         url: 'https://raw.githubusercontent.com/jenfonro/CatPawOpen/refs/heads/main/custom_spider/pan/quark.cjs',
     },
+    {
+        name: '139.cjs',
+        url: 'https://raw.githubusercontent.com/jenfonro/CatPawOpen/refs/heads/main/custom_spider/pan/139.cjs',
+    },
 ];
 let cache = {
     dirPath: '',

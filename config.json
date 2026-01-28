@@ -2,5 +2,8 @@
   "proxy": "",
   "panResolver": false,
   "listen": 3006,
-  "downloadProxy": ""
+  "downloadProxy": "",
+  "corsAllowOrigins": [],
+  "corsAllowCredentials": false,
+  "onlineConfigs": []
 }
