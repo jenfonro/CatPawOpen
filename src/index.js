@@ -8,6 +8,66 @@ import { getCatPawOpenVersion } from './util/version.js';
 
 let server = null;
 
+function safeUrlFromAxiosConfig(cfg) {
+    const c = cfg && typeof cfg === 'object' ? cfg : null;
+    if (!c) return '';
+    const baseURL = typeof c.baseURL === 'string' ? c.baseURL : '';
+    const url = typeof c.url === 'string' ? c.url : '';
+    if (!baseURL && !url) return '';
+    try {
+        return new URL(url || baseURL, baseURL || undefined).toString();
+    } catch (_) {
+        return `${baseURL || ''}${url || ''}`;
+    }
+}
+
+function summarizeThrownError(error) {
+    const e = error && typeof error === 'object' ? error : null;
+    if (!e) return '';
+    const parts = [];
+    try {
+        if (typeof e.name === 'string' && e.name) parts.push(e.name);
+    } catch (_) {}
+    try {
+        if (typeof e.message === 'string' && e.message) parts.push(e.message);
+    } catch (_) {}
+    try {
+        const code = typeof e.code === 'string' ? e.code : typeof e.errno === 'string' ? e.errno : '';
+        if (code) parts.push(`code=${code}`);
+    } catch (_) {}
+    try {
+        const status = e.response && typeof e.response.status === 'number' ? e.response.status : 0;
+        if (status) parts.push(`status=${status}`);
+    } catch (_) {}
+    try {
+        const url = safeUrlFromAxiosConfig(e.config);
+        if (url) parts.push(`url=${url.length > 300 ? `${url.slice(0, 300)}...(${url.length})` : url}`);
+    } catch (_) {}
+
+    // AggregateError (or axios error with AggregateError in `cause`)
+    try {
+        const agg = Array.isArray(e.errors) ? e : e.cause && Array.isArray(e.cause.errors) ? e.cause : null;
+        if (agg && Array.isArray(agg.errors) && agg.errors.length) {
+            const items = agg.errors
+                .slice(0, 3)
+                .map((it) => {
+                    const x = it && typeof it === 'object' ? it : null;
+                    if (!x) return String(it);
+                    const sub = [];
+                    if (typeof x.code === 'string' && x.code) sub.push(`code=${x.code}`);
+                    if (typeof x.message === 'string' && x.message) sub.push(x.message);
+                    if (typeof x.address === 'string' && x.address) sub.push(`addr=${x.address}`);
+                    if (typeof x.port === 'number' && x.port) sub.push(`port=${x.port}`);
+                    return sub.join(' ');
+                })
+                .filter(Boolean);
+            if (items.length) parts.push(`aggregate=[${items.join(' | ')}${agg.errors.length > 3 ? ` | +${agg.errors.length - 3}` : ''}]`);
+        }
+    } catch (_) {}
+
+    return parts.join(' ');
+}
+
 function getEmbeddedRootDir() {
     try {
         // eslint-disable-next-line no-undef
@@ -318,6 +378,11 @@ export async function start(config) {
     server.addHook('onError', async (_request, _reply, error) => {
         try {
             // Keep logs small: some thrown objects (e.g. axios errors) contain huge nested config/agent state.
+            const summary = summarizeThrownError(error);
+            if (summary) {
+                // eslint-disable-next-line no-console
+                console.error(`[error] ${summary}`);
+            }
             // eslint-disable-next-line no-console
             console.error(error && error.stack ? error.stack : error);
         } catch (_) {}

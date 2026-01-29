@@ -1114,6 +1114,53 @@ export default async function router(fastify) {
     );
     mark(`effective builtin spiders: ${(effectiveBaseSpiders || []).length}`);
 
+    const wrapCustomSpiderApiWithAutoInit = (spider) => {
+        if (!spider || typeof spider !== 'object') return null;
+        if (typeof spider.api !== 'function') return null;
+        const meta = spider.meta && typeof spider.meta === 'object' ? spider.meta : null;
+        const type = meta && Number.isFinite(Number(meta.type)) ? Number(meta.type) : NaN;
+        // Apply to non-pan spiders only; pan spiders often use auth init flows and should be left intact.
+        if (!Number.isFinite(type) || type >= 40) return spider.api;
+
+        return async function customSpiderAutoInit(instance, opts) {
+            // Register routes first so `/init` exists before we attempt to call it.
+            await spider.api(instance, opts);
+
+            let initPromise = null;
+            const ensureInitOnce = async (request) => {
+                if (initPromise) return initPromise;
+                initPromise = (async () => {
+                    const tvUserHeader =
+                        request && request.headers
+                            ? request.headers['x-tv-user'] || request.headers['X-TV-USER']
+                            : '';
+                    const injected = await instance.inject({
+                        method: 'POST',
+                        url: '/init',
+                        headers: {
+                            'content-type': 'application/json',
+                            ...(tvUserHeader ? { 'x-tv-user': String(tvUserHeader) } : {}),
+                        },
+                        payload: {},
+                    });
+                    return injected;
+                })();
+                return initPromise;
+            };
+
+            instance.addHook('preHandler', async function (request) {
+                const rawUrl = (request && request.raw && request.raw.url) || request.url || '';
+                const p = String(rawUrl || '').split('?')[0];
+                if (p === '/init' || p === '/init/') return;
+                try {
+                    await ensureInitOnce(request);
+                } catch (_) {
+                    // Ignore init errors; the actual route handler will still run and can return its own error.
+                }
+            });
+        };
+    };
+
     // 1) 先注册默认 spiders
     effectiveBaseSpiders.forEach((spider) => {
         const routePath = spiderPrefix + '/' + spider.meta.key + '/' + spider.meta.type;
@@ -1138,7 +1185,8 @@ export default async function router(fastify) {
     // 3) 最后注册自定义 spiders，并在日志中标注来源文件
     customSpiders.forEach((spider) => {
         const routePath = spiderPrefix + '/' + spider.meta.key + '/' + spider.meta.type;
-        fastify.register(spider.api, { prefix: routePath });
+        const wrapped = wrapCustomSpiderApiWithAutoInit(spider) || spider.api;
+        fastify.register(wrapped, { prefix: routePath });
         const fileName = spider && spider.__customFile ? String(spider.__customFile) : 'custom';
         // eslint-disable-next-line no-console
         console.log(`Register custom spider ${fileName} : ${routePath}`);
