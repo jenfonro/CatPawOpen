@@ -882,21 +882,36 @@ async function ensureSpiderInitOnceForRequest(req) {
     const tvUserHeader = user ? { 'X-TV-User': user } : {};
     const inflight = (async () => {
         try {
-            const res = await req.server.inject({
-                method: 'POST',
-                url: `${parsed.base}/init`,
-                headers: {
-                    'content-type': 'application/json',
-                    'x-cp-skip-auto-init': '1',
-                    ...tvUserHeader,
-                },
-                payload: {},
-            });
-            if (res && res.statusCode === 404) {
+            const tryInit = async (method) => {
+                const m = String(method || '').toUpperCase();
+                const isGetLike = m === 'GET' || m === 'HEAD';
+                return await req.server.inject({
+                    method: m,
+                    url: `${parsed.base}/init`,
+                    headers: {
+                        ...(isGetLike ? {} : { 'content-type': 'application/json' }),
+                        'x-cp-skip-auto-init': '1',
+                        ...tvUserHeader,
+                    },
+                    ...(isGetLike ? {} : { payload: {} }),
+                });
+            };
+
+            // Try POST first (most CatPaw scripts), then fallback to GET for scripts that register init as GET.
+            let res = await tryInit('POST');
+            const code = res ? Number(res.statusCode || 0) : 0;
+            if (code === 404 || code === 405) {
+                const res2 = await tryInit('GET');
+                // Prefer GET result if it exists.
+                res = res2 || res;
+            }
+
+            const finalCode = res ? Number(res.statusCode || 0) : 0;
+            if (finalCode === 404) {
                 cur.noInit = true;
                 return;
             }
-            if (res && res.statusCode >= 200 && res.statusCode < 300) {
+            if (finalCode >= 200 && finalCode < 300) {
                 cur.done = true;
                 return;
             }
@@ -983,6 +998,29 @@ function getPansListCached() {
     const root = readDbJsonSafeCached();
     const list = root && root.pans && typeof root.pans === 'object' && Array.isArray(root.pans.list) ? root.pans.list : null;
     return Array.isArray(list) ? list : null;
+}
+
+function readSpiderBaseOverrideFromDbJson(spiderKey) {
+    const key = String(spiderKey || '').trim().toLowerCase();
+    if (!key) return '';
+    const root = readDbJsonSafeCached();
+    const obj = root && typeof root === 'object' && !Array.isArray(root) ? root : null;
+    if (!obj) return '';
+    const map =
+        (obj.spiderBase && typeof obj.spiderBase === 'object' && !Array.isArray(obj.spiderBase) ? obj.spiderBase : null) ||
+        (obj.spiderBases && typeof obj.spiderBases === 'object' && !Array.isArray(obj.spiderBases) ? obj.spiderBases : null) ||
+        null;
+    if (!map) return '';
+    const raw = map[key] || map[String(spiderKey || '').trim()] || '';
+    const s = typeof raw === 'string' ? raw.trim() : '';
+    if (!s) return '';
+    try {
+        const u = new URL(s.startsWith('//') ? `https:${s}` : s);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+        return u.origin;
+    } catch (_) {
+        return '';
+    }
 }
 function getDbJsonPath() {
     if (!getDbJsonPath.state) getDbJsonPath.state = { path: '', ts: 0 };
@@ -2734,10 +2772,45 @@ async function loadOneFile(filePath) {
     const spiders = collectSpidersDeep(Object.values(context)).map((spider) => {
         try {
             if (spider && typeof spider.api === 'function') {
+                try {
+                    // Keep a handle to the VM context so per-request hooks can adjust runtime globals (MY_URL/location).
+                    // This is needed for some bundles that build axios URLs relative to a runtime base.
+                    spider.__cp_vm_context = context;
+                } catch (_) {}
                 const originalApi = spider.api;
                 spider.api = async (instance, opts) => {
                     instance.addHook('onRequest', async (req, _reply) => {
                         try {
+                            // Optional override: allow users to provide a base origin for a spider in db.json:
+                            // {
+                            //   "spiderBase": { "dongli": "https://example.com" }
+                            // }
+                            // This is only used when the script itself doesn't expose a base origin and would otherwise
+                            // fall back to `http://localhost/...` for relative URLs.
+                            try {
+                                const base = readSpiderBaseOverrideFromDbJson(spider && spider.meta ? spider.meta.key : '');
+                                const ctx = spider && spider.__cp_vm_context ? spider.__cp_vm_context : null;
+                                if (base && ctx && typeof ctx === 'object') {
+                                    try {
+                                        ctx.MY_URL = base;
+                                    } catch (_) {}
+                                    try {
+                                        ctx.baseURL = base;
+                                    } catch (_) {}
+                                    try {
+                                        if (ctx.location && typeof ctx.location === 'object') {
+                                            ctx.location.href = base;
+                                            ctx.location.origin = base;
+                                        }
+                                    } catch (_) {}
+                                    try {
+                                        if (ctx.globalThis && ctx.globalThis.location && typeof ctx.globalThis.location === 'object') {
+                                            ctx.globalThis.location.href = base;
+                                            ctx.globalThis.location.origin = base;
+                                        }
+                                    } catch (_) {}
+                                }
+                            } catch (_) {}
                             await ensureSpiderInitOnceForRequest(req);
                         } catch (_) {}
                     });
