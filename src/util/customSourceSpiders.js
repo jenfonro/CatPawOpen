@@ -1884,6 +1884,80 @@ function buildVmContext(requireFunc, filePath) {
         if (!context.document.location) context.document.location = context.location;
     } catch (_) {}
 
+    // Keep `location` in sync with common "base URL" globals used by many bundles.
+    // This helps browser-ported axios/fetch wrappers resolve relative URLs correctly (instead of defaulting to http://localhost).
+    try {
+        const { URL: NativeURL } = globalThis;
+        const normalizeBaseForLocation = (raw) => {
+            const s = typeof raw === 'string' ? raw.trim() : '';
+            if (!s) return '';
+            const lowered = s.toLowerCase();
+            if (lowered === 'undefined' || lowered === 'null') return '';
+            if (s.startsWith('//')) return `https:${s}`;
+            if (!s.includes('://') && /^[a-zA-Z0-9.-]+(?::\d+)?$/.test(s)) return `https://${s}`;
+            return s;
+        };
+        const applyLocationFromBase = (rawBase) => {
+            const base = normalizeBaseForLocation(rawBase);
+            if (!base) return;
+            try {
+                const u = new NativeURL(base);
+                if (!context.location) context.location = {};
+                context.location.href = u.toString();
+                context.location.origin = u.origin || '';
+                context.location.protocol = u.protocol || '';
+                context.location.host = u.host || '';
+                context.location.hostname = u.hostname || '';
+            } catch (_) {
+                // ignore invalid base
+            }
+        };
+        const defineSyncProp = (key) => {
+            if (!key || typeof key !== 'string') return;
+            const hidden = `__cp_${key}_value__`;
+            try {
+                if (!Object.prototype.hasOwnProperty.call(context, hidden)) context[hidden] = context[key];
+                Object.defineProperty(context, key, {
+                    configurable: true,
+                    enumerable: true,
+                    get() {
+                        return context[hidden];
+                    },
+                    set(v) {
+                        context[hidden] = v;
+                        applyLocationFromBase(v);
+                    },
+                });
+                if (context.globalThis && context.globalThis !== context) {
+                    Object.defineProperty(context.globalThis, key, {
+                        configurable: true,
+                        enumerable: true,
+                        get() {
+                            return context[hidden];
+                        },
+                        set(v) {
+                            context[hidden] = v;
+                            applyLocationFromBase(v);
+                        },
+                    });
+                }
+                applyLocationFromBase(context[hidden]);
+            } catch (_) {}
+        };
+        [
+            'MY_URL',
+            '__BASEURL__',
+            'baseURL',
+            'baseUrl',
+            'HOST',
+            'host',
+            'DOMAIN',
+            'domain',
+            'ORIGIN',
+            'origin',
+        ].forEach(defineSyncProp);
+    } catch (_) {}
+
     // Fix `TypeError: Invalid URL` for browser-ported scripts that call `new URL("/path")`
     // or `new URL("//host/path")` without a base.
     // This is based on runtime-provided bases (e.g. `location.href`, `MY_URL`, or explicit host strings),
