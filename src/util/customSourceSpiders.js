@@ -1116,6 +1116,12 @@ function isPkgRuntime() {
     }
 }
 
+function isPanRuntimeScriptDownloadDisabled() {
+    const raw = typeof process.env.DISABLE__RUNTIME_DOWNLOAD === 'string' ? process.env.DISABLE__RUNTIME_DOWNLOAD : '';
+    const s = String(raw || '').trim().toLowerCase();
+    return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+}
+
 function readJsonFileSafe(filePath) {
     try {
         if (!filePath || !fs.existsSync(filePath)) return null;
@@ -1266,6 +1272,7 @@ function commitStagedFilesWithRollback(staged, options = {}) {
 async function ensurePanRuntimeScripts(customSpiderDir) {
     if (!isPkgRuntime()) return { action: 'none' };
     if (!customSpiderDir) return { action: 'none' };
+    if (isPanRuntimeScriptDownloadDisabled()) return { action: 'disabled' };
 
     const panDir = path.resolve(customSpiderDir, 'pan');
     try {
