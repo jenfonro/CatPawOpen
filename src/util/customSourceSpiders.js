@@ -426,7 +426,7 @@ function wrapAxiosForTrace(axios, filePath, options = {}) {
                             !!url &&
                             (url.startsWith('/') || url.startsWith('./') || url.startsWith('../') || url.startsWith('?'));
                         if (!hasBase && isRelative && getRuntimeBaseURL) {
-                            const base = String(getRuntimeBaseURL() || '').trim();
+                            const base = String(getRuntimeBaseURL(url) || '').trim();
                             if (base.startsWith('http://') || base.startsWith('https://')) {
                                 cfg.baseURL = base;
                             }
@@ -2327,7 +2327,7 @@ async function loadOneFile(filePath) {
     const code = fs.readFileSync(filePath, 'utf8');
     const baseRequire = createRequire(filePath);
     let vmContextRef = null;
-    const getRuntimeBaseURL = () => {
+    const getRuntimeBaseURL = (relativeUrl) => {
         try {
             const ctx = vmContextRef;
             if (!ctx || typeof ctx !== 'object') return '';
@@ -2361,6 +2361,98 @@ async function loadOneFile(filePath) {
                 if (!v.includes('://') && /^[a-zA-Z0-9.-]+(?::\\d+)?$/.test(v)) v = `https://${v}`;
                 if (v.startsWith('http://') || v.startsWith('https://')) return v.replace(/\\/+$/g, '');
             }
+
+            // Heuristic: try to locate a base URL from script runtime objects keyed by the first path segment.
+            // Example: url="/dongli/list.php?..." => look for `dongli` config objects containing a host/origin string.
+            const rel = typeof relativeUrl === 'string' ? relativeUrl.trim() : '';
+            if (rel.startsWith('/')) {
+                const seg = rel.split('?')[0].split('#')[0].split('/').filter(Boolean)[0] || '';
+                const siteKey = String(seg || '').trim().toLowerCase();
+                const looksLikeHost = (s) => /^[a-zA-Z0-9.-]+(?::\d+)?$/.test(s);
+                const normalize = (raw) => {
+                    let s = typeof raw === 'string' ? raw.trim() : '';
+                    if (!s) return '';
+                    if (s.startsWith('//')) s = `https:${s}`;
+                    if (!s.includes('://') && looksLikeHost(s)) s = `https://${s}`;
+                    if (!(s.startsWith('http://') || s.startsWith('https://'))) return '';
+                    return s.replace(/\\/+$/g, '');
+                };
+                const scanObjForBase = (obj) => {
+                    if (!obj || typeof obj !== 'object') return '';
+                    const keys = (() => {
+                        try {
+                            return Object.keys(obj);
+                        } catch (_) {
+                            return [];
+                        }
+                    })();
+                    for (const k of keys.slice(0, 200)) {
+                        let v;
+                        try {
+                            v = obj[k];
+                        } catch (_) {
+                            v = undefined;
+                        }
+                        if (typeof v === 'string') {
+                            const n = normalize(v);
+                            if (n) return n;
+                        }
+                    }
+                    return '';
+                };
+                const findByKey = (root) => {
+                    const seen = new WeakSet();
+                    const queue = [root];
+                    let steps = 0;
+                    while (queue.length && steps < 5000) {
+                        const cur = queue.shift();
+                        steps += 1;
+                        if (!cur || typeof cur !== 'object') continue;
+                        if (seen.has(cur)) continue;
+                        seen.add(cur);
+                        let keys;
+                        try {
+                            keys = Object.keys(cur);
+                        } catch (_) {
+                            keys = null;
+                        }
+                        if (!keys || keys.length > 500) continue;
+                        for (const k of keys) {
+                            let v;
+                            try {
+                                v = cur[k];
+                            } catch (_) {
+                                v = undefined;
+                            }
+                            const kk = String(k || '').toLowerCase();
+                            if (siteKey && kk === siteKey) {
+                                if (typeof v === 'string') {
+                                    const n = normalize(v);
+                                    if (n) return n;
+                                }
+                                const nested = scanObjForBase(v);
+                                if (nested) return nested;
+                            }
+                            if (typeof v === 'string' && siteKey && kk.includes(siteKey)) {
+                                const n = normalize(v);
+                                if (n) return n;
+                            }
+                            if (v && typeof v === 'object') {
+                                if (Array.isArray(v)) {
+                                    if (v.length <= 50) queue.push(v);
+                                } else {
+                                    queue.push(v);
+                                }
+                            }
+                        }
+                    }
+                    return '';
+                };
+                if (siteKey) {
+                    const inferred = findByKey(ctx) || (ctx.globalThis ? findByKey(ctx.globalThis) : '');
+                    if (inferred) return inferred;
+                }
+            }
         } catch (_) {}
         return '';
     };
@@ -2385,6 +2477,27 @@ async function loadOneFile(filePath) {
     const script = new vm.Script(code, { filename: filePath });
     const timeoutMs = Number.parseInt(process.env.CATPAW_CUSTOM_SOURCE_TIMEOUT_MS || '', 10);
     script.runInContext(context, { timeout: Number.isFinite(timeoutMs) ? timeoutMs : 120000 });
+
+    // Some large bundles ship their own axios instance (not loaded via require('axios')), often assigned to
+    // a global like `L2`. Wrap any axios-like globals so relative URLs can pick up a runtime baseURL.
+    try {
+        const keys = Object.keys(context);
+        keys.slice(0, 2000).forEach((k) => {
+            try {
+                const v = context[k];
+                const isAxiosLike =
+                    typeof v === 'function' &&
+                    v &&
+                    typeof v.request === 'function' &&
+                    v.interceptors &&
+                    v.interceptors.request &&
+                    v.interceptors.response;
+                if (!isAxiosLike) return;
+                const wrapped = wrapAxiosForTrace(v, filePath, { getRuntimeBaseURL });
+                if (wrapped && wrapped !== v) context[k] = wrapped;
+            } catch (_) {}
+        });
+    } catch (_) {}
     // Some bundled scripts expect an internal persistent store (`kO`) to exist and call `kO.push(...)`.
     // In server-only mode the store may be null, causing crashes like:
     // "TypeError: Cannot read properties of null (reading 'push')".
