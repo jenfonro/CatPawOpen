@@ -351,6 +351,62 @@ function wrapAxiosForTrace(axios, filePath, options = {}) {
             return `${baseURL || ''}${url || ''}`;
         }
     };
+
+    // Some bundles keep their origin/domain only in source (or in a bridge not available in server-only mode),
+    // but still call axios with relative URLs like `/dongli/list.php?...`.
+    // As a last-resort, infer a base origin from the script text by looking for absolute URLs that contain the
+    // same path prefix (e.g. `https://example.com/dongli/...`).
+    const inferBaseURLFromScriptForUrl = (() => {
+        const cache = new Map(); // key = `${filePath}|${prefix}` -> baseURL
+        const normalizeOrigin = (raw) => {
+            const s = typeof raw === 'string' ? raw.trim() : '';
+            if (!s) return '';
+            if (s.startsWith('//')) return `https:${s}`;
+            return s;
+        };
+        const pickPrefix = (url) => {
+            const u = typeof url === 'string' ? url.trim() : '';
+            if (!u.startsWith('/')) return '';
+            // Use first segment as prefix: `/dongli/...` => `/dongli/`
+            const parts = u.split('?')[0].split('#')[0].split('/').filter(Boolean);
+            if (!parts.length) return '';
+            return `/${parts[0]}/`;
+        };
+        const infer = (url) => {
+            const prefix = pickPrefix(url);
+            if (!prefix) return '';
+            const key = `${String(filePath || '')}|${prefix}`;
+            if (cache.has(key)) return cache.get(key) || '';
+
+            let base = '';
+            try {
+                const text = fs.readFileSync(String(filePath || ''), 'utf8');
+                // Fast scan: find the first absolute URL containing the prefix.
+                // Keep it conservative: only accept URLs where the path part contains `/<segment>/`.
+                const re = /https?:\/\/[^\s"'`<>]+/g;
+                let m;
+                // eslint-disable-next-line no-cond-assign
+                while ((m = re.exec(text))) {
+                    const full = String(m[0] || '');
+                    if (!full.includes(prefix)) continue;
+                    try {
+                        const u = new URL(full);
+                        if (u && u.origin && u.pathname && u.pathname.includes(prefix)) {
+                            base = u.origin;
+                            break;
+                        }
+                    } catch (_) {}
+                }
+            } catch (_) {
+                base = '';
+            }
+
+            base = normalizeOrigin(base);
+            cache.set(key, base);
+            return base;
+        };
+        return infer;
+    })();
     const attach = (inst) => {
         try {
             if (!inst || !inst.interceptors || !inst.interceptors.request || !inst.interceptors.response) return inst;
@@ -374,6 +430,14 @@ function wrapAxiosForTrace(axios, filePath, options = {}) {
                             if (base.startsWith('http://') || base.startsWith('https://')) {
                                 cfg.baseURL = base;
                             }
+                        }
+                        // Still no base? Try infer from script source (path-prefix anchored).
+                        const finalHasBase =
+                            (typeof cfg.baseURL === 'string' && cfg.baseURL.trim()) ||
+                            (typeof cfg.baseUrl === 'string' && cfg.baseUrl.trim());
+                        if (!finalHasBase && isRelative) {
+                            const inferred = inferBaseURLFromScriptForUrl(url);
+                            if (inferred) cfg.baseURL = inferred;
                         }
                     }
                     const full = safeUrlFromConfig(cfg);
