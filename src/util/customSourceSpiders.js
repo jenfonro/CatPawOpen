@@ -750,6 +750,11 @@ function detectCustomScriptFormat(filePath) {
         return 'vm';
     }
 }
+
+// NOTE: We intentionally do not attempt to infer a base domain from script source.
+// Some large bundles contain many unrelated URLs (CDNs, APIs, samples), and guessing a single origin
+// can easily route traffic to the wrong host. For relative URL compatibility, prefer the base values
+// actually present in the script runtime (e.g. `location.href`, `MY_URL`, configured host strings).
 const spiderAutoInitState = new Map();
 function parseStandardSpiderPath(pathname) {
     const raw = typeof pathname === 'string' ? pathname : '';
@@ -1654,7 +1659,7 @@ function extractWebsiteWebPlugins(websiteBundleFn, requireFunc, filePath) {
     return plugins;
 }
 function buildVmContext(requireFunc, filePath) {
-    const { URL, URLSearchParams, TextEncoder, TextDecoder } = globalThis;
+    const { URL: NativeURL, URLSearchParams, TextEncoder, TextDecoder } = globalThis;
     let webStreams = {};
     try {
         try {
@@ -1729,7 +1734,7 @@ function buildVmContext(requireFunc, filePath) {
         Buffer,
         __filename: filename,
         __dirname: dirname,
-        URL,
+        URL: NativeURL,
         URLSearchParams,
         TextEncoder,
         TextDecoder,
@@ -1810,6 +1815,113 @@ function buildVmContext(requireFunc, filePath) {
         context.globalThis = context;
         context.global = context;
         context.window = context;
+    } catch (_) {}
+    // Provide a minimal browser-like `location` object; scripts may overwrite it.
+    try {
+        if (!context.location) {
+            context.location = { href: '', origin: '', protocol: '', host: '', hostname: '', pathname: '/', search: '', hash: '' };
+        }
+        if (!context.document) context.document = {};
+        if (!context.document.location) context.document.location = context.location;
+    } catch (_) {}
+
+    // Fix `TypeError: Invalid URL` for browser-ported scripts that call `new URL("/path")`
+    // or `new URL("//host/path")` without a base.
+    // This is based on runtime-provided bases (e.g. `location.href`, `MY_URL`, or explicit host strings),
+    // not "last request" history.
+    try {
+        const normalizeBase = (raw) => {
+            const s = typeof raw === 'string' ? raw.trim() : '';
+            if (!s) return '';
+            const lowered = s.toLowerCase();
+            if (lowered === 'undefined' || lowered === 'null') return '';
+            if (s.startsWith('//')) return `https:${s}`;
+            if (!s.includes('://') && /^[a-zA-Z0-9.-]+(?::\d+)?$/.test(s)) return `https://${s}`;
+            return s;
+        };
+        const isRelativeLike = (raw) => {
+            const s = typeof raw === 'string' ? raw.trim() : '';
+            if (!s) return false;
+            if (s.startsWith('/') || s.startsWith('./') || s.startsWith('../')) return true;
+            if (s.startsWith('//')) return true;
+            if (!s.includes('://') && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s)) return true;
+            return false;
+        };
+        const pickRuntimeBase = () => {
+            const tryGet = (getter) => {
+                try {
+                    return normalizeBase(getter());
+                } catch (_) {
+                    return '';
+                }
+            };
+            const candidates = [
+                () => context && context.location && context.location.href,
+                () => context && context.location && context.location.origin,
+                () => context && context.document && context.document.location && context.document.location.href,
+                () => context && context.document && context.document.location && context.document.location.origin,
+                () => context && context.MY_URL,
+                () => context && context.globalThis && context.globalThis.MY_URL,
+                () => context && context.__BASEURL__,
+                () => context && context.baseURL,
+                () => context && context.baseUrl,
+                () => context && context.host,
+                () => context && context.HOST,
+                () => context && context.domain,
+                () => context && context.DOMAIN,
+                () => context && context.origin,
+                () => context && context.ORIGIN,
+            ];
+            for (const g of candidates) {
+                const v = tryGet(g);
+                if (v && v.includes('://')) return v;
+            }
+            // Last-resort: scan a few obvious keys for an absolute base.
+            try {
+                const keys = Object.keys(context || {});
+                for (let i = 0; i < Math.min(keys.length, 200); i += 1) {
+                    const k = keys[i];
+                    if (!/(base|host|domain|origin)/i.test(k)) continue;
+                    const v = normalizeBase(context[k]);
+                    if (v && v.includes('://')) return v;
+                }
+            } catch (_) {}
+            return '';
+        };
+        class URLCompat extends NativeURL {
+            constructor(input, base) {
+                const raw = String(input == null ? '' : input).trim();
+                if (base === undefined) {
+                    if (raw.startsWith('//')) {
+                        super(`https:${raw}`);
+                        return;
+                    }
+                    if (isRelativeLike(raw)) {
+                        const b = pickRuntimeBase();
+                        if (b) {
+                            super(raw, b);
+                            return;
+                        }
+                    }
+                    super(raw);
+                    return;
+                }
+                const nb = normalizeBase(String(base == null ? '' : base));
+                if (raw.startsWith('//') && !nb) {
+                    super(`https:${raw}`);
+                    return;
+                }
+                super(raw, nb || String(base));
+            }
+        }
+        try {
+            if (typeof NativeURL.canParse === 'function') URLCompat.canParse = NativeURL.canParse.bind(NativeURL);
+            if (typeof NativeURL.parse === 'function') URLCompat.parse = NativeURL.parse.bind(NativeURL);
+            if (typeof NativeURL.createObjectURL === 'function') URLCompat.createObjectURL = NativeURL.createObjectURL.bind(NativeURL);
+            if (typeof NativeURL.revokeObjectURL === 'function') URLCompat.revokeObjectURL = NativeURL.revokeObjectURL.bind(NativeURL);
+        } catch (_) {}
+        context.URL = URLCompat;
+        if (context.globalThis) context.globalThis.URL = URLCompat;
     } catch (_) {}
     // Prevent scripts from overwriting critical shims.
     try {
