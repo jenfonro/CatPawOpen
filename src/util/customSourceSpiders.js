@@ -1822,7 +1822,21 @@ function buildVmContext(requireFunc, filePath) {
         })();
     const filename = filePath ? path.resolve(filePath) : '';
     const dirname = filename ? path.dirname(filename) : process.cwd();
-    const baseMessageToDart = async () => [];
+    const baseMessageToDart = async (msg) => {
+        const m = msg && typeof msg === 'object' && !Array.isArray(msg) ? msg : {};
+        const action = typeof m.action === 'string' ? m.action : '';
+        if (action === 'queryProfile') {
+            const root = readDbJsonSafeCached();
+            return root && typeof root === 'object' ? root : {};
+        }
+        if (action === 'saveProfile') {
+            // Server-only mode: allow scripts to "save" profile without a Dart side.
+            // We keep it as a no-op to avoid unexpected overwrites; scripts usually only need this call not to throw.
+            return { ok: true };
+        }
+        // Unknown action: keep silent.
+        return null;
+    };
     const ctx = {
         console,
         process,
