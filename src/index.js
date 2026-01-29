@@ -253,6 +253,7 @@ function ensureConfigDefaults(config) {
 export async function start(config) {
     console.log(`catpawopen version : ${getCatPawOpenVersion()}`);
     await ensureFetchPolyfill();
+    const enableLogger = process.env.NODE_ENV !== 'development';
     const timeoutRaw =
         (typeof process.env.CATPAW_PLUGIN_TIMEOUT_MS === 'string' && process.env.CATPAW_PLUGIN_TIMEOUT_MS) ||
         (typeof process.env.CATPAWOPEN_PLUGIN_TIMEOUT_MS === 'string' && process.env.CATPAWOPEN_PLUGIN_TIMEOUT_MS) ||
@@ -273,7 +274,22 @@ export async function start(config) {
     server = fastify({
         serverFactory: catServerFactory,
         forceCloseConnections: true,
-        logger: !!(process.env.NODE_ENV !== 'development'),
+        logger: enableLogger
+            ? {
+                  level: 'info',
+                  redact: {
+                      // Avoid huge logs (e.g. axios error objects embed agents/sockets/certs).
+                      paths: [
+                          'req.headers.authorization',
+                          'req.headers.cookie',
+                          'err.config',
+                          'err.request',
+                          'err.response',
+                      ],
+                      remove: true,
+                  },
+              }
+            : false,
         maxParamLength: 10240,
         ...(pluginTimeoutMs > 0 ? { pluginTimeout: pluginTimeoutMs } : {}),
     });
@@ -300,7 +316,11 @@ export async function start(config) {
         return result;
     };
     server.addHook('onError', async (_request, _reply, error) => {
-        console.error(error);
+        try {
+            // Keep logs small: some thrown objects (e.g. axios errors) contain huge nested config/agent state.
+            // eslint-disable-next-line no-console
+            console.error(error && error.stack ? error.stack : error);
+        } catch (_) {}
         if (!error.statusCode) error.statusCode = 500;
         return error;
     });
