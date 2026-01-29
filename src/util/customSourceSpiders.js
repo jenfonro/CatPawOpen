@@ -205,6 +205,24 @@ function pickHeaderValue(headers, name) {
     }
     return '';
 }
+
+function pickForwardedFirst(value) {
+    if (typeof value !== 'string') return '';
+    const first = value.split(',')[0];
+    return String(first || '').trim();
+}
+
+function getExternalOriginFromFastifyRequest(req) {
+    const headers = (req && req.headers) || {};
+    const proto = pickForwardedFirst(pickHeaderValue(headers, 'x-forwarded-proto')) || '';
+    const host =
+        pickForwardedFirst(pickHeaderValue(headers, 'x-forwarded-host')) ||
+        pickForwardedFirst(pickHeaderValue(headers, 'host')) ||
+        '';
+    if (!host) return '';
+    const scheme = proto === 'https' || proto === 'http' ? proto : 'http';
+    return `${scheme}://${host}`;
+}
 function maskCookieForLog(cookieStr) {
     const keys = parseCookieKeys(cookieStr);
     if (!keys.length) return '';
@@ -690,6 +708,17 @@ function wrapNodeHttpForTrace(mod, filePath, defaultScheme) {
                         const respChunks = [];
                         let respBytes = 0;
                         const RESP_MAX = 2048;
+                        const respHeaders = (res && res.headers && typeof res.headers === 'object') ? res.headers : {};
+                        const respCt = pickHeaderValue(respHeaders, 'content-type').toLowerCase();
+                        const respCe = pickHeaderValue(respHeaders, 'content-encoding').toLowerCase();
+                        const isCompressed = /\b(gzip|br|deflate)\b/i.test(respCe);
+                        const isTextLike =
+                            respCt.startsWith('text/') ||
+                            respCt.includes('application/json') ||
+                            respCt.includes('+json') ||
+                            respCt.includes('xml') ||
+                            respCt.includes('javascript') ||
+                            respCt.includes('application/x-www-form-urlencoded');
                         res.on('data', (d) => {
                             try {
                                 if (!d) return;
@@ -703,11 +732,20 @@ function wrapNodeHttpForTrace(mod, filePath, defaultScheme) {
                         });
                         res.on('end', () => {
                             try {
-                                const text = respChunks.length ? Buffer.concat(respChunks).toString('utf8') : '';
+                                let body = undefined;
+                                if (respChunks.length) {
+                                    if (isCompressed) body = `${respCe || 'compressed'}(${respBytes} bytes)`;
+                                    else if (isTextLike) {
+                                        const text = Buffer.concat(respChunks).toString('utf8');
+                                        body = text ? text.slice(0, 400) : undefined;
+                                    } else {
+                                        body = `binary(${respBytes} bytes)`;
+                                    }
+                                }
                                 // eslint-disable-next-line no-console
                                 console.log(tag, 'res', status, info.urlStr || info.pathName || '', {
                                     ...pickHeadersForLog(headerMap, info.hostHeader || info.hostname),
-                                    body: text ? text.slice(0, 400) : undefined,
+                                    ...(body !== undefined ? { body } : {}),
                                 });
                             } catch (_) {}
                         });
@@ -1987,9 +2025,17 @@ function buildVmContext(requireFunc, filePath) {
         };
         const formatConsoleArg = (arg) => {
             try {
+                if (typeof arg === 'string' && arg.length > 2000) return `${arg.slice(0, 2000)}...(${arg.length})`;
+                const isAxiosishObj = (x) => {
+                    if (!x || typeof x !== 'object') return false;
+                    try {
+                        return !!x.isAxiosError || !!(x.config || x.request || x.response);
+                    } catch (_) {
+                        return false;
+                    }
+                };
                 if (arg instanceof Error) {
-                    const isAxiosish = !!arg.isAxiosError || !!(arg.config || arg.request || arg.response);
-                    if (isAxiosish) {
+                    if (isAxiosishObj(arg)) {
                         const brief = formatAxiosishError(arg);
                         return brief || arg.stack || arg.message || String(arg);
                     }
@@ -1997,6 +2043,14 @@ function buildVmContext(requireFunc, filePath) {
                 }
                 if (Buffer.isBuffer(arg)) return `Buffer(${arg.length})`;
                 if (arg && typeof arg === 'object') {
+                    if (isAxiosishObj(arg)) {
+                        const brief = formatAxiosishError(arg);
+                        if (brief) return brief;
+                    }
+                    const name = typeof arg.name === 'string' ? arg.name : '';
+                    const message = typeof arg.message === 'string' ? arg.message : '';
+                    const stack = typeof arg.stack === 'string' ? arg.stack : '';
+                    if ((name && message) || stack) return stack || `${name || 'Error'}: ${message || ''}`.trim();
                     return inspect(arg, { depth: 2, maxArrayLength: 20, maxStringLength: 200, breakLength: 120, compact: true });
                 }
             } catch (_) {}
@@ -2186,10 +2240,10 @@ function buildVmContext(requireFunc, filePath) {
 	            if (!head) return false;
 	            return /\.(php|jsp|aspx|html?|js|json|txt|xml)$/i.test(head);
 	        };
-	        class URLCompat extends NativeURL {
-	            constructor(input, base) {
-	                const raw = String(input == null ? '' : input).trim();
-	                if (base === undefined) {
+        class URLCompat extends NativeURL {
+            constructor(input, base) {
+                const raw = String(input == null ? '' : input).trim();
+                if (base === undefined) {
 	                    if (raw.startsWith('//')) {
 	                        const b = pickRuntimeBase();
 	                        if (isDoubleSlashPathLike(raw) && b) {
@@ -2213,10 +2267,24 @@ function buildVmContext(requireFunc, filePath) {
 	                    super(raw);
 	                    return;
 	                }
-	                const baseRaw = String(base == null ? '' : base);
-	                const nb = normalizeBase(baseRaw);
-	                const runtimeBase = pickRuntimeBase();
-	                const effectiveBase = nb || runtimeBase;
+                const baseRaw = String(base == null ? '' : base);
+                const nb = normalizeBase(baseRaw);
+                const runtimeBase = pickRuntimeBase();
+                const effectiveBase = nb || runtimeBase;
+                const isLocalhostBase = (b) => {
+                    const s = typeof b === 'string' ? b.trim().toLowerCase() : '';
+                    if (!s) return false;
+                    return (
+                        s.startsWith('http://localhost') ||
+                        s.startsWith('https://localhost') ||
+                        s.startsWith('http://127.0.0.1') ||
+                        s.startsWith('https://127.0.0.1') ||
+                        s.startsWith('http://0.0.0.0') ||
+                        s.startsWith('https://0.0.0.0') ||
+                        s.startsWith('http://[::1]') ||
+                        s.startsWith('https://[::1]')
+                    );
+                };
 
 	                if (raw.startsWith('//')) {
 	                    if (isDoubleSlashPathLike(raw) && effectiveBase) {
@@ -2232,15 +2300,17 @@ function buildVmContext(requireFunc, filePath) {
 	                    }
 	                }
 
-	                // Some scripts pass `''/null/undefined` as base by mistake; fall back to runtime-provided base.
-	                if (isRelativeLike(raw) && !nb && runtimeBase) {
-	                    super(raw, runtimeBase);
-	                    return;
-	                }
+                // Some scripts pass `''/null/undefined` as base by mistake; fall back to runtime-provided base.
+                if (isRelativeLike(raw)) {
+                    if ((!nb && runtimeBase) || (runtimeBase && isLocalhostBase(nb))) {
+                        super(raw, runtimeBase);
+                        return;
+                    }
+                }
 
-	                super(raw, nb || baseRaw);
-	            }
-	        }
+                super(raw, nb || baseRaw);
+            }
+        }
         try {
             if (typeof NativeURL.canParse === 'function') URLCompat.canParse = NativeURL.canParse.bind(NativeURL);
             if (typeof NativeURL.parse === 'function') URLCompat.parse = NativeURL.parse.bind(NativeURL);
@@ -2781,36 +2851,33 @@ async function loadOneFile(filePath) {
                 spider.api = async (instance, opts) => {
                     instance.addHook('onRequest', async (req, _reply) => {
                         try {
-                            // Optional override: allow users to provide a base origin for a spider in db.json:
-                            // {
-                            //   "spiderBase": { "dongli": "https://example.com" }
-                            // }
-                            // This is only used when the script itself doesn't expose a base origin and would otherwise
-                            // fall back to `http://localhost/...` for relative URLs.
-                            try {
-                                const base = readSpiderBaseOverrideFromDbJson(spider && spider.meta ? spider.meta.key : '');
-                                const ctx = spider && spider.__cp_vm_context ? spider.__cp_vm_context : null;
-                                if (base && ctx && typeof ctx === 'object') {
-                                    try {
-                                        ctx.MY_URL = base;
-                                    } catch (_) {}
-                                    try {
-                                        ctx.baseURL = base;
-                                    } catch (_) {}
-                                    try {
-                                        if (ctx.location && typeof ctx.location === 'object') {
-                                            ctx.location.href = base;
-                                            ctx.location.origin = base;
-                                        }
-                                    } catch (_) {}
-                                    try {
-                                        if (ctx.globalThis && ctx.globalThis.location && typeof ctx.globalThis.location === 'object') {
-                                            ctx.globalThis.location.href = base;
-                                            ctx.globalThis.location.origin = base;
-                                        }
-                                    } catch (_) {}
-                                }
-                            } catch (_) {}
+                            // Ensure browser-ported bundles don't fall back to `http://localhost` for relative URLs.
+                            // Set `location/MY_URL/baseURL` based on the *actual* origin used to access this server.
+                            const base = getExternalOriginFromFastifyRequest(req);
+                            const ctx = spider && spider.__cp_vm_context ? spider.__cp_vm_context : null;
+                            if (base && ctx && typeof ctx === 'object') {
+                                try {
+                                    ctx.MY_URL = base;
+                                } catch (_) {}
+                                try {
+                                    ctx.__BASEURL__ = base;
+                                } catch (_) {}
+                                try {
+                                    ctx.baseURL = base;
+                                } catch (_) {}
+                                try {
+                                    if (ctx.location && typeof ctx.location === 'object') {
+                                        ctx.location.href = base;
+                                        ctx.location.origin = base;
+                                    }
+                                } catch (_) {}
+                                try {
+                                    if (ctx.globalThis && ctx.globalThis.location && typeof ctx.globalThis.location === 'object') {
+                                        ctx.globalThis.location.href = base;
+                                        ctx.globalThis.location.origin = base;
+                                    }
+                                } catch (_) {}
+                            }
                             await ensureSpiderInitOnceForRequest(req);
                         } catch (_) {}
                     });
