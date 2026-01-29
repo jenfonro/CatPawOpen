@@ -331,11 +331,13 @@ function wrapFetchForTrace(fetchImpl, filePath) {
     } catch (_) {}
     return wrapped;
 }
-function wrapAxiosForTrace(axios, filePath) {
+function wrapAxiosForTrace(axios, filePath, options = {}) {
     const enabled = process.env.NET_DEBUG === '1';
     const sitesDebug = isSpiderDebugEnabled();
     if (!axios || typeof axios !== 'function') return axios;
     if (axios.__cp_traced) return axios;
+    const opts = options && typeof options === 'object' ? options : {};
+    const getRuntimeBaseURL = typeof opts.getRuntimeBaseURL === 'function' ? opts.getRuntimeBaseURL : null;
     const tag = `[trace:${path.basename(String(filePath || 'custom'))}]`;
     const sitesTag = `[sites:${getCustomScriptFileNameForLog(filePath) || path.basename(String(filePath || 'custom'))}]`;
     const safeUrlFromConfig = (cfg) => {
@@ -356,6 +358,24 @@ function wrapAxiosForTrace(axios, filePath) {
             inst.__cp_traced = true;
             inst.interceptors.request.use((cfg) => {
                 try {
+                    // Some browser-ported bundles call axios with relative URLs (e.g. "/dongli/list.php?...") and rely on
+                    // a runtime-provided origin (location/MY_URL/etc.). When executed via Node's http adapter, a missing
+                    // baseURL can fall back to `http://localhost/...` and break requests.
+                    if (cfg && typeof cfg === 'object') {
+                        const hasBase =
+                            (typeof cfg.baseURL === 'string' && cfg.baseURL.trim()) ||
+                            (typeof cfg.baseUrl === 'string' && cfg.baseUrl.trim());
+                        const url = typeof cfg.url === 'string' ? cfg.url.trim() : '';
+                        const isRelative =
+                            !!url &&
+                            (url.startsWith('/') || url.startsWith('./') || url.startsWith('../') || url.startsWith('?'));
+                        if (!hasBase && isRelative && getRuntimeBaseURL) {
+                            const base = String(getRuntimeBaseURL() || '').trim();
+                            if (base.startsWith('http://') || base.startsWith('https://')) {
+                                cfg.baseURL = base;
+                            }
+                        }
+                    }
                     const full = safeUrlFromConfig(cfg);
                     try {
                         const headers = (cfg && cfg.headers && typeof cfg.headers === 'object') ? cfg.headers : {};
@@ -642,6 +662,16 @@ function wrapNodeHttpForTrace(mod, filePath, defaultScheme) {
 function detectCustomScriptFormat(filePath) {
     const filename = typeof filePath === 'string' ? filePath : '';
     if (!filename) return 'vm';
+    // Online scripts (custom_spider/online/*) are downloaded "runtime bundles" that often assume a browser-like
+    // runtime (location, fetch, messageToDart, etc.). Even if the file text looks like CJS (e.g. it assigns
+    // `module.exports`), executing it via Node's `require()` can make HTTP clients (axios) treat relative URLs
+    // as `http://localhost/...` and break spiders like `/spider/dongli/3/category`.
+    //
+    // Force VM execution for these online bundles so we can provide a consistent runtime surface.
+    try {
+        const normalized = filename.split(path.sep).join('/');
+        if (normalized.includes('/custom_spider/online/')) return 'vm';
+    } catch (_) {}
     const stripStringsAndComments = (input) => {
         const src = typeof input === 'string' ? input : '';
         let out = '';
@@ -2232,10 +2262,48 @@ async function loadOneFile(filePath) {
     }
     const code = fs.readFileSync(filePath, 'utf8');
     const baseRequire = createRequire(filePath);
+    let vmContextRef = null;
+    const getRuntimeBaseURL = () => {
+        try {
+            const ctx = vmContextRef;
+            if (!ctx || typeof ctx !== 'object') return '';
+            const candidates = [
+                () => ctx.location && ctx.location.origin,
+                () => ctx.location && ctx.location.href,
+                () => ctx.document && ctx.document.location && ctx.document.location.origin,
+                () => ctx.document && ctx.document.location && ctx.document.location.href,
+                () => ctx.MY_URL,
+                () => ctx.__BASEURL__,
+                () => ctx.baseURL,
+                () => ctx.baseUrl,
+                () => ctx.ORIGIN,
+                () => ctx.origin,
+                () => (ctx.globalThis ? ctx.globalThis.MY_URL : ''),
+                () => (ctx.globalThis ? ctx.globalThis.__BASEURL__ : ''),
+                () => (ctx.globalThis ? ctx.globalThis.baseURL : ''),
+                () => (ctx.globalThis ? ctx.globalThis.baseUrl : ''),
+                () => (ctx.globalThis ? ctx.globalThis.ORIGIN : ''),
+                () => (ctx.globalThis ? ctx.globalThis.origin : ''),
+            ];
+            for (const fn of candidates) {
+                let v = '';
+                try {
+                    v = String(fn() || '').trim();
+                } catch (_) {
+                    v = '';
+                }
+                if (!v) continue;
+                if (v.startsWith('//')) v = `https:${v}`;
+                if (!v.includes('://') && /^[a-zA-Z0-9.-]+(?::\\d+)?$/.test(v)) v = `https://${v}`;
+                if (v.startsWith('http://') || v.startsWith('https://')) return v.replace(/\\/+$/g, '');
+            }
+        } catch (_) {}
+        return '';
+    };
     const requireFunc = (() => {
         const fn = (id) => {
             const mod = baseRequire(id);
-            if (id === 'axios') return wrapAxiosForTrace(mod, filePath);
+            if (id === 'axios') return wrapAxiosForTrace(mod, filePath, { getRuntimeBaseURL });
             if (id === 'http' || id === 'node:http') return wrapNodeHttpForTrace(mod, filePath, 'http');
             if (id === 'https' || id === 'node:https') return wrapNodeHttpForTrace(mod, filePath, 'https');
             return mod;
@@ -2249,6 +2317,7 @@ async function loadOneFile(filePath) {
         return fn;
     })();
     const context = buildVmContext(requireFunc, filePath);
+    vmContextRef = context;
     const script = new vm.Script(code, { filename: filePath });
     const timeoutMs = Number.parseInt(process.env.CATPAW_CUSTOM_SOURCE_TIMEOUT_MS || '', 10);
     script.runInContext(context, { timeout: Number.isFinite(timeoutMs) ? timeoutMs : 120000 });
