@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import vm from 'vm';
 import crypto from 'node:crypto';
+import { inspect } from 'node:util';
 import { createRequire } from 'module';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { getCurrentTvUser, sanitizeTvUsername } from './tvUserContext.js';
@@ -1816,6 +1817,64 @@ function buildVmContext(requireFunc, filePath) {
         context.global = context;
         context.window = context;
     } catch (_) {}
+
+    // Sanitize VM console output to avoid log explosions (e.g. axios errors with huge `request/response` objects).
+    try {
+        const baseConsole = console;
+        const formatAxiosishError = (err) => {
+            try {
+                const e = err && typeof err === 'object' ? err : null;
+                if (!e) return '';
+                const message = typeof e.message === 'string' ? e.message : '';
+                const code = typeof e.code === 'string' ? e.code : typeof e.errno === 'string' ? e.errno : '';
+                const status = e.response && typeof e.response.status === 'number' ? e.response.status : 0;
+                const url = e.config && typeof e.config === 'object' && typeof e.config.url === 'string' ? e.config.url : '';
+                const parts = [];
+                if (message) parts.push(message);
+                if (code) parts.push(`code=${code}`);
+                if (status) parts.push(`status=${status}`);
+                if (url) parts.push(`url=${url.length > 300 ? `${url.slice(0, 300)}...(${url.length})` : url}`);
+                return parts.join(' ');
+            } catch (_) {
+                return '';
+            }
+        };
+        const formatConsoleArg = (arg) => {
+            try {
+                if (arg instanceof Error) {
+                    const isAxiosish = !!arg.isAxiosError || !!(arg.config || arg.request || arg.response);
+                    if (isAxiosish) {
+                        const brief = formatAxiosishError(arg);
+                        return brief || arg.stack || arg.message || String(arg);
+                    }
+                    return arg.stack || arg.message || String(arg);
+                }
+                if (Buffer.isBuffer(arg)) return `Buffer(${arg.length})`;
+                if (arg && typeof arg === 'object') {
+                    return inspect(arg, { depth: 2, maxArrayLength: 20, maxStringLength: 200, breakLength: 120, compact: true });
+                }
+            } catch (_) {}
+            return arg;
+        };
+        const wrap = (level) => {
+            const fn = baseConsole && typeof baseConsole[level] === 'function' ? baseConsole[level] : baseConsole.log;
+            return (...args) => {
+                try {
+                    fn.apply(baseConsole, Array.isArray(args) ? args.map(formatConsoleArg) : []);
+                } catch (_) {}
+            };
+        };
+        context.console = {
+            ...baseConsole,
+            log: wrap('log'),
+            info: wrap('info'),
+            warn: wrap('warn'),
+            error: wrap('error'),
+            debug: wrap('debug'),
+        };
+        context.globalThis.console = context.console;
+    } catch (_) {}
+
     // Provide a minimal browser-like `location` object; scripts may overwrite it.
     try {
         if (!context.location) {
@@ -1847,7 +1906,7 @@ function buildVmContext(requireFunc, filePath) {
             if (!s.includes('://') && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s)) return true;
             return false;
         };
-        const pickRuntimeBase = () => {
+	        const pickRuntimeBase = () => {
             const tryGet = (getter) => {
                 try {
                     return normalizeBase(getter());
@@ -1886,34 +1945,82 @@ function buildVmContext(requireFunc, filePath) {
                     if (v && v.includes('://')) return v;
                 }
             } catch (_) {}
-            return '';
-        };
-        class URLCompat extends NativeURL {
-            constructor(input, base) {
-                const raw = String(input == null ? '' : input).trim();
-                if (base === undefined) {
-                    if (raw.startsWith('//')) {
-                        super(`https:${raw}`);
-                        return;
-                    }
-                    if (isRelativeLike(raw)) {
-                        const b = pickRuntimeBase();
-                        if (b) {
-                            super(raw, b);
+	            return '';
+	        };
+	        const getOriginFromBase = (base) => {
+	            const b = normalizeBase(base);
+	            if (!b) return '';
+	            try {
+	                return new NativeURL(b).origin || '';
+	            } catch (_) {
+	                return '';
+	            }
+	        };
+	        const isDoubleSlashPathLike = (raw) => {
+	            // Some scripts produce `//forum.php?...` but expect it to be treated as a path on the current host.
+	            // Native URL semantics treat `//x` as a network-path reference; we only override this when it looks like a file path.
+	            const s = typeof raw === 'string' ? raw.trim() : '';
+	            if (!s.startsWith('//')) return false;
+	            const rest = s.slice(2);
+	            const head = rest.split(/[/?#]/)[0];
+	            if (!head) return false;
+	            return /\.(php|jsp|aspx|html?|js|json|txt|xml)$/i.test(head);
+	        };
+	        class URLCompat extends NativeURL {
+	            constructor(input, base) {
+	                const raw = String(input == null ? '' : input).trim();
+	                if (base === undefined) {
+	                    if (raw.startsWith('//')) {
+	                        const b = pickRuntimeBase();
+	                        if (isDoubleSlashPathLike(raw) && b) {
+	                            const origin = getOriginFromBase(b);
+	                            if (origin) {
+	                                super(`${origin}${raw}`);
+	                                return;
+	                            }
+	                        }
+	                        // Treat as scheme-relative URL by default.
+	                        super(`https:${raw}`);
+	                        return;
+	                    }
+	                    if (isRelativeLike(raw)) {
+	                        const b = pickRuntimeBase();
+	                        if (b) {
+	                            super(raw, b);
                             return;
                         }
                     }
-                    super(raw);
-                    return;
-                }
-                const nb = normalizeBase(String(base == null ? '' : base));
-                if (raw.startsWith('//') && !nb) {
-                    super(`https:${raw}`);
-                    return;
-                }
-                super(raw, nb || String(base));
-            }
-        }
+	                    super(raw);
+	                    return;
+	                }
+	                const baseRaw = String(base == null ? '' : base);
+	                const nb = normalizeBase(baseRaw);
+	                const runtimeBase = pickRuntimeBase();
+	                const effectiveBase = nb || runtimeBase;
+
+	                if (raw.startsWith('//')) {
+	                    if (isDoubleSlashPathLike(raw) && effectiveBase) {
+	                        const origin = getOriginFromBase(effectiveBase);
+	                        if (origin) {
+	                            super(`${origin}${raw}`);
+	                            return;
+	                        }
+	                    }
+	                    if (!nb) {
+	                        super(`https:${raw}`);
+	                        return;
+	                    }
+	                }
+
+	                // Some scripts pass `''/null/undefined` as base by mistake; fall back to runtime-provided base.
+	                if (isRelativeLike(raw) && !nb && runtimeBase) {
+	                    super(raw, runtimeBase);
+	                    return;
+	                }
+
+	                super(raw, nb || baseRaw);
+	            }
+	        }
         try {
             if (typeof NativeURL.canParse === 'function') URLCompat.canParse = NativeURL.canParse.bind(NativeURL);
             if (typeof NativeURL.parse === 'function') URLCompat.parse = NativeURL.parse.bind(NativeURL);
