@@ -4,7 +4,7 @@
     "type": "module",
     "main": "src/dev.js",
     "scripts": {
-        "dev": "cross-env DEV_HTTP_PORT=5758 nodemon --config nodemon.json src/dev.js",
+        "dev": "cross-env DEV_HTTP_PORT=9988 nodemon --config nodemon.json src/dev.js",
         "_build": "rimraf dist && node esbuild.js && node esbuild-config.js",
         "build": "cross-env NODE_ENV=production npm run _build && node copyDist.js D:\\soft\\CatPawOpen\\data\\flutter_assets\\asset\\js",
         "build:copy": "cross-env NODE_ENV=production npm run _build && node copyDist.js D:\\soft\\CatPawOpen\\data\\flutter_assets\\asset\\js",

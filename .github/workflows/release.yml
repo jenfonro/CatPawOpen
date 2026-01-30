@@ -1,0 +1,193 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-${{ matrix.asset_os }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            pkg_target: node18-linux-x64
+            asset_os: linux
+          - goos: linux
+            goarch: arm64
+            pkg_target: node18-linux-arm64
+            asset_os: linux
+          - goos: linux
+            goarch: amd64
+            pkg_target: node18-alpine-x64
+            asset_os: linux-musl
+          - goos: linux
+            goarch: arm64
+            pkg_target: node18-alpine-arm64
+            asset_os: linux-musl
+          - goos: windows
+            goarch: amd64
+            pkg_target: node18-win-x64
+            asset_os: windows
+          - goos: windows
+            goarch: arm64
+            pkg_target: node18-win-arm64
+            asset_os: windows
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ inputs.version }}"
+          if [[ -z "${v}" ]]; then
+            echo "version is required" >&2
+            exit 1
+          fi
+          if [[ "${v}" != v* ]]; then
+            echo "version must start with 'v' (e.g. v1.0.0)" >&2
+            exit 1
+          fi
+          if [[ "${v}" =~ [[:space:]] ]]; then
+            echo "version must not contain spaces" >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # pkg may need to compile Node.js from sources for 32-bit targets,
+      # and Node.js configure requires Python <= 3.10.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build bundle
+        shell: bash
+        env:
+          CATPAWOPEN_VERSION: ${{ inputs.version }}
+          NODE_ENV: production
+        run: |
+          set -euo pipefail
+          npm run _build
+
+      - name: Prepare entrypoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > dist/package.json <<'EOF'
+          { "type": "commonjs" }
+          EOF
+
+      - name: Package executable
+        shell: bash
+        env:
+          PKG_TARGET: ${{ matrix.pkg_target }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          ASSET_OS: ${{ matrix.asset_os }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ext=""
+          if [[ "${GOOS}" == "windows" ]]; then ext=".exe"; fi
+          out="dist/catpawopen_${ASSET_OS}_${GOARCH}${ext}"
+          npx --yes pkg@5.8.1 standalone.cjs \
+            --targets "${PKG_TARGET}" \
+            --public \
+            --public-packages "*" \
+            --no-bytecode \
+            --output "${out}" \
+            --assets "dist/package.json" \
+            --assets "package.json" \
+            --assets "config.json" \
+            --assets "src/**/*"
+          echo "built: ${out}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: catpawopen_${{ matrix.asset_os }}_${{ matrix.goarch }}
+          path: dist/catpawopen_${{ matrix.asset_os }}_${{ matrix.goarch }}*
+          if-no-files-found: error
+
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-dist
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find release-dist -maxdepth 2 -type f -print0 | xargs -0 -I{} mv {} dist/
+          ls -la dist
+
+      - name: Generate release notes
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          v="${VERSION}"
+          prev_tag="$(
+            git tag --merged HEAD --list 'v*' \
+              | grep -Ev '(^$|beta|timestamp)' \
+              | sort -V \
+              | grep -vx "${v}" \
+              | tail -n 1 \
+              || true
+          )"
+
+          {
+            echo "version: ${v}"
+            echo "commit: ${{ github.sha }}"
+            echo
+            if [[ -n "${prev_tag}" ]]; then
+              echo "changes since ${prev_tag}: $(git rev-list --count \"${prev_tag}..HEAD\")"
+              echo
+              git log --oneline "${prev_tag}..HEAD"
+            else
+              echo "notes: initial release"
+            fi
+          } > notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          body_path: notes.md
+          files: dist/*

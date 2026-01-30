@@ -1,5 +1,12 @@
-/nodejs/node_modules/
-/nodejs/dist/
-/.idea/
-/nodejs/vod_cache
-/nodejs/yarn.lock
+dist
+generated
+node_modules
+db.json
+runtime.log
+.catpaw_online_runtime_bootstrap.cjs
+custom_spider/*.js
+custom_spider/*.cjs
+custom_spider/*.mjs
+custom_spider/*.remote.json
+custom_spider/.catpaw_online_runtime_bootstrap.cjs
+custom_spider/online/

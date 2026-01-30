@@ -30,6 +30,23 @@ export async function findAvailablePort(startPort) {
     return port;
 }
 
+export async function findAvailablePortInRange(startPort, endPort) {
+    const start = Number.isFinite(Number(startPort)) ? Math.max(1, Math.trunc(Number(startPort))) : 30000;
+    const end = Number.isFinite(Number(endPort)) ? Math.max(start, Math.trunc(Number(endPort))) : 39999;
+    // Try a handful of random ports first.
+    for (let i = 0; i < 64; i += 1) {
+        const candidate = start + Math.floor(Math.random() * (end - start + 1));
+        // eslint-disable-next-line no-await-in-loop
+        if (await checkPort(candidate)) return candidate;
+    }
+    // Fallback to linear scan.
+    for (let p = start; p <= end; p += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        if (await checkPort(p)) return p;
+    }
+    throw new Error(`no available port in range ${start}-${end}`);
+}
+
 export function extractTags(filename) {
     // 正则匹配方括号内的内容
     const regex = /\[(.*?)\]/g;
