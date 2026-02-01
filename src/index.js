@@ -7,12 +7,33 @@ import {startOnlineRuntime, stopOnlineRuntime, stopAllOnlineRuntimes} from './ut
 import path from 'node:path';
 import fs from 'node:fs';
 import {applyOnlineConfigs} from './util/onlineConfigStore.js';
+import {fileURLToPath} from 'node:url';
 
 let server = null;
 let configWatchTimer = null;
 let configWatchLastMtime = 0;
 let onlineLastEntry = '';
 const onlineRuntimePorts = new Map(); // id -> port
+
+let cachedCatPawOpenVersion = '';
+function resolveCatPawOpenVersion() {
+    // Prefer build-time injected version (set by the build pipeline).
+    // See `esbuild.js` which defines `globalThis.__CATPAWOPEN_BUILD_VERSION__`.
+    try {
+        const v = globalThis && typeof globalThis.__CATPAWOPEN_BUILD_VERSION__ === 'string' ? globalThis.__CATPAWOPEN_BUILD_VERSION__ : '';
+        if (v && String(v).trim()) return String(v).trim();
+    } catch (_) {}
+    if (cachedCatPawOpenVersion) return cachedCatPawOpenVersion;
+    try {
+        const here = path.dirname(fileURLToPath(import.meta.url));
+        const pkgPath = path.resolve(here, '..', 'package.json');
+        const raw = fs.readFileSync(pkgPath, 'utf8');
+        const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
+        const v = parsed && typeof parsed.version === 'string' ? parsed.version.trim() : '';
+        if (v) cachedCatPawOpenVersion = v;
+    } catch (_) {}
+    return cachedCatPawOpenVersion || '';
+}
 
 /**
  * Start the server with the given configuration.
@@ -64,6 +85,24 @@ export async function start(config) {
     server.addHook('onRequest', (request, reply, done) => {
         applyCors(request, reply);
         done();
+    });
+
+    // Inject version into JSON responses.
+    // - Objects: add `version` field (if not already present)
+    // - Arrays: wrap as `{ version, data: [...] }`
+    server.addHook('preSerialization', async (_request, _reply, payload) => {
+        try {
+            const version = resolveCatPawOpenVersion();
+            if (!version) return payload;
+            if (payload == null) return payload;
+            if (Buffer.isBuffer(payload) || payload instanceof Uint8Array) return payload;
+            if (typeof payload !== 'object') return payload;
+            if (Array.isArray(payload)) return {version, data: payload};
+            if (Object.prototype.hasOwnProperty.call(payload, 'version')) return payload;
+            return {...payload, version};
+        } catch (_) {
+            return payload;
+        }
     });
     server.options('/*', async (request, reply) => {
         applyCors(request, reply);

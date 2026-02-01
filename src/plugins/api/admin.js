@@ -591,8 +591,35 @@ export const apiPlugins = [
                     if (!key) continue;
                     const val = store && typeof store[key] === 'object' && store[key] ? store[key] : {};
                     const cookie = typeof val.cookie === 'string' ? val.cookie : '';
+                    const authorization = typeof val.authorization === 'string' ? val.authorization : '';
                     const username = typeof val.username === 'string' ? val.username : '';
                     const password = typeof val.password === 'string' ? val.password : '';
+
+                    // Builtin 139 (移动云盘/和彩云) resolver:
+                    // - not managed by `/website/{key}/...` routes
+                    // - persist to main db.json so `/api/139/play` can read it.
+                    if (key === '139') {
+                        const nextAuth = (authorization || cookie || '').trim();
+                        if (!nextAuth) {
+                            results.push({ key, ok: true, skipped: true, message: 'empty credential' });
+                            continue;
+                        }
+                        try {
+                            if (fastify && fastify.db && typeof fastify.db.push === 'function') {
+                                // Store under db.json: { "139": { "authorization": "..." } }
+                                // (pan139 plugin reads /139/authorization)
+                                // eslint-disable-next-line no-await-in-loop
+                                await fastify.db.push('/139/authorization', nextAuth);
+                            }
+                            okCount += 1;
+                            results.push({ key, ok: true, skipped: false, message: '' });
+                        } catch (e) {
+                            failCount += 1;
+                            const msg = e && e.message ? String(e.message) : 'save failed';
+                            results.push({ key, ok: false, skipped: false, message: msg });
+                        }
+                        continue;
+                    }
 
                     const type = username && password ? 'account' : cookie ? 'cookie' : '';
                     if (!type) {

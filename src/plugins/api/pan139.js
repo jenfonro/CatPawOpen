@@ -151,24 +151,25 @@ function readJsonFileSafe(filePath) {
     }
 }
 
-function getYidongAuthorizationFromDbFile() {
+function get139AuthorizationFromDbFile() {
     for (const p of getDbJsonPathCandidates()) {
         const root = readJsonFileSafe(p);
-        const v = root && root.yidong && typeof root.yidong === 'object' ? root.yidong.authorization : '';
+        const obj = root && typeof root === 'object' ? root['139'] : null;
+        const v = obj && typeof obj === 'object' ? obj.authorization : '';
         const s = toStr(v).trim();
         if (s) return s;
     }
     return '';
 }
 
-async function getYidongAuthorization(instance) {
+async function get139Authorization(instance) {
     try {
         if (instance && instance.db && typeof instance.db.getData === 'function') {
-            const v = instance.db.getData('/yidong/authorization');
+            const v = instance.db.getData('/139/authorization');
             if (typeof v === 'string' && v.trim()) return v.trim();
         }
     } catch (_) {}
-    return getYidongAuthorizationFromDbFile();
+    return get139AuthorizationFromDbFile();
 }
 
 function buildMcloudHeaders({ authorization, bodyForSign }) {
@@ -379,7 +380,7 @@ export const apiPlugins = [
                 }
 
                 try {
-                    const authorization = await getYidongAuthorization(instance);
+                    const authorization = await get139Authorization(instance);
                     const out = await outlinkDlFromOutLinkV3Signed({ linkID, contentId, coID, authorization });
                     if (!out.url) {
                         const code = out.parsed && (out.parsed.code || out.parsed.resultCode);
@@ -402,4 +403,3 @@ export const apiPlugins = [
 ];
 
 export default apiPlugins;
-
