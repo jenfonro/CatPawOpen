@@ -73,18 +73,157 @@ export function startOnlineRuntime({ id = 'default', port = 9988, logPrefix = '[
         if (prev && prev.child && !prev.child.killed) prev.child.kill();
     } catch (_) {}
 
-const bootstrap = `
-(() => {
-  const http = require('http');
-  const https = require('https');
-  const fs = require('fs');
-  const path = require('path');
-  const crypto = require('crypto');
-  const vm = require('vm');
+		const bootstrap = `
+		(() => {
+		  const http = require('http');
+		  const https = require('https');
+		  const fs = require('fs');
+		  const path = require('path');
+		  const Module = require('module');
+		  const nodeCrypto = require('crypto');
+		  let CryptoJS = null;
+		  try { CryptoJS = require('crypto-js'); } catch (_) { CryptoJS = null; }
+		  const vm = require('vm');
 
-  try { if (process.env.ONLINE_CWD) process.chdir(process.env.ONLINE_CWD); } catch (_) {}
-  globalThis.catServerFactory = (handle) => http.createServer((req, res) => handle(req, res));
-  globalThis.catDartServerPort = () => 0;
+		  try { if (process.env.ONLINE_CWD) process.chdir(process.env.ONLINE_CWD); } catch (_) {}
+
+		  // Some bundled spiders expect CryptoJS-style helpers on crypto (e.g. crypto.MD5),
+		  // while others expect Node crypto (e.g. crypto.createHash). Provide a compatible object
+		  // for require('crypto') and also ensure globalThis.crypto has MD5/SHA* while preserving WebCrypto methods.
+		  try {
+		    const webcrypto = (() => {
+		      try {
+		        const c = globalThis && globalThis.crypto;
+		        return c && typeof c === 'object' ? c : null;
+		      } catch (_) {
+		        return null;
+		      }
+		    })();
+
+		    const md5Hex = (s) =>
+		      nodeCrypto.createHash('md5').update(String(s == null ? '' : s), 'utf8').digest('hex');
+		    const sha1Hex = (s) =>
+		      nodeCrypto.createHash('sha1').update(String(s == null ? '' : s), 'utf8').digest('hex');
+		    const sha256Hex = (s) =>
+		      nodeCrypto.createHash('sha256').update(String(s == null ? '' : s), 'utf8').digest('hex');
+
+		    const wordArrayFromHex = (hex) => ({
+		      __hex: String(hex || ''),
+		      toString(enc) {
+		        if (enc && typeof enc.stringify === 'function') return enc.stringify(this);
+		        return this.__hex;
+		      },
+		    });
+
+		    const cryptoCompat =
+		      CryptoJS && typeof CryptoJS === 'object'
+		        ? CryptoJS
+		        : {
+		            enc: {
+		              Hex: {
+		                stringify(wa) {
+		                  if (wa && typeof wa.__hex === 'string') return wa.__hex;
+		                  if (wa && typeof wa.toString === 'function') return wa.toString();
+		                  return String(wa == null ? '' : wa);
+		                },
+		              },
+		            },
+		            MD5(s) {
+		              return wordArrayFromHex(md5Hex(s));
+		            },
+		            SHA1(s) {
+		              return wordArrayFromHex(sha1Hex(s));
+		            },
+		            SHA256(s) {
+		              return wordArrayFromHex(sha256Hex(s));
+		            },
+		          };
+
+		    if (cryptoCompat && typeof cryptoCompat === 'object') {
+		      if (typeof cryptoCompat.md5 !== 'function') cryptoCompat.md5 = cryptoCompat.MD5;
+		      if (typeof cryptoCompat.sha1 !== 'function') cryptoCompat.sha1 = cryptoCompat.SHA1;
+		      if (typeof cryptoCompat.sha256 !== 'function') cryptoCompat.sha256 = cryptoCompat.SHA256;
+		    }
+
+		    const composite = new Proxy(cryptoCompat || {}, {
+		      get(target, prop) {
+		        if (target && prop in target) return target[prop];
+		        if (nodeCrypto && prop in nodeCrypto) return nodeCrypto[prop];
+		        return undefined;
+		      },
+		    });
+
+		    // Expose CryptoJS (or a minimal substitute) for scripts that reference it directly.
+		    globalThis.CryptoJS = cryptoCompat;
+
+		    // Preserve WebCrypto methods on the object scripts see as global crypto.
+		    try {
+		      if (webcrypto && typeof webcrypto === 'object') {
+		        if (!composite.subtle && webcrypto.subtle) composite.subtle = webcrypto.subtle;
+		        if (typeof composite.getRandomValues !== 'function' && typeof webcrypto.getRandomValues === 'function') {
+		          composite.getRandomValues = webcrypto.getRandomValues.bind(webcrypto);
+		        }
+		        if (typeof composite.randomUUID !== 'function' && typeof webcrypto.randomUUID === 'function') {
+		          composite.randomUUID = webcrypto.randomUUID.bind(webcrypto);
+		        }
+		      }
+		    } catch (_) {}
+
+		    // Make sure scripts that use the global crypto variable can call crypto.MD5(...).
+		    // Some bundles overwrite global crypto; we keep it pinned to the composite but still accept WebCrypto updates.
+		    try {
+		      Object.defineProperty(globalThis, 'crypto', {
+		        configurable: true,
+		        enumerable: true,
+		        get() {
+		          return composite;
+		        },
+		        set(v) {
+		          try {
+		            if (v && typeof v === 'object') {
+		              if (!composite.subtle && v.subtle) composite.subtle = v.subtle;
+		              if (typeof composite.getRandomValues !== 'function' && typeof v.getRandomValues === 'function') {
+		                composite.getRandomValues = v.getRandomValues.bind(v);
+		              }
+		              if (typeof composite.randomUUID !== 'function' && typeof v.randomUUID === 'function') {
+		                composite.randomUUID = v.randomUUID.bind(v);
+		              }
+		            }
+		          } catch (_) {}
+		        },
+		      });
+		    } catch (_) {
+		      try {
+		        globalThis.crypto = composite;
+		      } catch (_) {}
+		    }
+
+		    // Ensure any require('crypto') within the online script resolves to our composite.
+		    try {
+		      const origLoad = Module._load;
+		      Module._load = function patchedLoad(request, parent, isMain) {
+		        try {
+		          if (request === 'crypto' || request === 'node:crypto') return composite;
+		          if (request === 'crypto-js') return cryptoCompat;
+		        } catch (_) {}
+		        return origLoad.apply(this, arguments);
+		      };
+		    } catch (_) {}
+
+		    try {
+		      const origRequire = require;
+		      globalThis.require = function patchedRequire(name) {
+		        try {
+		          const mod = String(name || '').trim();
+		          if (mod === 'crypto' || mod === 'node:crypto') return composite;
+		          if (mod === 'crypto-js') return cryptoCompat;
+		        } catch (_) {}
+		        return origRequire(name);
+		      };
+		    } catch (_) {}
+		  } catch (_) {}
+		  globalThis.catServerFactory = (handle) => http.createServer((req, res) => handle(req, res));
+		  globalThis.catDartServerPort = () => 0;
 
   const entry = process.env.ONLINE_ENTRY;
   if (!entry) throw new Error('missing ONLINE_ENTRY');
@@ -97,7 +236,7 @@ const bootstrap = `
   globalThis.__dirname = path.resolve(__onlineCwd);
 
   try {
-    const md5hex = (s) => crypto.createHash('md5').update(String(s || ''), 'utf8').digest('hex');
+    const md5hex = (s) => nodeCrypto.createHash('md5').update(String(s || ''), 'utf8').digest('hex');
     const dbPath = path.resolve(__onlineCwd, 'db.json');
     const readDb = () => {
       try {
