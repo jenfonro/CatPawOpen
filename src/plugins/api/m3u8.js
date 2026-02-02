@@ -596,8 +596,25 @@ const apiPlugins = [
         } catch {}
         if (go.enabled && !session.goProxyToken) {
           try {
+            fastify.log.info(
+              {
+                goProxyApi: typeof cfg.goProxyApi === 'string' ? cfg.goProxyApi : '',
+                internalBase: go.internalBase,
+                publicBase: go.publicBase,
+                registerUrl: `${String(go.internalBase || '').replace(/\/+$/g, '')}/register`,
+                requestHost: request && request.headers ? request.headers.host : '',
+                forwardedProto: request && request.headers ? request.headers['x-forwarded-proto'] : '',
+                forwardedHost: request && request.headers ? request.headers['x-forwarded-host'] : '',
+              },
+              '[m3u8] goproxy register (proxy.m3u8)'
+            );
+          } catch {}
+          try {
             session.goProxyToken = await registerGoProxy(go.internalBase, session.upstreamUrl, session.headers);
           } catch (_e) {
+            try {
+              fastify.log.warn({ err: _e }, '[m3u8] goproxy register failed (proxy.m3u8)');
+            } catch {}
             session.goProxyToken = '';
           }
         }
@@ -630,8 +647,25 @@ const apiPlugins = [
         } catch {}
         if (go.enabled && !session.goProxyToken) {
           try {
+            fastify.log.info(
+              {
+                goProxyApi: typeof cfg.goProxyApi === 'string' ? cfg.goProxyApi : '',
+                internalBase: go.internalBase,
+                publicBase: go.publicBase,
+                registerUrl: `${String(go.internalBase || '').replace(/\/+$/g, '')}/register`,
+                requestHost: request && request.headers ? request.headers.host : '',
+                forwardedProto: request && request.headers ? request.headers['x-forwarded-proto'] : '',
+                forwardedHost: request && request.headers ? request.headers['x-forwarded-host'] : '',
+              },
+              '[m3u8] goproxy register (pl)'
+            );
+          } catch {}
+          try {
             session.goProxyToken = await registerGoProxy(go.internalBase, session.upstreamUrl, session.headers);
           } catch (_e) {
+            try {
+              fastify.log.warn({ err: _e }, '[m3u8] goproxy register failed (pl)');
+            } catch {}
             session.goProxyToken = '';
           }
         }
