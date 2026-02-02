@@ -16,7 +16,15 @@ let onlineLastEntry = '';
 const onlineRuntimePorts = new Map(); // id -> port
 
 let cachedCatPawOpenVersion = '';
+const DEV_BUILD_STAMP = Date.now();
 function resolveCatPawOpenVersion() {
+    // In local dev (`npm run dev`), prefer a beta version so API responses don't look like a release build.
+    // Keep it stable per process (not per request).
+    try {
+        if (!(process && process.pkg) && String(process.env.NODE_ENV || '').trim() === 'development') {
+            return `beta-${DEV_BUILD_STAMP}`;
+        }
+    } catch (_) {}
     // Prefer build-time injected version (set by the build pipeline).
     // See `esbuild.js` which defines `globalThis.__CATPAWOPEN_BUILD_VERSION__`.
     try {
