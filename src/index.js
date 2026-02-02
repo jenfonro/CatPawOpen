@@ -96,6 +96,8 @@ export async function start(config) {
             if (!version) return payload;
             if (payload == null) return payload;
             if (Buffer.isBuffer(payload) || payload instanceof Uint8Array) return payload;
+            // Do not touch streams (proxy endpoints, file downloads, etc).
+            if (payload && typeof payload === 'object' && typeof payload.pipe === 'function') return payload;
             if (typeof payload !== 'object') return payload;
             if (Array.isArray(payload)) return {version, data: payload};
             if (Object.prototype.hasOwnProperty.call(payload, 'version')) return payload;
