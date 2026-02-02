@@ -1,9 +1,15 @@
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { URL } from 'node:url';
+import fs from 'node:fs';
+import path from 'node:path';
+import http from 'node:http';
+import https from 'node:https';
 
 const DEFAULT_TTL_SECONDS = 30 * 60;
 const MAX_URL_LEN = 8 * 1024;
+const DEFAULT_HTTP_TIMEOUT_MS = 12000;
+const MAX_REDIRECTS = 5;
 
 function nowMs() {
   return Date.now();
@@ -48,6 +54,47 @@ function normalizeHttpUrl(u) {
   }
 }
 
+function resolveRuntimeRootDir() {
+  try {
+    if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
+      return path.dirname(process.execPath);
+    }
+  } catch {}
+  try {
+    const envRoot = typeof process.env.NODE_PATH === 'string' ? process.env.NODE_PATH.trim() : '';
+    if (envRoot) return path.resolve(envRoot);
+  } catch {}
+  return process.cwd();
+}
+
+function readConfigJsonSafe() {
+  try {
+    const rootDir = resolveRuntimeRootDir();
+    const cfgPath = path.resolve(rootDir, 'config.json');
+    if (!fs.existsSync(cfgPath)) return {};
+    const raw = fs.readFileSync(cfgPath, 'utf8');
+    const parsed = raw && raw.trim() ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function pickForwardedFirst(value) {
+  if (typeof value !== 'string') return '';
+  const first = value.split(',')[0];
+  return String(first || '').trim();
+}
+
+function getExternalOriginFromRequest(request) {
+  const headers = (request && request.headers) || {};
+  const proto = pickForwardedFirst(headers['x-forwarded-proto']) || '';
+  const host = pickForwardedFirst(headers['x-forwarded-host']) || String(headers.host || '').trim();
+  if (!host) return '';
+  const scheme = proto === 'https' || proto === 'http' ? proto : 'http';
+  return `${scheme}://${host}`;
+}
+
 function decodeQueryUrl(raw) {
   const s = safeTrim(String(raw || ''));
   if (!s) return '';
@@ -68,6 +115,68 @@ function toNodeReadable(body) {
   // node stream
   if (typeof body.pipe === 'function') return body;
   return null;
+}
+
+function withTimeout(ms, fn) {
+  const timeoutMs = Number.isFinite(Number(ms)) ? Math.max(200, Math.trunc(Number(ms))) : DEFAULT_HTTP_TIMEOUT_MS;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+    Promise.resolve()
+      .then(fn)
+      .then((v) => resolve(v))
+      .catch(reject)
+      .finally(() => clearTimeout(timer));
+  });
+}
+
+function requestOnce(urlStr, { method, headers } = {}) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try {
+      u = new URL(String(urlStr || ''));
+    } catch {
+      reject(new Error('invalid url'));
+      return;
+    }
+    const mod = u.protocol === 'https:' ? https : http;
+    const req = mod.request(
+      {
+        method: method || 'GET',
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: `${u.pathname || '/'}${u.search || ''}`,
+        headers: headers || {},
+      },
+      (res) => resolve({ u, res })
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function httpRequestFollow(urlStr, { method, headers, timeoutMs } = {}) {
+  let current = String(urlStr || '');
+  for (let i = 0; i <= MAX_REDIRECTS; i += 1) {
+    const { u, res } = await withTimeout(timeoutMs, () => requestOnce(current, { method, headers }));
+    const status = Number(res.statusCode || 0);
+    const loc = res.headers && (res.headers.location || res.headers.Location);
+    if (status >= 300 && status < 400 && loc) {
+      try {
+        const next = new URL(String(loc), u).toString();
+        res.resume();
+        current = next;
+        continue;
+      } catch {}
+    }
+    return { url: current, res };
+  }
+  throw new Error('too many redirects');
+}
+
+async function readAll(res) {
+  const chunks = [];
+  for await (const c of res) chunks.push(Buffer.from(c));
+  return Buffer.concat(chunks);
 }
 
 function ensureStore(fastify) {
@@ -139,6 +248,161 @@ function buildProxyPath(token, kind, absUrl) {
   return `/api/m3u8/${encodeURIComponent(token)}/seg?u=${enc}`;
 }
 
+function normalizeGoProxyApiBase(input) {
+  const raw = safeTrim(input);
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) {
+    try {
+      const u = new URL(raw);
+      u.hash = '';
+      u.search = '';
+      const p = u.pathname || '/';
+      u.pathname = p.endsWith('/') ? p : `${p}/`;
+      return u.toString();
+    } catch {
+      return raw;
+    }
+  }
+  if (raw.startsWith('/')) return raw.replace(/\/+$/g, '') || '/';
+  return '';
+}
+
+function resolveGoProxyBases(request, cfg) {
+  const root = cfg && typeof cfg === 'object' && !Array.isArray(cfg) ? cfg : {};
+  const api = normalizeGoProxyApiBase(root.goProxyApi);
+  if (!api) return { enabled: false, internalBase: '', publicBase: '' };
+
+  if (/^https?:\/\//i.test(api)) {
+    const base = api.replace(/\/+$/g, '');
+    return { enabled: true, internalBase: `${base}/`, publicBase: `${base}/` };
+  }
+
+  const origin = getExternalOriginFromRequest(request);
+  if (!origin) return { enabled: false, internalBase: '', publicBase: '' };
+  const base = `${origin}${api}`.replace(/\/+$/g, '');
+  return { enabled: true, internalBase: `${base}/`, publicBase: `${base}/` };
+}
+
+function headersMapToList(headers) {
+  const h = normalizeHeaders(headers);
+  const out = [];
+  Object.keys(h).forEach((k) => {
+    out.push({ key: k, value: String(h[k] || '') });
+  });
+  return out;
+}
+
+async function fetchJsonWithTimeout(url, options, timeoutMs) {
+  const ms = Number.isFinite(Number(timeoutMs)) ? Math.max(200, Math.trunc(Number(timeoutMs))) : 3000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const resp = await fetch(url, { ...(options || {}), signal: controller.signal });
+    const data = await resp.json().catch(() => ({}));
+    return { resp, data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function registerGoProxy(internalBase, upstreamUrl, headers) {
+  const base = safeTrim(internalBase).replace(/\/+$/g, '');
+  if (!base) throw new Error('missing goproxy base');
+  const url = `${base}/register`;
+  const { resp, data } = await fetchJsonWithTimeout(
+    url,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: upstreamUrl, headersList: headersMapToList(headers) }),
+    },
+    3000
+  );
+  if (!resp.ok) {
+    const msg = data && (data.message || data.error) ? String(data.message || data.error) : `HTTP ${resp.status}`;
+    throw new Error(msg);
+  }
+  const token = data && data.token ? String(data.token).trim() : '';
+  if (!token) throw new Error('missing goproxy token');
+  return token;
+}
+
+function buildGoProxyBinaryUrl(publicBase, goToken, kind, absUrl) {
+  const base = safeTrim(publicBase).replace(/\/+$/g, '');
+  const tok = safeTrim(goToken);
+  if (!base || !tok) return '';
+  const enc = encodeURIComponent(absUrl);
+  const p = kind === 'key' ? 'key' : 'seg';
+  return `${base}/${encodeURIComponent(tok)}/${p}?u=${enc}`;
+}
+
+function rewritePlaylistProxy(text, { token, baseUrl, go, goToken }) {
+  const raw = typeof text === 'string' ? text : '';
+  if (!raw) return '';
+  const lines = raw.split(/\r?\n/);
+  const out = [];
+
+  for (const line of lines) {
+    const trimmed = String(line || '').trim();
+    if (!trimmed) {
+      out.push(line);
+      continue;
+    }
+    if (trimmed.startsWith('#')) {
+      if (/^#EXT-X-(KEY|SESSION-KEY)\b/i.test(trimmed) && /URI\s*=\s*"/i.test(trimmed)) {
+        const uri = parseAttributeUri(trimmed);
+        const abs = uri ? absolutizeMaybe(uri, baseUrl) : '';
+        if (abs && go && go.enabled && goToken) {
+          out.push(replaceAttributeUri(line, buildGoProxyBinaryUrl(go.publicBase, goToken, 'key', abs) || buildProxyPath(token, 'key', abs)));
+        } else if (abs) {
+          out.push(replaceAttributeUri(line, buildProxyPath(token, 'key', abs)));
+        } else {
+          out.push(line);
+        }
+        continue;
+      }
+      if (/^#EXT-X-MAP\b/i.test(trimmed) && /URI\s*=\s*"/i.test(trimmed)) {
+        const uri = parseAttributeUri(trimmed);
+        const abs = uri ? absolutizeMaybe(uri, baseUrl) : '';
+        if (abs && go && go.enabled && goToken) {
+          out.push(replaceAttributeUri(line, buildGoProxyBinaryUrl(go.publicBase, goToken, 'seg', abs) || buildProxyPath(token, 'seg', abs)));
+        } else if (abs) {
+          out.push(replaceAttributeUri(line, buildProxyPath(token, 'seg', abs)));
+        } else {
+          out.push(line);
+        }
+        continue;
+      }
+      if (/^#EXT-X-(MEDIA|I-FRAME-STREAM-INF)\b/i.test(trimmed) && /URI\s*=\s*"/i.test(trimmed)) {
+        const uri = parseAttributeUri(trimmed);
+        const abs = uri ? absolutizeMaybe(uri, baseUrl) : '';
+        if (abs) out.push(replaceAttributeUri(line, buildProxyPath(token, 'pl', abs)));
+        else out.push(line);
+        continue;
+      }
+      out.push(line);
+      continue;
+    }
+
+    const abs = absolutizeMaybe(trimmed, baseUrl);
+    if (!abs) {
+      out.push(trimmed);
+      continue;
+    }
+    if (String(abs).toLowerCase().endsWith('.m3u8')) {
+      out.push(buildProxyPath(token, 'pl', abs));
+      continue;
+    }
+    if (go && go.enabled && goToken) {
+      out.push(buildGoProxyBinaryUrl(go.publicBase, goToken, 'seg', abs) || buildProxyPath(token, 'seg', abs));
+    } else {
+      out.push(buildProxyPath(token, 'seg', abs));
+    }
+  }
+
+  return out.join('\n');
+}
+
 function rewritePlaylistText(text, { token, baseUrl, mode }) {
   const raw = typeof text === 'string' ? text : '';
   if (!raw) return '';
@@ -186,8 +450,10 @@ function rewritePlaylistText(text, { token, baseUrl, mode }) {
 }
 
 async function fetchUpstreamText(url, headers) {
-  const res = await fetch(url, { method: 'GET', headers, redirect: 'follow' });
-  const buf = await res.arrayBuffer();
+  // Use Node's http/https client to avoid undici header parsing errors
+  // when upstream returns non-ASCII header values (e.g. Content-Disposition filenames).
+  const { res } = await httpRequestFollow(url, { method: 'GET', headers, timeoutMs: DEFAULT_HTTP_TIMEOUT_MS });
+  const buf = await readAll(res);
   const text = Buffer.from(buf).toString('utf8');
   return { res, text };
 }
@@ -218,11 +484,16 @@ function copyUpstreamResponseHeaders(reply, upstreamHeaders, opts) {
     'upgrade',
   ]);
   const expose = [];
-  for (const [k, v] of upstreamHeaders.entries()) {
+  const iter =
+    upstreamHeaders && typeof upstreamHeaders.entries === 'function'
+      ? upstreamHeaders.entries()
+      : Object.entries((upstreamHeaders && typeof upstreamHeaders === 'object' ? upstreamHeaders : {}) || {});
+  for (const [k, v0] of iter) {
     const key = String(k || '').toLowerCase();
     if (!key || deny.has(key)) continue;
     if (stripContentLength && key === 'content-length') continue;
     if (stripContentEncoding && key === 'content-encoding') continue;
+    const v = Array.isArray(v0) ? v0.join(', ') : v0;
     try {
       reply.header(k, v);
       if (
@@ -255,6 +526,14 @@ const apiPlugins = [
     prefix: '/api/m3u8',
     plugin: async function m3u8Api(fastify) {
       const store = ensureStore(fastify);
+      const cfgCache = { t: 0, v: {} };
+      const readCfg = () => {
+        const now = nowMs();
+        if (cfgCache.v && now-cfgCache.t < 1000) return cfgCache.v;
+        cfgCache.v = readConfigJsonSafe();
+        cfgCache.t = now;
+        return cfgCache.v;
+      };
 
       fastify.post('/register', async function (request, reply) {
         const body = request && request.body && typeof request.body === 'object' ? request.body : {};
@@ -276,6 +555,7 @@ const apiPlugins = [
           headers,
           createdAt,
           expiresAt: createdAt + ttlSeconds * 1000,
+          goProxyToken: '',
         });
 
         return {
@@ -295,7 +575,7 @@ const apiPlugins = [
         if (!session) return apiError(reply, 404, 'not found');
 
         const { res, text } = await fetchUpstreamText(session.upstreamUrl, session.headers);
-        reply.code(res.status || 200);
+        reply.code(res.statusCode || res.status || 200);
         reply.type('application/vnd.apple.mpegurl; charset=utf-8');
         // Avoid injecting raw upstream URL into headers: non-ASCII characters can crash Node's header validator.
         const normalized = rewritePlaylistText(text, { token, baseUrl: session.upstreamUrl, mode: 'index' });
@@ -309,10 +589,26 @@ const apiPlugins = [
         const session = getSession(store, token);
         if (!session) return apiError(reply, 404, 'not found');
 
+        const cfg = readCfg();
+        const go = resolveGoProxyBases(request, cfg);
+        try {
+          reply.header('X-GoProxy-Enabled', go.enabled ? '1' : '0');
+        } catch {}
+        if (go.enabled && !session.goProxyToken) {
+          try {
+            session.goProxyToken = await registerGoProxy(go.internalBase, session.upstreamUrl, session.headers);
+          } catch (_e) {
+            session.goProxyToken = '';
+          }
+        }
+        try {
+          reply.header('X-GoProxy-Token', session.goProxyToken ? '1' : '0');
+        } catch {}
+
         const { res, text } = await fetchUpstreamText(session.upstreamUrl, session.headers);
-        reply.code(res.status || 200);
+        reply.code(res.statusCode || res.status || 200);
         reply.type('application/vnd.apple.mpegurl; charset=utf-8');
-        const rewritten = rewritePlaylistText(text, { token, baseUrl: session.upstreamUrl, mode: 'proxy' });
+        const rewritten = rewritePlaylistProxy(text, { token, baseUrl: session.upstreamUrl, go, goToken: session.goProxyToken });
         return rewritten;
       });
 
@@ -327,10 +623,26 @@ const apiPlugins = [
         if (u.length > MAX_URL_LEN) return apiError(reply, 400, 'u too long');
         if (!isHttpUrl(u)) return apiError(reply, 400, 'invalid u');
 
+        const cfg = readCfg();
+        const go = resolveGoProxyBases(request, cfg);
+        try {
+          reply.header('X-GoProxy-Enabled', go.enabled ? '1' : '0');
+        } catch {}
+        if (go.enabled && !session.goProxyToken) {
+          try {
+            session.goProxyToken = await registerGoProxy(go.internalBase, session.upstreamUrl, session.headers);
+          } catch (_e) {
+            session.goProxyToken = '';
+          }
+        }
+        try {
+          reply.header('X-GoProxy-Token', session.goProxyToken ? '1' : '0');
+        } catch {}
+
         const { res, text } = await fetchUpstreamText(u, session.headers);
-        reply.code(res.status || 200);
+        reply.code(res.statusCode || res.status || 200);
         reply.type('application/vnd.apple.mpegurl; charset=utf-8');
-        const rewritten = rewritePlaylistText(text, { token, baseUrl: u, mode: 'proxy' });
+        const rewritten = rewritePlaylistProxy(text, { token, baseUrl: u, go, goToken: session.goProxyToken });
         return rewritten;
       });
 
@@ -351,21 +663,17 @@ const apiPlugins = [
         if (!Object.keys(headers).some((k) => String(k).toLowerCase() === 'accept-encoding')) {
           headers['Accept-Encoding'] = 'identity';
         }
-        const res = await fetch(u, { method: 'GET', headers, redirect: 'follow' });
-        reply.code(res.status || 200);
+        const { res } = await httpRequestFollow(u, { method: 'GET', headers, timeoutMs: DEFAULT_HTTP_TIMEOUT_MS });
+        reply.code(res.statusCode || 200);
         // When streaming, do not forward Content-Length/Encoding (Fastify will stream chunked),
         // otherwise browsers may throw ERR_CONTENT_LENGTH_MISMATCH.
-        copyUpstreamResponseHeaders(reply, res.headers, { stripContentLength: true, stripContentEncoding: true });
+        copyUpstreamResponseHeaders(reply, res.headers || {}, { stripContentLength: true, stripContentEncoding: true });
         if (!reply.getHeader || !reply.getHeader('Content-Type')) {
           try {
             if (kind === 'key') reply.type('application/octet-stream');
           } catch {}
         }
-        const body = toNodeReadable(res.body);
-        if (body) return reply.send(body);
-        const buf = await res.arrayBuffer().catch(() => null);
-        if (!buf) return reply.send('');
-        return reply.send(Buffer.from(buf));
+        return reply.send(res);
       };
 
       fastify.get('/:token/seg', async function (request, reply) {

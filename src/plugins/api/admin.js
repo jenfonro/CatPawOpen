@@ -74,6 +74,7 @@ function readSettingsFromConfig(root) {
     return {
         proxy: typeof cfg.proxy === 'string' ? cfg.proxy : '',
         panBuiltinResolverEnabled: !!cfg.panBuiltinResolverEnabled,
+        goProxyApi: typeof cfg.goProxyApi === 'string' ? cfg.goProxyApi : '',
         corsAllowOrigins: Array.isArray(cfg.corsAllowOrigins) ? cfg.corsAllowOrigins : [],
         corsAllowCredentials: !!cfg.corsAllowCredentials,
     };
@@ -397,6 +398,8 @@ export const apiPlugins = [
                 if (Object.prototype.hasOwnProperty.call(body, 'proxy')) next.proxy = typeof body.proxy === 'string' ? body.proxy : '';
                 if (Object.prototype.hasOwnProperty.call(body, 'panBuiltinResolverEnabled'))
                     next.panBuiltinResolverEnabled = !!body.panBuiltinResolverEnabled;
+                if (Object.prototype.hasOwnProperty.call(body, 'goProxyApi'))
+                    next.goProxyApi = typeof body.goProxyApi === 'string' ? body.goProxyApi : '';
                 if (Object.prototype.hasOwnProperty.call(body, 'corsAllowOrigins'))
                     next.corsAllowOrigins = Array.isArray(body.corsAllowOrigins) ? body.corsAllowOrigins : [];
                 if (Object.prototype.hasOwnProperty.call(body, 'corsAllowCredentials')) next.corsAllowCredentials = !!body.corsAllowCredentials;
