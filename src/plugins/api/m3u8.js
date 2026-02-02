@@ -89,9 +89,26 @@ function pickForwardedFirst(value) {
 function getExternalOriginFromRequest(request) {
   const headers = (request && request.headers) || {};
   const proto = pickForwardedFirst(headers['x-forwarded-proto']) || '';
-  const host = pickForwardedFirst(headers['x-forwarded-host']) || String(headers.host || '').trim();
-  if (!host) return '';
   const scheme = proto === 'https' || proto === 'http' ? proto : 'http';
+
+  const xfHost = pickForwardedFirst(headers['x-forwarded-host']);
+  const hHost = String(headers.host || '').trim();
+  const xfPort = pickForwardedFirst(headers['x-forwarded-port']);
+
+  // Prefer forwarded host, but do not accidentally drop an explicit port.
+  // Common nginx config sets `X-Forwarded-Host $host` (no port) while `Host $http_host` includes the port.
+  let host = xfHost || hHost;
+  if (host && !String(host).includes(':') && hHost && hHost.includes(':')) {
+    host = hHost;
+  } else if (host && !String(host).includes(':') && xfPort) {
+    const port = String(xfPort).trim();
+    if (port && /^\d+$/.test(port)) {
+      const isDefault = (scheme === 'https' && port === '443') || (scheme === 'http' && port === '80');
+      if (!isDefault) host = `${host}:${port}`;
+    }
+  }
+
+  if (!host) return '';
   return `${scheme}://${host}`;
 }
 
