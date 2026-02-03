@@ -45,6 +45,67 @@ function writeJsonFileAtomic(filePath, obj) {
     atomicWriteFile(filePath, `${JSON.stringify(root, null, 2)}\n`);
 }
 
+function save139AuthorizationToConfig(rootDir, authorization) {
+    const root = rootDir ? String(rootDir) : '';
+    const auth = typeof authorization === 'string' ? authorization.trim() : '';
+    if (!root) throw new Error('invalid runtime root');
+    if (!auth) throw new Error('missing authorization');
+
+    const cfgPath = path.resolve(root, 'config.json');
+    const cfgRoot = readJsonFileSafe(cfgPath) || {};
+    const next = cfgRoot && typeof cfgRoot === 'object' && !Array.isArray(cfgRoot) ? { ...cfgRoot } : {};
+
+    const account =
+        next.account && typeof next.account === 'object' && next.account && !Array.isArray(next.account) ? { ...next.account } : {};
+    const p139 =
+        account['139'] && typeof account['139'] === 'object' && account['139'] && !Array.isArray(account['139'])
+            ? { ...account['139'] }
+            : {};
+
+    p139.authorization = auth;
+    account['139'] = p139;
+    next.account = account;
+
+    writeJsonFileAtomic(cfgPath, next);
+}
+
+function savePanCredentialToConfig(rootDir, key, value) {
+    const root = rootDir ? String(rootDir) : '';
+    const panKey = typeof key === 'string' ? key.trim() : '';
+    const v = value && typeof value === 'object' ? value : {};
+    if (!root) throw new Error('invalid runtime root');
+    if (!panKey) throw new Error('invalid pan key');
+
+    const cookie = typeof v.cookie === 'string' ? v.cookie.trim() : '';
+    const authorization = typeof v.authorization === 'string' ? v.authorization.trim() : '';
+    const username = typeof v.username === 'string' ? v.username : '';
+    const password = typeof v.password === 'string' ? v.password : '';
+
+    if (!cookie && !authorization && !(username && password)) throw new Error('empty credential');
+
+    const cfgPath = path.resolve(root, 'config.json');
+    const cfgRoot = readJsonFileSafe(cfgPath) || {};
+    const next = cfgRoot && typeof cfgRoot === 'object' && !Array.isArray(cfgRoot) ? { ...cfgRoot } : {};
+
+    const account =
+        next.account && typeof next.account === 'object' && next.account && !Array.isArray(next.account) ? { ...next.account } : {};
+    const prev =
+        account[panKey] && typeof account[panKey] === 'object' && account[panKey] && !Array.isArray(account[panKey])
+            ? { ...account[panKey] }
+            : {};
+
+    if (cookie) prev.cookie = cookie;
+    if (authorization) prev.authorization = authorization;
+    if (username && password) {
+        prev.username = username;
+        prev.password = password;
+    }
+    account[panKey] = prev;
+    next.account = account;
+
+    writeJsonFileAtomic(cfgPath, next);
+}
+
 function normalizeOnlineConfigsInput(body) {
     const b = body && typeof body === 'object' ? body : {};
     const v = Object.prototype.hasOwnProperty.call(b, 'onlineConfigs')
@@ -600,7 +661,7 @@ export const apiPlugins = [
 
                     // Builtin 139 (移动云盘/和彩云) resolver:
                     // - not managed by `/website/{key}/...` routes
-                    // - persist to main db.json so `/api/139/play` can read it.
+                    // - persisted into config.json so `/api/139/play` can read it.
                     if (key === '139') {
                         const nextAuth = (authorization || cookie || '').trim();
                         if (!nextAuth) {
@@ -608,12 +669,7 @@ export const apiPlugins = [
                             continue;
                         }
                         try {
-                            if (fastify && fastify.db && typeof fastify.db.push === 'function') {
-                                // Store under db.json: { "139": { "authorization": "..." } }
-                                // (pan139 plugin reads /139/authorization)
-                                // eslint-disable-next-line no-await-in-loop
-                                await fastify.db.push('/139/authorization', nextAuth);
-                            }
+                            save139AuthorizationToConfig(resolveRuntimeRootDir(), nextAuth);
                             okCount += 1;
                             results.push({ key, ok: true, skipped: false, message: '' });
                         } catch (e) {
@@ -622,6 +678,17 @@ export const apiPlugins = [
                             results.push({ key, ok: false, skipped: false, message: msg });
                         }
                         continue;
+                    }
+
+                    // Builtin baidu/quark credentials are read from config.json; online scripts still use db.json.
+                    if (key === 'baidu' || key === 'quark') {
+                        const hasCredential = !!((username && password) || cookie);
+                        if (!hasCredential) {
+                            results.push({ key, ok: true, skipped: true, message: 'empty credential' });
+                            continue;
+                        }
+                        // Best-effort write config.json first; final status still depends on both.
+                        // (Do not early-return here; keep `/website/{key}/{cookie|account}` sync for db.json.)
                     }
 
                     const type = username && password ? 'account' : cookie ? 'cookie' : '';
@@ -639,6 +706,19 @@ export const apiPlugins = [
 
                     let lastErr = '';
                     let saved = false;
+
+                    // For builtin baidu/quark: persist to config.json, but still sync to website for db.json.
+                    let configOk = true;
+                    let configErr = '';
+                    if (key === 'baidu' || key === 'quark') {
+                        try {
+                            savePanCredentialToConfig(resolveRuntimeRootDir(), key, { cookie, username, password });
+                        } catch (e) {
+                            configOk = false;
+                            configErr = e && e.message ? String(e.message) : 'config save failed';
+                        }
+                    }
+
                     for (const r of candidates) {
                         const endpoint = `http://127.0.0.1:${r.port}/website/${encodeURIComponent(key)}/${type}`;
                         const payload = type === 'account' ? { username, password } : { cookie };
@@ -662,14 +742,16 @@ export const apiPlugins = [
                         lastErr = unwrapped.message || 'save failed';
                     }
 
-                    if (saved) {
+                    if (saved && configOk) {
                         okCount += 1;
                         results.push({ key, ok: true, skipped: false, message: '' });
                     } else {
                         failCount += 1;
-                        results.push({ key, ok: false, skipped: false, message: lastErr || 'save failed' });
+                        const msg = !configOk ? configErr || 'config save failed' : lastErr || 'save failed';
+                        results.push({ key, ok: false, skipped: false, message: msg });
                     }
                 }
+
 
                 return reply.send({
                     success: true,

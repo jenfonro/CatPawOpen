@@ -24,16 +24,6 @@ function toStr(v) {
     return typeof v === 'string' ? v : v == null ? '' : String(v);
 }
 
-function resolveRuntimeRootDir() {
-    try {
-        if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
-            return path.dirname(process.execPath);
-        }
-    } catch (_) {}
-    const p = typeof process.env.NODE_PATH === 'string' && process.env.NODE_PATH.trim() ? process.env.NODE_PATH.trim() : '';
-    return p ? path.resolve(p) : process.cwd();
-}
-
 function normalizeBase64Input(value) {
     let s = toStr(value).trim();
     if (!s) return '';
@@ -128,48 +118,40 @@ function decodeAccountFromAuthorization(authorization) {
     return parseDecoded(tokenRaw);
 }
 
-function getDbJsonPathCandidates() {
-    const out = [];
+function resolveRuntimeRootDir() {
     try {
-        const root = resolveRuntimeRootDir();
-        out.push(path.resolve(root, 'db.json'));
+        if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
+            return path.dirname(process.execPath);
+        }
     } catch (_) {}
-    try {
-        out.push(path.resolve(process.cwd(), 'db.json'));
-    } catch (_) {}
-    return out.filter(Boolean);
+    const p = typeof process.env.NODE_PATH === 'string' && process.env.NODE_PATH.trim() ? process.env.NODE_PATH.trim() : '';
+    return p ? path.resolve(p) : process.cwd();
 }
 
-function readJsonFileSafe(filePath) {
+function readConfigJsonSafe(configPath) {
     try {
-        if (!filePath || !fs.existsSync(filePath)) return null;
-        const raw = fs.readFileSync(filePath, 'utf8');
-        const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
-        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+        if (!configPath || !fs.existsSync(configPath)) return {};
+        const raw = fs.readFileSync(configPath, 'utf8');
+        const parsed = raw && raw.trim() ? JSON.parse(raw) : {};
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
     } catch (_) {
-        return null;
+        return {};
     }
-}
-
-function get139AuthorizationFromDbFile() {
-    for (const p of getDbJsonPathCandidates()) {
-        const root = readJsonFileSafe(p);
-        const obj = root && typeof root === 'object' ? root['139'] : null;
-        const v = obj && typeof obj === 'object' ? obj.authorization : '';
-        const s = toStr(v).trim();
-        if (s) return s;
-    }
-    return '';
 }
 
 async function get139Authorization(instance) {
+    // Persisted in config.json (main process runtime root) under:
+    // { account: { "139": { authorization: "..." } } }
     try {
-        if (instance && instance.db && typeof instance.db.getData === 'function') {
-            const v = instance.db.getData('/139/authorization');
-            if (typeof v === 'string' && v.trim()) return v.trim();
-        }
+        const runtimeRoot = resolveRuntimeRootDir();
+        const cfgPath = path.resolve(runtimeRoot, 'config.json');
+        const cfgRoot = readConfigJsonSafe(cfgPath);
+        const account = cfgRoot && typeof cfgRoot.account === 'object' && cfgRoot.account && !Array.isArray(cfgRoot.account) ? cfgRoot.account : {};
+        const p139 = account && typeof account['139'] === 'object' && account['139'] && !Array.isArray(account['139']) ? account['139'] : {};
+        const v = typeof p139.authorization === 'string' ? p139.authorization : '';
+        return v.trim();
     } catch (_) {}
-    return get139AuthorizationFromDbFile();
+    return '';
 }
 
 function buildMcloudHeaders({ authorization, bodyForSign }) {

@@ -21,7 +21,8 @@ function resolveCatPawOpenVersion() {
     // In local dev (`npm run dev`), prefer a beta version so API responses don't look like a release build.
     // Keep it stable per process (not per request).
     try {
-        if (!(process && process.pkg) && String(process.env.NODE_ENV || '').trim() === 'development') {
+        const env = String(process.env.NODE_ENV || '').trim().toLowerCase();
+        if (!(process && process.pkg) && env !== 'production') {
             return `beta-${DEV_BUILD_STAMP}`;
         }
     } catch (_) {}

@@ -1,5 +1,8 @@
 // Quark API plugin.
 
+import fs from 'node:fs';
+import path from 'node:path';
+
 const QUARK_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch';
 
@@ -21,10 +24,24 @@ function maskForLog(value, head = 6, tail = 4) {
 
 async function readDbRoot(server) {
   try {
-    const db = server && server.db ? server.db : null;
-    if (!db || typeof db.getData !== 'function') return {};
-    const root = await db.getData('/');
-    return root && typeof root === 'object' && !Array.isArray(root) ? root : {};
+    const _ = server;
+    const rootDir = (() => {
+      try {
+        if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
+          return path.dirname(process.execPath);
+        }
+      } catch {}
+      try {
+        const envRoot = typeof process.env.NODE_PATH === 'string' ? process.env.NODE_PATH.trim() : '';
+        if (envRoot) return path.resolve(envRoot);
+      } catch {}
+      return process.cwd();
+    })();
+    const cfgPath = path.resolve(rootDir, 'config.json');
+    if (!fs.existsSync(cfgPath)) return {};
+    const raw = fs.readFileSync(cfgPath, 'utf8');
+    const parsed = raw && raw.trim() ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
   } catch {
     return {};
   }
@@ -37,12 +54,14 @@ function looksLikeCookieString(v) {
 
 function getQuarkCookieFromDbRoot(root) {
   try {
-    const q = root && typeof root === 'object' ? root.quark : null;
+    const account =
+      root && typeof root === 'object' && root.account && typeof root.account === 'object' && !Array.isArray(root.account)
+        ? root.account
+        : null;
+    const q = account ? account.quark : null;
     if (typeof q === 'string') return q.trim();
     if (!q || typeof q !== 'object' || Array.isArray(q)) return '';
-    for (const v of Object.values(q)) {
-      if (typeof v === 'string' && looksLikeCookieString(v)) return v.trim();
-    }
+    return typeof q.cookie === 'string' ? q.cookie.trim() : '';
   } catch {}
   return '';
 }

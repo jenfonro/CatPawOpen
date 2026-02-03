@@ -1,5 +1,7 @@
 // Baidu Netdisk API plugin.
 
+import fs from 'node:fs';
+import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
 import zlib from 'node:zlib';
@@ -223,10 +225,24 @@ function looksLikeCookieString(v) {
 
 async function readDbRoot(server) {
   try {
-    const db = server && server.db ? server.db : null;
-    if (!db || typeof db.getData !== 'function') return {};
-    const root = await db.getData('/');
-    return root && typeof root === 'object' && !Array.isArray(root) ? root : {};
+    const _ = server;
+    const rootDir = (() => {
+      try {
+        if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
+          return path.dirname(process.execPath);
+        }
+      } catch {}
+      try {
+        const envRoot = typeof process.env.NODE_PATH === 'string' ? process.env.NODE_PATH.trim() : '';
+        if (envRoot) return path.resolve(envRoot);
+      } catch {}
+      return process.cwd();
+    })();
+    const cfgPath = path.resolve(rootDir, 'config.json');
+    if (!fs.existsSync(cfgPath)) return {};
+    const raw = fs.readFileSync(cfgPath, 'utf8');
+    const parsed = raw && raw.trim() ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
   } catch {
     return {};
   }
@@ -234,12 +250,14 @@ async function readDbRoot(server) {
 
 function getBaiduCookieFromDbRoot(root) {
   try {
-    const b = root && typeof root === 'object' ? root.baidu : null;
+    const account =
+      root && typeof root === 'object' && root.account && typeof root.account === 'object' && !Array.isArray(root.account)
+        ? root.account
+        : null;
+    const b = account ? account.baidu : null;
     if (typeof b === 'string') return b.trim();
     if (!b || typeof b !== 'object' || Array.isArray(b)) return '';
-    for (const v of Object.values(b)) {
-      if (typeof v === 'string' && looksLikeCookieString(v)) return v.trim();
-    }
+    return typeof b.cookie === 'string' ? b.cookie.trim() : '';
   } catch {}
   return '';
 }
