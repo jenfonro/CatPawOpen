@@ -11,3 +11,7 @@ Due to the differences across platforms, there are certain functionalities withi
 Dev `npm run dev`
 
 Build `npm run build`
+
+### Security note
+
+Unregistered routes are rejected with HTTP `403` (no routing hints are returned).

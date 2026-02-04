@@ -641,16 +641,7 @@ export default async function router(fastify) {
 
     // Online runtime routes must be accessed via an explicit id prefix.
     fastify.setNotFoundHandler(async function (request, reply) {
-        const ids =
-            fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.keys === 'function'
-                ? Array.from(fastify.onlineRuntimePorts.keys())
-                : [];
-        const urlPath = (request && request.raw && typeof request.raw.url === 'string' ? request.raw.url : request.url) || '/';
-        return reply.code(404).send({
-            error: 'route not found',
-            path: urlPath,
-            hint: ids.length ? `use /${ids[0]}/... (or /online/<id>/...)` : 'no online runtime loaded',
-            onlineRuntimeIds: ids,
-        });
+        // Security: do not leak runtime ids or routing hints for unregistered routes.
+        return reply.code(403).send({ error: 'forbidden' });
     });
 }
