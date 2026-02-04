@@ -260,7 +260,12 @@ export async function start(config) {
         } catch (_) {}
     }, pollMs);
 
-    const startPortRaw = typeof process.env.DEV_HTTP_PORT === 'string' ? process.env.DEV_HTTP_PORT : '';
+    const startPortRaw =
+        typeof process.env.DEV_HTTP_PORT === 'string' && process.env.DEV_HTTP_PORT.trim()
+            ? process.env.DEV_HTTP_PORT
+            : typeof process.env.PORT === 'string'
+              ? process.env.PORT
+              : '';
     const trimmedPort = String(startPortRaw || '').trim();
     // Important: Number('') === 0, so treat empty env as "not set".
     const parsedPort = trimmedPort ? Math.trunc(Number(trimmedPort)) : 0;
