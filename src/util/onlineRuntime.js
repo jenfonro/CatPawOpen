@@ -433,6 +433,50 @@ export function startOnlineRuntime({ id = 'default', port = 9988, logPrefix = '[
 	    await globalThis.Ndr(baseCfg);
 	    patchBodyShape(globalThis.xn);
 	    ensureConfigDefaults(globalThis.xn);
+	    // Guard against accidental credential wipe:
+	    // Some bundled scripts may push('/uc/<hash>', '') during unrelated flows (e.g. category probe),
+	    // which overwrites a previously saved UC cookie with empty string.
+	    try {
+	      const srv = globalThis.xn;
+
+	      if (srv && srv.db && typeof srv.db.push === 'function' && typeof srv.db.getData === 'function') {
+	        const origPush = srv.db.push.bind(srv.db);
+	        srv.db.push = async (...args) => {
+	          try {
+	            const p = args[0];
+	            const v = args[1];
+	            if (typeof p === 'string') {
+	              // 1) Prevent overwriting "/uc/<md5>" with empty string if there is already a non-empty value.
+	              if (/^\\/uc\\/[0-9a-f]{32}$/i.test(p) && typeof v === 'string' && v === '') {
+	                try {
+	                  const cur = await srv.db.getData(p);
+	                  if (typeof cur === 'string' && cur.trim()) return cur;
+	                } catch (_) {}
+	              }
+
+	              // 2) If a script writes the whole "/uc" object, keep existing non-empty md5 keys.
+	              if (p === '/uc' && v && typeof v === 'object' && !Array.isArray(v)) {
+	                let out = null;
+	                for (const k of Object.keys(v)) {
+	                  if (!/^[0-9a-f]{32}$/i.test(k)) continue;
+	                  const vv = v[k];
+	                  if (typeof vv !== 'string' || vv !== '') continue;
+	                  try {
+	                    const cur = await srv.db.getData('/uc/' + k);
+	                    if (typeof cur === 'string' && cur.trim()) {
+	                      if (!out) out = Object.assign({}, v);
+	                      out[k] = cur;
+	                    }
+	                  } catch (_) {}
+	                }
+	                if (out) args[1] = out;
+	              }
+	            }
+	          } catch (_) {}
+	          return origPush(...args);
+	        };
+	      }
+	    } catch (_) {}
 
     return;
   }
