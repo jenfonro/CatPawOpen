@@ -88,7 +88,7 @@ function buildOnlineFileName(urlStr, id) {
 
 async function downloadText(url) {
     const res = await axios.get(url, {
-        timeout: 20000,
+        timeout: 30000,
         maxRedirects: 5,
         responseType: 'arraybuffer',
         maxContentLength: 10 * 1024 * 1024,

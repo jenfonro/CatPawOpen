@@ -303,25 +303,39 @@ async function checkRuntimeHealthy(port, runtimeId, entryBaseName) {
     const p = Number.isFinite(Number(port)) ? Math.max(1, Math.trunc(Number(port))) : 0;
     if (!p) return { ok: false, message: 'invalid port' };
 
-    // Wait briefly for the child server to start accepting connections.
+    const totalTimeoutMs = 30000;
+    const perTryTimeoutMs = 2500;
+    const retryDelayMs = 500;
+
+    // Wait for the child server to start accepting connections.
     // Keep total wait bounded to avoid blocking the dashboard too long.
-    const tries = 6;
-    for (let i = 0; i < tries; i += 1) {
+    const deadline = Date.now() + totalTimeoutMs;
+    let lastErrMsg = 'unreachable';
+    while (true) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+            return {
+                ok: false,
+                message: lastErrMsg || 'timeout',
+                runtime: { id: runtimeId, port: p, entry: entryBaseName },
+            };
+        }
+
+        const tryTimeoutMs = Math.max(100, Math.min(perTryTimeoutMs, remainingMs - 100));
         try {
             // eslint-disable-next-line no-await-in-loop
-            const cfg = await httpGetJson(`http://127.0.0.1:${p}/full-config`, { timeoutMs: 2500 });
+            const cfg = await httpGetJson(`http://127.0.0.1:${p}/full-config`, { timeoutMs: tryTimeoutMs });
             if (cfg && typeof cfg === 'object') {
                 return { ok: true, message: '', runtime: { id: runtimeId, port: p, entry: entryBaseName } };
             }
         } catch (e) {
-            const msg = e && e.message ? String(e.message) : 'unreachable';
-            // retry
-            if (i === tries - 1) return { ok: false, message: msg, runtime: { id: runtimeId, port: p, entry: entryBaseName } };
+            lastErrMsg = e && e.message ? String(e.message) : 'unreachable';
         }
+
+        const sleepMs = Math.min(retryDelayMs, Math.max(0, deadline - Date.now()));
         // eslint-disable-next-line no-await-in-loop
-        await sleep(300);
+        await sleep(sleepMs);
     }
-    return { ok: false, message: 'unreachable', runtime: { id: runtimeId, port: p, entry: entryBaseName } };
 }
 
 async function syncOnlineRuntimesNow(fastify, rootDir) {
@@ -532,6 +546,7 @@ export const apiPlugins = [
                                     name,
                                     ...(id ? { id } : {}),
                                     status: 'error',
+                                    phase: 'download',
                                     message: 'download failed',
                                 });
                                 continue;
@@ -548,7 +563,7 @@ export const apiPlugins = [
                                 name,
                                 ...(id ? { id } : {}),
                                 status: health.ok ? 'pass' : 'error',
-                                ...(health.ok ? {} : { message: health.message || 'runtime not ready' }),
+                                ...(health.ok ? {} : { phase: 'runtime', message: 'runtime failed' }),
                                 ...(health.runtime ? { runtime: health.runtime } : {}),
                             });
                         }
