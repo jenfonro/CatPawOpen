@@ -339,9 +339,8 @@ async function quarkTvLinkByFid({ fid, root, rootDir, method }) {
   }
 }
 
-async function readDbRoot(server) {
+async function readDbRoot() {
   try {
-    void server;
     const rootDir = resolveRuntimeRootDir();
     const cfgPath = path.resolve(rootDir, 'config.json');
     return readJsonFileSafe(cfgPath);
@@ -590,6 +589,19 @@ function mergeCookieString(baseCookie, setCookies) {
   return Array.from(out.entries())
     .map(([k, v]) => `${k}=${v}`)
     .join('; ');
+}
+
+function tryGetStringArrayByPath(root, pathParts) {
+  try {
+    let cur = root;
+    for (const p of pathParts) {
+      if (!cur || typeof cur !== 'object') return [];
+      cur = cur[p];
+    }
+    if (!Array.isArray(cur)) return [];
+    return cur.map((x) => String(x || '').trim()).filter(Boolean);
+  } catch {}
+  return [];
 }
 
 async function fetchJsonDetailed(url, init) {
@@ -858,7 +870,11 @@ async function quarkShareSave({ shareId, stoken, fid, fidToken, toPdirFid, cooki
     if (finished) break;
     await new Promise((r) => setTimeout(r, 300));
   }
-  return { ok: true, task: lastTask, toPdirFid: toPdir };
+  const savedFids =
+    tryGetStringArrayByPath(lastTask, ['data', 'save_as', 'save_as_top_fids']) ||
+    tryGetStringArrayByPath(lastTask, ['data', 'save_as', 'save_as_top_fid']) ||
+    [];
+  return { ok: true, task: lastTask, toPdirFid: toPdir, savedFids };
 }
 
 async function getShareDetail({ shareId, stoken, passcode, cookie, pdirFid }) {
@@ -936,7 +952,15 @@ async function quarkDirectDownload({ fid, fidToken, cookie, want }) {
 async function resolveDownloadUrl({ shareId, stoken, fid, fidToken, toPdirFid, cookie, want }) {
   const toPdir = String(toPdirFid || '').trim() || '0';
   if (toPdir === '0') throw new Error('missing to_pdir_fid');
-  await quarkShareSave({ shareId, stoken, fid, fidToken, toPdirFid: toPdir, cookie });
+  const saved = await quarkShareSave({ shareId, stoken, fid, fidToken, toPdirFid: toPdir, cookie });
+  const savedFids = Array.isArray(saved && saved.savedFids) ? saved.savedFids : [];
+  if (savedFids.length) {
+    try {
+      return await quarkDirectDownload({ fid: savedFids[0], fidToken: '', cookie, want });
+    } catch {
+      // fall through to list fallback
+    }
+  }
 
   // After save, pick the saved file from destination folder and request a direct url for it.
   const sortResp = await quarkListDir({ pdirFid: toPdir, cookie, size: 200 });
@@ -1428,9 +1452,10 @@ const apiPlugins = [
           return { ok: false, message: msg };
         }
 
+        let savedFid = '';
         try {
           stage = 'save';
-          await quarkShareSave({
+          const saved = await quarkShareSave({
             shareId: parsed.shareId,
             stoken: parsed.stoken,
             fid: parsed.fid,
@@ -1438,6 +1463,8 @@ const apiPlugins = [
             toPdirFid,
             cookie,
           });
+          const savedFids = Array.isArray(saved && saved.savedFids) ? saved.savedFids : [];
+          if (savedFids.length) savedFid = String(savedFids[0] || '').trim();
         } catch (e) {
           const msg = ((e && e.message) || String(e)).slice(0, 400);
           panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
@@ -1445,16 +1472,18 @@ const apiPlugins = [
           return { ok: false, message: msg };
         }
 
-        // List destination folder and request a direct url for the first saved file.
-        let picked = null;
-        try {
-          stage = 'list';
-          picked = await pickFirstFileInDir();
-        } catch (e) {
-          const msg = ((e && e.message) || String(e)).slice(0, 400);
-          panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
-          reply.code(502);
-          return { ok: false, message: msg };
+        // Prefer `save_as_top_fids` from the task result; fall back to listing when missing.
+        let picked = savedFid ? { fid: savedFid } : null;
+        if (!picked) {
+          try {
+            stage = 'list';
+            picked = await pickFirstFileInDir();
+          } catch (e) {
+            const msg = ((e && e.message) || String(e)).slice(0, 400);
+            panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
+            reply.code(502);
+            return { ok: false, message: msg };
+          }
         }
 
         const pickedFid = picked ? String(picked.fid || picked.file_id || picked.id || '').trim() : '';

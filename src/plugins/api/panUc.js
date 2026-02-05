@@ -410,9 +410,8 @@ function saveUcCookieToConfig(rootDir, cookie) {
   return { cfgPath, saved: true };
 }
 
-async function readDbRoot(server) {
+async function readDbRoot() {
   try {
-    void server;
     const rootDir = resolveRuntimeRootDir();
     const cfgPath = path.resolve(rootDir, 'config.json');
     return readJsonFileSafe(cfgPath);
@@ -448,27 +447,6 @@ function getUcCookieFromDbRoot(root) {
     if (out4) return out4;
   } catch {}
   return '';
-}
-
-async function fetchJson(url, init) {
-  const res = await fetch(url, { redirect: 'manual', ...init });
-  const text = await res.text();
-  let data;
-  try {
-    data = text && text.trim() ? JSON.parse(text) : null;
-  } catch {
-    data = null;
-  }
-  if (!res.ok) {
-    const msg = (data && (data.message || data.msg)) || text || `status=${res.status}`;
-    const err = new Error(`uc http ${res.status}: ${String(msg).slice(0, 300)}`);
-    err.status = res.status;
-    throw err;
-  }
-  if (data && typeof data === 'object' && 'code' in data && Number(data.code) !== 0) {
-    throw new Error(`uc api code=${data.code} message=${String(data.message || '').slice(0, 300)}`);
-  }
-  return data;
 }
 
 function cookieHasKey(cookieStr, key) {
