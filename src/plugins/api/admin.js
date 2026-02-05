@@ -106,6 +106,49 @@ function savePanCredentialToConfig(rootDir, key, value) {
     writeJsonFileAtomic(cfgPath, next);
 }
 
+function saveQuarkTvCredentialToConfig(rootDir, value) {
+    const root = rootDir ? String(rootDir) : '';
+    const v = value && typeof value === 'object' ? value : {};
+    if (!root) throw new Error('invalid runtime root');
+
+    const refreshToken =
+        typeof v.refresh_token === 'string'
+            ? v.refresh_token.trim()
+            : typeof v.refreshToken === 'string'
+              ? v.refreshToken.trim()
+              : '';
+    const deviceId =
+        typeof v.device_id === 'string'
+            ? v.device_id.trim()
+            : typeof v.deviceId === 'string'
+              ? v.deviceId.trim()
+              : '';
+
+    if (!refreshToken || !deviceId) throw new Error('missing quark_tv refresh_token/device_id');
+
+    const cfgPath = path.resolve(root, 'config.json');
+    const cfgRoot = readJsonFileSafe(cfgPath) || {};
+    const next = cfgRoot && typeof cfgRoot === 'object' && !Array.isArray(cfgRoot) ? { ...cfgRoot } : {};
+
+    const account =
+        next.account && typeof next.account === 'object' && next.account && !Array.isArray(next.account) ? { ...next.account } : {};
+    const prev =
+        account.quark_tv && typeof account.quark_tv === 'object' && account.quark_tv && !Array.isArray(account.quark_tv)
+            ? { ...account.quark_tv }
+            : {};
+
+    prev.refresh_token = refreshToken;
+    prev.device_id = deviceId;
+    // Reset access_token so the next request will refresh using the new refresh_token/device_id.
+    prev.access_token = '';
+    prev.access_token_exp_at = 0;
+
+    account.quark_tv = prev;
+    next.account = account;
+
+    writeJsonFileAtomic(cfgPath, next);
+}
+
 function normalizeOnlineConfigsInput(body) {
     const b = body && typeof body === 'object' ? body : {};
     const v = Object.prototype.hasOwnProperty.call(b, 'onlineConfigs')
@@ -617,7 +660,7 @@ export const apiPlugins = [
             });
 
             // Sync pan credentials from MeowFilm into the running online runtime(s).
-            // Payload: { pans: { [key]: { cookie? } | { username?, password? } } }
+            // Payload: { pans: { [key]: { cookie? } | { username?, password? } | { refresh_token?, device_id? } } }
             fastify.post('/pan/sync', async function (request, reply) {
                 const ports =
                     fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.entries === 'function'
@@ -673,6 +716,18 @@ export const apiPlugins = [
                     const authorization = typeof val.authorization === 'string' ? val.authorization : '';
                     const username = typeof val.username === 'string' ? val.username : '';
                     const password = typeof val.password === 'string' ? val.password : '';
+                    const refreshToken =
+                        typeof val.refresh_token === 'string'
+                            ? val.refresh_token
+                            : typeof val.refreshToken === 'string'
+                              ? val.refreshToken
+                              : '';
+                    const deviceId =
+                        typeof val.device_id === 'string'
+                            ? val.device_id
+                            : typeof val.deviceId === 'string'
+                              ? val.deviceId
+                              : '';
 
                     // Builtin 139 (移动云盘/和彩云) resolver:
                     // - not managed by `/website/{key}/...` routes
@@ -685,6 +740,28 @@ export const apiPlugins = [
                         }
                         try {
                             save139AuthorizationToConfig(resolveRuntimeRootDir(), nextAuth);
+                            okCount += 1;
+                            results.push({ key, ok: true, skipped: false, message: '' });
+                        } catch (e) {
+                            failCount += 1;
+                            const msg = e && e.message ? String(e.message) : 'save failed';
+                            results.push({ key, ok: false, skipped: false, message: msg });
+                        }
+                        continue;
+                    }
+
+                    // Builtin QuarkTV (open-api-drive) resolver:
+                    // - not managed by `/website/{key}/...` routes
+                    // - persisted into config.json under account.quark_tv so `/api/quark/*` can read it.
+                    if (key === 'quark_tv') {
+                        const rt = String(refreshToken || '').trim();
+                        const dev = String(deviceId || '').trim();
+                        if (!rt || !dev) {
+                            results.push({ key, ok: true, skipped: true, message: 'empty credential' });
+                            continue;
+                        }
+                        try {
+                            saveQuarkTvCredentialToConfig(resolveRuntimeRootDir(), { refresh_token: rt, device_id: dev });
                             okCount += 1;
                             results.push({ key, ok: true, skipped: false, message: '' });
                         } catch (e) {

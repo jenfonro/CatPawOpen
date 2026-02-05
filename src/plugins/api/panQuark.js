@@ -2,12 +2,34 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 const QUARK_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch';
 
 const QUARK_REFERER = 'https://pan.quark.cn';
 const PAN_DEBUG = process.env.PAN_DEBUG === '1';
+
+// QuarkTV (open-api-drive) config: ported from OpenList `drivers/quark_uc_tv`.
+const QUARK_TV_API = 'https://open-api-drive.quark.cn';
+const QUARK_TV_CODE_API = 'http://api.extscreen.com/quarkdrive';
+const QUARK_TV_CLIENT_ID = 'd3194e61504e493eb6222857bccfed94';
+const QUARK_TV_SIGN_KEY = 'kw2dvtd7p4t3pjl2d9ed9yc8yej8kw2d';
+const QUARK_TV_APP_VER = '1.8.2.2';
+const QUARK_TV_CHANNEL = 'GENERAL';
+const QUARK_TV_UA =
+  'Mozilla/5.0 (Linux; U; Android 13; zh-cn; M2004J7AC Build/UKQ1.231108.001) AppleWebKit/533.1 (KHTML, like Gecko) Mobile Safari/533.1';
+const QUARK_TV_DEVICE_BRAND = 'Xiaomi';
+const QUARK_TV_PLATFORM = 'tv';
+const QUARK_TV_DEVICE_NAME = 'M2004J7AC';
+const QUARK_TV_DEVICE_MODEL = 'M2004J7AC';
+const QUARK_TV_BUILD_DEVICE = 'M2004J7AC';
+const QUARK_TV_BUILD_PRODUCT = 'M2004J7AC';
+const QUARK_TV_DEVICE_GPU = 'Adreno (TM) 550';
+const QUARK_TV_ACTIVITY_RECT = '{}';
+const QUARK_TV_TOKEN_SKEW_MS = 60_000;
+const QUARK_TV_TOKEN_REFRESH_DEADLINE_MS = 10_000;
+let quarkTvRefreshInFlight = null;
 
 function panLog(...args) {
   if (!PAN_DEBUG) return;
@@ -57,24 +79,294 @@ function setQuarkPlayUrlCache(key, value) {
   }
 }
 
+function md5Hex(input) {
+  return crypto.createHash('md5').update(String(input == null ? '' : input)).digest('hex');
+}
+
+function sha256Hex(input) {
+  return crypto.createHash('sha256').update(String(input == null ? '' : input)).digest('hex');
+}
+
+function quarkTvGenerateReqSign(method, pathname, deviceId) {
+  const m = String(method || 'GET').toUpperCase();
+  const p = String(pathname || '').trim() || '/';
+  const timestamp = String(Date.now());
+  const dev = String(deviceId || '').trim();
+  const reqId = md5Hex(`${dev}${timestamp}`);
+  const tokenData = `${m}&${p}&${timestamp}&${QUARK_TV_SIGN_KEY}`;
+  const xPanToken = sha256Hex(tokenData);
+  return { tm: timestamp, xPanToken, reqId };
+}
+
+function isQuarkTvAccessTokenInvalid(resp, msg) {
+  try {
+    const r = resp && typeof resp === 'object' ? resp : null;
+    const status = r && Object.prototype.hasOwnProperty.call(r, 'status') ? Number(r.status) : NaN;
+    const errno = r && Object.prototype.hasOwnProperty.call(r, 'errno') ? Number(r.errno) : NaN;
+    if (status === -1 && errno === 10001) return true;
+  } catch {}
+  const m = String(msg || '').toLowerCase();
+  if (!m) return false;
+  return m.includes('access token') || m.includes('access_token') || m.includes('token无效') || m.includes('token 无效');
+}
+
+async function fetchQuarkTvJson(urlStr, init) {
+  const res = await fetch(urlStr, { redirect: 'manual', ...init });
+  const text = await res.text();
+  let data;
+  try {
+    data = text && text.trim() ? JSON.parse(text) : null;
+  } catch {
+    data = null;
+  }
+  if (!res.ok) {
+    const msg = (data && (data.error_info || data.message || data.msg)) || text || `status=${res.status}`;
+    const err = new Error(`quark_tv http ${res.status}: ${String(msg).slice(0, 300)}`);
+    err.status = res.status;
+    err.body = data;
+    throw err;
+  }
+  if (data && typeof data === 'object') {
+    const status = Object.prototype.hasOwnProperty.call(data, 'status') ? Number(data.status) : NaN;
+    const errno = Object.prototype.hasOwnProperty.call(data, 'errno') ? Number(data.errno) : 0;
+    const errInfo =
+      (Object.prototype.hasOwnProperty.call(data, 'error_info') ? data.error_info : '') ||
+      (Object.prototype.hasOwnProperty.call(data, 'message') ? data.message : '') ||
+      '';
+    if ((Number.isFinite(status) && status >= 400) || (Number.isFinite(errno) && errno !== 0)) {
+      const err = new Error(`quark_tv api errno=${Number.isFinite(errno) ? errno : String(data.errno)}: ${String(errInfo || 'request failed').slice(0, 300)}`);
+      err.body = data;
+      err.errno = errno;
+      err.statusCode = status;
+      throw err;
+    }
+  }
+  return data;
+}
+
+async function quarkTvRefreshAccessToken({ rootDir, refreshToken, deviceId }) {
+  const rt = String(refreshToken || '').trim();
+  const dev = String(deviceId || '').trim();
+  if (!rt) throw new Error('missing quark_tv refresh_token');
+  if (!dev) throw new Error('missing quark_tv device_id');
+
+  const { reqId } = quarkTvGenerateReqSign('POST', '/token', dev);
+  const url = `${QUARK_TV_CODE_API}/token`;
+  const body = {
+    req_id: reqId,
+    app_ver: QUARK_TV_APP_VER,
+    device_id: dev,
+    device_brand: QUARK_TV_DEVICE_BRAND,
+    platform: QUARK_TV_PLATFORM,
+    device_name: QUARK_TV_DEVICE_NAME,
+    device_model: QUARK_TV_DEVICE_MODEL,
+    build_device: QUARK_TV_BUILD_DEVICE,
+    build_product: QUARK_TV_BUILD_PRODUCT,
+    device_gpu: QUARK_TV_DEVICE_GPU,
+    activity_rect: QUARK_TV_ACTIVITY_RECT,
+    channel: QUARK_TV_CHANNEL,
+    refresh_token: rt,
+  };
+
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  const t = setTimeout(() => {
+    try {
+      if (ctrl) ctrl.abort(new Error('timeout'));
+    } catch {}
+  }, QUARK_TV_TOKEN_REFRESH_DEADLINE_MS);
+  let resp;
+  try {
+    resp = await fetchQuarkTvJson(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      ...(ctrl ? { signal: ctrl.signal } : {}),
+    });
+  } finally {
+    clearTimeout(t);
+  }
+
+  const code = resp && typeof resp === 'object' && 'code' in resp ? Number(resp.code) : NaN;
+  if (code !== 200) {
+    const msg = (resp && typeof resp === 'object' && (resp.message || resp.msg)) || 'refresh failed';
+    const err = new Error(`quark_tv refresh failed: ${String(msg).slice(0, 300)}`);
+    err.body = resp;
+    throw err;
+  }
+  const data = resp && typeof resp === 'object' && resp.data && typeof resp.data === 'object' ? resp.data : null;
+  const accessToken = data && typeof data.access_token === 'string' ? data.access_token.trim() : '';
+  const nextRefresh = data && typeof data.refresh_token === 'string' ? data.refresh_token.trim() : '';
+  const expiresIn = data && Number.isFinite(Number(data.expires_in)) ? Math.trunc(Number(data.expires_in)) : 0;
+  if (!accessToken) throw new Error('quark_tv refresh failed: empty access_token');
+
+  const expAt = expiresIn > 0 ? Date.now() + expiresIn * 1000 : 0;
+  try {
+    saveQuarkTvAccountToConfig(rootDir, {
+      refreshToken: nextRefresh || rt,
+      deviceId: dev,
+      accessToken,
+      accessTokenExpAt: expAt,
+    });
+  } catch (e) {
+    panLog('quark_tv token save failed', (e && e.message) || String(e));
+  }
+
+  return { accessToken, refreshToken: nextRefresh || rt, expiresIn, expAt };
+}
+
+async function ensureQuarkTvAccessToken({ rootDir, account }) {
+  const root = rootDir ? String(rootDir) : resolveRuntimeRootDir();
+  const a = account && typeof account === 'object' ? account : {};
+  const refreshToken = String(a.refreshToken || '').trim();
+  const deviceId = String(a.deviceId || '').trim();
+  const accessToken = String(a.accessToken || '').trim();
+  const expAt = Number.isFinite(Number(a.accessTokenExpAt)) ? Math.trunc(Number(a.accessTokenExpAt)) : 0;
+
+  const needRefresh =
+    !accessToken ||
+    (expAt > 0 && Date.now() + QUARK_TV_TOKEN_SKEW_MS >= expAt);
+
+  if (!needRefresh) return { accessToken, refreshToken, deviceId, expAt };
+
+  if (!quarkTvRefreshInFlight) {
+    quarkTvRefreshInFlight = (async () => {
+      try {
+        return await quarkTvRefreshAccessToken({ rootDir: root, refreshToken, deviceId });
+      } finally {
+        quarkTvRefreshInFlight = null;
+      }
+    })();
+  }
+  const out = await quarkTvRefreshInFlight;
+  return { accessToken: out.accessToken, refreshToken: out.refreshToken, deviceId, expAt: out.expAt };
+}
+
+async function quarkTvLinkByFid({ fid, root, rootDir, method }) {
+  const fId = String(fid || '').trim();
+  if (!fId) throw new Error('missing fid');
+  const runtimeRoot = rootDir ? String(rootDir) : resolveRuntimeRootDir();
+  const account = getQuarkTvAccountFromDbRoot(root);
+  if (!account || !account.refreshToken || !account.deviceId) throw new Error('missing quark_tv credentials (account.quark_tv.refresh_token + device_id)');
+
+  let tokens = await ensureQuarkTvAccessToken({ rootDir: runtimeRoot, account });
+  const m = String(method || 'streaming').trim().toLowerCase();
+  const apiMethod = m === 'download' ? 'download' : 'streaming';
+
+  const callOnce = async () => {
+    const { tm, xPanToken, reqId } = quarkTvGenerateReqSign('GET', '/file', tokens.deviceId);
+    const u = new URL(`${QUARK_TV_API}/file`);
+    const base = {
+      req_id: reqId,
+      access_token: tokens.accessToken,
+      app_ver: QUARK_TV_APP_VER,
+      device_id: tokens.deviceId,
+      device_brand: QUARK_TV_DEVICE_BRAND,
+      platform: QUARK_TV_PLATFORM,
+      device_name: QUARK_TV_DEVICE_NAME,
+      device_model: QUARK_TV_DEVICE_MODEL,
+      build_device: QUARK_TV_BUILD_DEVICE,
+      build_product: QUARK_TV_BUILD_PRODUCT,
+      device_gpu: QUARK_TV_DEVICE_GPU,
+      activity_rect: QUARK_TV_ACTIVITY_RECT,
+      channel: QUARK_TV_CHANNEL,
+      method: apiMethod,
+      group_by: 'source',
+      fid: fId,
+      resolution: 'low,normal,high,super,2k,4k',
+      support: 'dolby_vision',
+    };
+    for (const [k, v] of Object.entries(base)) u.searchParams.set(k, String(v));
+
+    const headers = {
+      Accept: 'application/json, text/plain, */*',
+      'User-Agent': QUARK_TV_UA,
+      'x-pan-tm': tm,
+      'x-pan-token': xPanToken,
+      'x-pan-client-id': QUARK_TV_CLIENT_ID,
+    };
+    return await fetchQuarkTvJson(u.toString(), { method: 'GET', headers });
+  };
+
+  try {
+    const resp = await callOnce();
+    const data = resp && typeof resp === 'object' && resp.data && typeof resp.data === 'object' ? resp.data : null;
+    let url = '';
+    if (apiMethod === 'download') {
+      url = data && typeof data.download_url === 'string' ? data.download_url.trim() : '';
+      if (!url) throw new Error('quark_tv download_url not found');
+    } else {
+      const list = data && Array.isArray(data.video_info) ? data.video_info : [];
+      for (const it of list) {
+        if (!it || typeof it !== 'object') continue;
+        const u = typeof it.url === 'string' ? it.url.trim() : '';
+        if (u) {
+          url = u;
+          break;
+        }
+      }
+      if (!url) throw new Error('quark_tv streaming url not found');
+    }
+    return { url, raw: resp, method: apiMethod };
+  } catch (e) {
+    const body = e && e.body ? e.body : null;
+    const msg = (e && e.message) || String(e);
+    if (!isQuarkTvAccessTokenInvalid(body, msg)) throw e;
+    const refreshed = await quarkTvRefreshAccessToken({
+      rootDir: runtimeRoot,
+      refreshToken: account.refreshToken,
+      deviceId: account.deviceId,
+    });
+    tokens = { ...tokens, accessToken: refreshed.accessToken };
+    const resp2 = await callOnce();
+    const data2 = resp2 && typeof resp2 === 'object' && resp2.data && typeof resp2.data === 'object' ? resp2.data : null;
+    let url2 = '';
+    if (apiMethod === 'download') {
+      url2 = data2 && typeof data2.download_url === 'string' ? data2.download_url.trim() : '';
+      if (!url2) throw new Error('quark_tv download_url not found');
+    } else {
+      const list2 = data2 && Array.isArray(data2.video_info) ? data2.video_info : [];
+      for (const it of list2) {
+        if (!it || typeof it !== 'object') continue;
+        const u = typeof it.url === 'string' ? it.url.trim() : '';
+        if (u) {
+          url2 = u;
+          break;
+        }
+      }
+      if (!url2) throw new Error('quark_tv streaming url not found');
+    }
+    return { url: url2, raw: resp2, method: apiMethod };
+  }
+}
+
 async function readDbRoot(server) {
   try {
-    const _ = server;
-    const rootDir = (() => {
-      try {
-        if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
-          return path.dirname(process.execPath);
-        }
-      } catch {}
-      try {
-        const envRoot = typeof process.env.NODE_PATH === 'string' ? process.env.NODE_PATH.trim() : '';
-        if (envRoot) return path.resolve(envRoot);
-      } catch {}
-      return process.cwd();
-    })();
+    void server;
+    const rootDir = resolveRuntimeRootDir();
     const cfgPath = path.resolve(rootDir, 'config.json');
-    if (!fs.existsSync(cfgPath)) return {};
-    const raw = fs.readFileSync(cfgPath, 'utf8');
+    return readJsonFileSafe(cfgPath);
+  } catch {
+    return {};
+  }
+}
+
+function resolveRuntimeRootDir() {
+  try {
+    if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
+      return path.dirname(process.execPath);
+    }
+  } catch {}
+  try {
+    const envRoot = typeof process.env.NODE_PATH === 'string' ? process.env.NODE_PATH.trim() : '';
+    if (envRoot) return path.resolve(envRoot);
+  } catch {}
+  return process.cwd();
+}
+
+function readJsonFileSafe(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return {};
+    const raw = fs.readFileSync(filePath, 'utf8');
     const parsed = raw && raw.trim() ? JSON.parse(raw) : {};
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
   } catch {
@@ -82,9 +374,17 @@ async function readDbRoot(server) {
   }
 }
 
-function looksLikeCookieString(v) {
-  const s = String(v || '').trim();
-  return !!(s && s.includes('='));
+function atomicWriteFile(filePath, content) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.resolve(dir, `.${path.basename(filePath)}.tmp.${process.pid}.${Date.now()}`);
+  fs.writeFileSync(tmp, content, 'utf8');
+  fs.renameSync(tmp, filePath);
+}
+
+function writeJsonFileAtomic(filePath, obj) {
+  const root = obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
+  atomicWriteFile(filePath, `${JSON.stringify(root, null, 2)}\n`);
 }
 
 function getQuarkCookieFromDbRoot(root) {
@@ -99,6 +399,55 @@ function getQuarkCookieFromDbRoot(root) {
     return typeof q.cookie === 'string' ? q.cookie.trim() : '';
   } catch {}
   return '';
+}
+
+function getQuarkTvAccountFromDbRoot(root) {
+  try {
+    const account =
+      root && typeof root === 'object' && root.account && typeof root.account === 'object' && !Array.isArray(root.account)
+        ? root.account
+        : null;
+    const q = account ? account.quark_tv : null;
+    if (!q || typeof q !== 'object' || Array.isArray(q)) return { refreshToken: '', deviceId: '', accessToken: '', accessTokenExpAt: 0 };
+    const refreshToken = typeof q.refresh_token === 'string' ? q.refresh_token.trim() : typeof q.refreshToken === 'string' ? q.refreshToken.trim() : '';
+    const deviceId = typeof q.device_id === 'string' ? q.device_id.trim() : typeof q.deviceId === 'string' ? q.deviceId.trim() : '';
+    const accessToken = typeof q.access_token === 'string' ? q.access_token.trim() : typeof q.accessToken === 'string' ? q.accessToken.trim() : '';
+    const accessTokenExpAt = Number.isFinite(Number(q.access_token_exp_at))
+      ? Math.trunc(Number(q.access_token_exp_at))
+      : Number.isFinite(Number(q.accessTokenExpAt))
+        ? Math.trunc(Number(q.accessTokenExpAt))
+        : 0;
+    return { refreshToken, deviceId, accessToken, accessTokenExpAt };
+  } catch {}
+  return { refreshToken: '', deviceId: '', accessToken: '', accessTokenExpAt: 0 };
+}
+
+function saveQuarkTvAccountToConfig(rootDir, patch) {
+  const root = rootDir ? String(rootDir) : '';
+  const p = patch && typeof patch === 'object' && patch ? patch : {};
+  if (!root) throw new Error('invalid runtime root');
+
+  const cfgPath = path.resolve(root, 'config.json');
+  const cfgRoot = readJsonFileSafe(cfgPath) || {};
+  const next = cfgRoot && typeof cfgRoot === 'object' && !Array.isArray(cfgRoot) ? { ...cfgRoot } : {};
+
+  const account =
+    next.account && typeof next.account === 'object' && next.account && !Array.isArray(next.account) ? { ...next.account } : {};
+  const prev =
+    account.quark_tv && typeof account.quark_tv === 'object' && account.quark_tv && !Array.isArray(account.quark_tv)
+      ? { ...account.quark_tv }
+      : {};
+
+  if (typeof p.refreshToken === 'string' && p.refreshToken.trim()) prev.refresh_token = p.refreshToken.trim();
+  if (typeof p.deviceId === 'string' && p.deviceId.trim()) prev.device_id = p.deviceId.trim();
+  if (typeof p.accessToken === 'string') prev.access_token = p.accessToken.trim();
+  if (Number.isFinite(Number(p.accessTokenExpAt)) && Number(p.accessTokenExpAt) > 0) prev.access_token_exp_at = Math.trunc(Number(p.accessTokenExpAt));
+
+  account.quark_tv = prev;
+  next.account = account;
+
+  writeJsonFileAtomic(cfgPath, next);
+  return { cfgPath, saved: true };
 }
 
 function parseQuarkProxyDownUrl(urlStr) {
@@ -678,18 +1027,19 @@ const apiPlugins = [
           return { ok: false, message: 'missing quark cookie' };
         }
         try {
+          const want = String(body.want || 'download_url').trim() || 'download_url';
           const out = await quarkDirectDownload({
             fid,
             fidToken: body.fidToken || body.fid_token,
             cookie,
-            want: body.want || 'download_url',
+            want,
           });
           return {
             ok: true,
             url: out.url,
             headers: {
               Cookie: out.cookie || cookie,
-              Referer: 'https://pan.quark.cn',
+              Referer: QUARK_REFERER,
               'User-Agent': QUARK_UA,
             },
           };
@@ -898,7 +1248,7 @@ const apiPlugins = [
         const fidToken = String(body.fidToken || body.fid_token || (parsedDown ? parsedDown.fidToken : '') || '').trim();
         const toPdirPath = String(body.toPdirPath || body.to_pdir_path || body.toPath || body.to_path || '').trim();
         let toPdirFid = String(body.toPdirFid || body.to_pdir_fid || '').trim();
-        const want = String(body.want || 'download_url').trim();
+        const want = String(body.want || 'download_url').trim() || 'download_url';
         try {
           if (!toPdirFid) {
             if (!toPdirPath) {
@@ -926,7 +1276,7 @@ const apiPlugins = [
       });
 
       // Direct-download for files that already exist in the user's Quark drive (no share-save/transfer).
-      // Input: { fid, fidToken?, want? }  Output: { ok, url, headers }
+      // Input: { fid, fidToken?, want? }  Output: { ok, url, headers? }
       instance.post('/download', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
         const root = await readDbRoot(req.server);
@@ -954,6 +1304,35 @@ const apiPlugins = [
               'User-Agent': QUARK_UA,
             },
           };
+        } catch (e) {
+          const msg = (e && e.message) || String(e);
+          reply.code(502);
+          return { ok: false, message: msg.slice(0, 400) };
+        }
+      });
+
+      // QuarkTV (open-api-drive) direct-download link by fid.
+      // Reads credential from config.json: { account: { quark_tv: { refresh_token, device_id, ... } } }
+      // Input: { fid, method?: "streaming"|"download" }  Output: { ok, url, method }
+      instance.post('/tv/download', async (req, reply) => {
+        const body = req && typeof req.body === 'object' ? req.body : {};
+        const fid = String(body.fid || body.file_id || body.id || '').trim();
+        if (!fid) {
+          reply.code(400);
+          return { ok: false, message: 'missing fid' };
+        }
+        const method = String(body.method || body.link_method || 'streaming').trim().toLowerCase();
+
+        const root = await readDbRoot(req.server);
+        const tvAcc = getQuarkTvAccountFromDbRoot(root);
+        if (!tvAcc || !tvAcc.refreshToken || !tvAcc.deviceId) {
+          reply.code(400);
+          return { ok: false, message: 'missing quark_tv credentials (account.quark_tv.refresh_token + device_id)' };
+        }
+
+        try {
+          const out = await quarkTvLinkByFid({ fid, root, rootDir: resolveRuntimeRootDir(), method });
+          return { ok: true, url: out.url, method: out.method };
         } catch (e) {
           const msg = (e && e.message) || String(e);
           reply.code(502);
@@ -1000,9 +1379,9 @@ const apiPlugins = [
         if (!isTvPrepare && tvUserForCache) {
           const cacheKey = `v1|${tvUserForCache}|${want}|${rawId}`;
           const cached = getQuarkPlayUrlCache(cacheKey);
-          if (cached && cached.url && cached.header) {
+          if (cached && cached.url) {
             panLog(`quark play cache hit id=${reqId}`, { ms: Date.now() - tStart, want });
-            return { ok: true, url: cached.url, parse: 0, header: cached.header };
+            return { ok: true, url: cached.url, parse: 0, ...(cached.header ? { header: cached.header } : {}) };
           }
         }
 
@@ -1145,13 +1524,59 @@ const apiPlugins = [
         }
 
         try {
-          stage = 'download';
-          const out = await quarkDirectDownload({ fid: pickedFid, fidToken: pickedToken, cookie, want });
-          playCookie = out.cookie || playCookie;
-          playHeader.Cookie = playCookie;
-          const url = out.url;
+          const tvAcc = getQuarkTvAccountFromDbRoot(root);
+          const hasTvCred = !!(tvAcc && tvAcc.refreshToken && tvAcc.deviceId);
+
+          let url = '';
+          let headerOut = playHeader;
+
+          if (hasTvCred) {
+            try {
+              // Prefer QuarkTV streaming (matches OpenList `link_method=streaming` behavior for videos).
+              stage = 'download_tv_streaming';
+              const tvOut = await quarkTvLinkByFid({
+                fid: pickedFid,
+                root,
+                rootDir: resolveRuntimeRootDir(),
+                method: 'streaming',
+              });
+              url = tvOut.url;
+              headerOut = null;
+            } catch (e) {
+              // If QuarkTV fails to refresh access_token (e.g., refresh_token expired), fall back to the original cookie-based resolver.
+              // Also fall back for non-video files (streaming url not found) by trying download once.
+              const msg = (e && e.message) || String(e);
+              panLog(`quark play tv streaming failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: String(msg).slice(0, 240) });
+              try {
+                stage = 'download_tv_download';
+                const tvOut2 = await quarkTvLinkByFid({
+                  fid: pickedFid,
+                  root,
+                  rootDir: resolveRuntimeRootDir(),
+                  method: 'download',
+                });
+                url = tvOut2.url;
+                headerOut = null;
+              } catch (e2) {
+                const msg2 = (e2 && e2.message) || String(e2);
+                panLog(`quark play tv download failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: String(msg2).slice(0, 240) });
+                url = '';
+              }
+            }
+          }
+
+          if (!url) {
+            stage = 'download';
+            const out = await quarkDirectDownload({ fid: pickedFid, fidToken: pickedToken, cookie, want });
+            playCookie = out.cookie || playCookie;
+            playHeader.Cookie = playCookie;
+            url = out.url;
+            headerOut = playHeader;
+          }
+
           panLog(`quark play done id=${reqId}`, {
             ms: Date.now() - tStart,
+            stage,
             want,
             toPdirFid: maskForLog(toPdirFid),
             pickedFid: maskForLog(pickedFid),
@@ -1166,14 +1591,9 @@ const apiPlugins = [
 
           if (tvUserForCache && url) {
             const cacheKey = `v1|${tvUserForCache}|${want}|${rawId}`;
-            setQuarkPlayUrlCache(cacheKey, { url, header: playHeader });
+            setQuarkPlayUrlCache(cacheKey, { url, header: headerOut });
           }
-          return {
-            ok: true,
-            url,
-            parse: 0,
-            header: playHeader,
-          };
+          return { ok: true, url, parse: 0, ...(headerOut ? { header: headerOut } : {}) };
         } catch (e) {
           const msg = ((e && e.message) || String(e)).slice(0, 400);
           panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
