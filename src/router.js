@@ -127,6 +127,12 @@ function isQuarkFlag(flag) {
     return s.includes('夸克') || s.includes('夸父') || s.toLowerCase().includes('quark');
 }
 
+function isUcFlag(flag) {
+    const s = String(flag || '');
+    const lower = s.toLowerCase();
+    return s.includes('优夕') || lower.includes('uc') || s.includes('drive.uc.cn') || s.includes('uc.cn');
+}
+
 function looksLikeHexId32(value) {
     return /^[a-f0-9]{32}$/i.test(String(value || '').trim());
 }
@@ -150,7 +156,7 @@ export default async function router(fastify) {
     }
 
     // Unified play entrypoint:
-    // - if builtin pan resolver enabled: dispatch to /api/{baidu,quark,139}/play based on flag
+    // - if builtin pan resolver enabled: dispatch to /api/{baidu,quark,uc,139}/play based on flag
     // - otherwise (or no match): forward to the target runtime play via siteApi + siteId
     fastify.post('/play', async function (request, reply) {
         const body = request && request.body && typeof request.body === 'object' ? request.body : {};
@@ -164,6 +170,8 @@ export default async function router(fastify) {
         const cfgPath = path.resolve(runtimeRoot, 'config.json');
         const cfgRoot = readConfigJsonSafe(cfgPath);
         const panEnabled = readPanBuiltinResolverEnabledFromConfigRoot(cfgRoot);
+        const hasUcTvCred = !!(cfgRoot && cfgRoot.account && cfgRoot.account.uc_tv && cfgRoot.account.uc_tv.refresh_token && cfgRoot.account.uc_tv.device_id);
+        const hasUcCookie = !!(cfgRoot && cfgRoot.account && cfgRoot.account.uc && cfgRoot.account.uc.cookie);
 
         const rawUrl = request && request.raw && typeof request.raw.url === 'string' ? request.raw.url : '';
         const queryStr = rawUrl.includes('?') ? rawUrl.slice(rawUrl.indexOf('?')) : '';
@@ -172,10 +180,14 @@ export default async function router(fastify) {
 
         // 1) builtin pan resolver path
         if (panEnabled) {
-            let route = isBaiduFlag(flag) ? '/api/baidu/play' : isQuarkFlag(flag) ? '/api/quark/play' : is139Flag(flag) ? '/api/139/play' : '';
+            let route = isBaiduFlag(flag) ? '/api/baidu/play' : isQuarkFlag(flag) ? '/api/quark/play' : isUcFlag(flag) ? '/api/uc/play' : is139Flag(flag) ? '/api/139/play' : '';
             // If the id is already a Quark file id (32-hex), skip save/transfer and request a direct url.
             if (route === '/api/quark/play' && looksLikeHexId32(playId)) {
                 route = '/api/quark/download';
+            }
+            // If the id is already a UC file id (32-hex), request a direct url (prefer UCTV when configured).
+            if (route === '/api/uc/play' && looksLikeHexId32(playId)) {
+                route = hasUcTvCred ? '/api/uc/tv/download' : hasUcCookie ? '/api/uc/file/download' : '/api/uc/tv/download';
             }
             if (route) {
                 const nextBody = { ...body };
@@ -194,6 +206,11 @@ export default async function router(fastify) {
                     // Normalize to the download API input shape.
                     nextBody.fid = playId;
                     delete nextBody.id;
+                }
+                if (route === '/api/uc/tv/download' || route === '/api/uc/file/download') {
+                    nextBody.fid = playId;
+                    delete nextBody.id;
+                    // Keep flag untouched but it's ignored by fid-based UC endpoints.
                 }
                 const injected = await fastify.inject({
                     method: 'POST',

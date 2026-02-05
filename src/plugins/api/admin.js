@@ -149,6 +149,47 @@ function saveQuarkTvCredentialToConfig(rootDir, value) {
     writeJsonFileAtomic(cfgPath, next);
 }
 
+function saveUcTvCredentialToConfig(rootDir, value) {
+    const root = rootDir ? String(rootDir) : '';
+    const v = value && typeof value === 'object' ? value : {};
+    if (!root) throw new Error('invalid runtime root');
+
+    const refreshToken =
+        typeof v.refresh_token === 'string'
+            ? v.refresh_token.trim()
+            : typeof v.refreshToken === 'string'
+              ? v.refreshToken.trim()
+              : '';
+    const deviceId =
+        typeof v.device_id === 'string'
+            ? v.device_id.trim()
+            : typeof v.deviceId === 'string'
+              ? v.deviceId.trim()
+              : '';
+
+    if (!refreshToken || !deviceId) throw new Error('missing uc_tv refresh_token/device_id');
+
+    const cfgPath = path.resolve(root, 'config.json');
+    const cfgRoot = readJsonFileSafe(cfgPath) || {};
+    const next = cfgRoot && typeof cfgRoot === 'object' && !Array.isArray(cfgRoot) ? { ...cfgRoot } : {};
+
+    const account =
+        next.account && typeof next.account === 'object' && next.account && !Array.isArray(next.account) ? { ...next.account } : {};
+    const prev =
+        account.uc_tv && typeof account.uc_tv === 'object' && account.uc_tv && !Array.isArray(account.uc_tv) ? { ...account.uc_tv } : {};
+
+    prev.refresh_token = refreshToken;
+    prev.device_id = deviceId;
+    // Reset access_token so the next request will refresh using the new refresh_token/device_id.
+    prev.access_token = '';
+    prev.access_token_exp_at = 0;
+
+    account.uc_tv = prev;
+    next.account = account;
+
+    writeJsonFileAtomic(cfgPath, next);
+}
+
 function normalizeOnlineConfigsInput(body) {
     const b = body && typeof body === 'object' ? body : {};
     const v = Object.prototype.hasOwnProperty.call(b, 'onlineConfigs')
@@ -751,9 +792,9 @@ export const apiPlugins = [
                         continue;
                     }
 
-                    // Builtin QuarkTV (open-api-drive) resolver:
+                    // Builtin QuarkTV/UCTV (open-api-drive) resolver:
                     // - not managed by `/website/{key}/...` routes
-                    // - persisted into config.json under account.quark_tv so `/api/quark/*` can read it.
+                    // - persisted into config.json under account.{quark_tv|uc_tv} so `/api/{quark|uc}/*` can read it.
                     if (key === 'quark_tv') {
                         const rt = String(refreshToken || '').trim();
                         const dev = String(deviceId || '').trim();
@@ -763,6 +804,25 @@ export const apiPlugins = [
                         }
                         try {
                             saveQuarkTvCredentialToConfig(resolveRuntimeRootDir(), { refresh_token: rt, device_id: dev });
+                            okCount += 1;
+                            results.push({ key, ok: true, skipped: false, message: '' });
+                        } catch (e) {
+                            failCount += 1;
+                            const msg = e && e.message ? String(e.message) : 'save failed';
+                            results.push({ key, ok: false, skipped: false, message: msg });
+                        }
+                        continue;
+                    }
+
+                    if (key === 'uc_tv') {
+                        const rt = String(refreshToken || '').trim();
+                        const dev = String(deviceId || '').trim();
+                        if (!rt || !dev) {
+                            results.push({ key, ok: true, skipped: true, message: 'empty credential' });
+                            continue;
+                        }
+                        try {
+                            saveUcTvCredentialToConfig(resolveRuntimeRootDir(), { refresh_token: rt, device_id: dev });
                             okCount += 1;
                             results.push({ key, ok: true, skipped: false, message: '' });
                         } catch (e) {
