@@ -15,6 +15,77 @@ let configWatchLastMtime = 0;
 let onlineLastEntry = '';
 const onlineRuntimePorts = new Map(); // id -> port
 
+let shutdownHooksInstalled = false;
+let shutdownInProgress = false;
+function installShutdownHooks() {
+    if (shutdownHooksInstalled) return;
+    shutdownHooksInstalled = true;
+
+    const graceful = async (reason) => {
+        if (shutdownInProgress) return;
+        shutdownInProgress = true;
+        try {
+            if (reason) {
+                // eslint-disable-next-line no-console
+                console.log(`[catpawopen] shutting down (${reason})...`);
+            }
+        } catch (_) {}
+        try {
+            await stop();
+        } catch (err) {
+            try {
+                // eslint-disable-next-line no-console
+                console.error(err && err.stack ? err.stack : err);
+            } catch (_) {}
+        } finally {
+            try {
+                process.exit(0);
+            } catch (_) {}
+        }
+    };
+
+    const signals = ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGBREAK'];
+    for (const sig of signals) {
+        try {
+            process.once(sig, () => {
+                void graceful(sig);
+            });
+        } catch (_) {}
+    }
+
+    try {
+        process.once('uncaughtException', (err) => {
+            try {
+                // eslint-disable-next-line no-console
+                console.error(err && err.stack ? err.stack : err);
+            } catch (_) {}
+            void graceful('uncaughtException');
+        });
+    } catch (_) {}
+
+    try {
+        process.once('unhandledRejection', (err) => {
+            try {
+                // eslint-disable-next-line no-console
+                console.error(err && err.stack ? err.stack : err);
+            } catch (_) {}
+            void graceful('unhandledRejection');
+        });
+    } catch (_) {}
+
+    // Best-effort sync cleanup for hard exits.
+    try {
+        process.once('exit', () => {
+            try {
+                stopAllOnlineRuntimes();
+            } catch (_) {}
+            try {
+                if (configWatchTimer) clearInterval(configWatchTimer);
+            } catch (_) {}
+        });
+    } catch (_) {}
+}
+
 let cachedCatPawOpenVersion = '';
 const DEV_BUILD_STAMP = Date.now();
 function resolveCatPawOpenVersion() {
@@ -56,6 +127,7 @@ function resolveCatPawOpenVersion() {
  * @return {void}
  */
 export async function start(config) {
+    installShutdownHooks();
     /**
      * @type {import('fastify').FastifyInstance}
      */
@@ -184,8 +256,9 @@ export async function start(config) {
             if (res && res.skipped) {
                 // Config does not manage online scripts; keep legacy behavior (run whatever exists in custom_spider/).
                 const p = await findAvailablePortInRange(30000, 39999);
-                const started = startOnlineRuntime({id: 'default', port: p});
+                const started = await startOnlineRuntime({id: 'default', port: p});
                 if (started && started.port) onlineRuntimePorts.set('default', started.port);
+                else onlineRuntimePorts.delete('default');
                 onlineLastEntry = started && started.entry ? started.entry : onlineLastEntry;
                 return;
             }
@@ -221,12 +294,14 @@ export async function start(config) {
                     try {
                         stopOnlineRuntime(id);
                     } catch (_) {}
-                    const started = startOnlineRuntime({id, port, entry: r.destPath});
+                    const started = await startOnlineRuntime({id, port, entry: r.destPath});
                     if (started && started.port) onlineRuntimePorts.set(id, started.port);
+                    else onlineRuntimePorts.delete(id);
                 } else {
                     // Ensure it is running (best-effort).
-                    const started = startOnlineRuntime({id, port, entry: r.destPath});
+                    const started = await startOnlineRuntime({id, port, entry: r.destPath});
                     if (started && started.port) onlineRuntimePorts.set(id, started.port);
+                    else onlineRuntimePorts.delete(id);
                 }
             }
 
@@ -281,7 +356,13 @@ export async function start(config) {
  */
 export async function stop() {
     if (server) {
-        server.close();
+        try {
+            await server.close();
+        } catch (_) {
+            try {
+                server.close();
+            } catch (_) {}
+        }
         server.stop = true;
     }
     try {

@@ -418,8 +418,9 @@ async function syncOnlineRuntimesNow(fastify, rootDir) {
                 stopOnlineRuntime(id);
             } catch (_) {}
         }
-        const started = startOnlineRuntime({ id, port, entry: r.destPath });
+        const started = await startOnlineRuntime({ id, port, entry: r.destPath });
         if (started && started.port) portsMap.set(id, started.port);
+        else portsMap.delete(id);
         runtimes.push({ id, port: started && started.port ? started.port : port, entry: r.destPath, ok: !!(started && started.port) });
     }
 

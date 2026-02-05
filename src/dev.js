@@ -70,7 +70,12 @@ function setupDevLogFile() {
     process.once('exit', closeStream);
     process.once('SIGINT', () => {
         closeStream();
-        process.exit(0);
+    });
+    process.once('SIGTERM', () => {
+        closeStream();
+    });
+    process.once('SIGBREAK', () => {
+        closeStream();
     });
 }
 
