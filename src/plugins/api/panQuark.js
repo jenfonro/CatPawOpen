@@ -1362,9 +1362,6 @@ const apiPlugins = [
         }
 
         const query = (req && req.query) || {};
-        const quarkTv = String(query.quark_tv == null ? '' : query.quark_tv).trim();
-        const isTvPrepare = quarkTv === '1';
-        const isTvFallback = quarkTv === '0';
         const want = String(body.want || query.want || 'download_url').trim() || 'download_url';
         const tvUserForCache = getTvUserFromReq(req) || '';
         panLog(`quark play recv id=${reqId}`, {
@@ -1372,11 +1369,10 @@ const apiPlugins = [
           shareId: maskForLog(parsed.shareId, 4, 4),
           fid: maskForLog(parsed.fid),
           tvUser: tvUserForCache,
-          quark_tv: quarkTv || undefined,
         });
 
-        // Cache only resolved URLs (not prepare stage).
-        if (!isTvPrepare && tvUserForCache) {
+        // Cache only resolved URLs.
+        if (tvUserForCache) {
           const cacheKey = `v1|${tvUserForCache}|${want}|${rawId}`;
           const cached = getQuarkPlayUrlCache(cacheKey);
           if (cached && cached.url) {
@@ -1421,63 +1417,32 @@ const apiPlugins = [
           }
           return null;
         };
-        const waitForFirstFileInDir = async () => {
-          const delays = [0, 300, 700, 1200];
-          for (let i = 0; i < delays.length; i += 1) {
-            if (delays[i]) await new Promise((r) => setTimeout(r, delays[i]));
-            try {
-              const picked = await pickFirstFileInDir();
-              if (picked) return picked;
-            } catch (_) {}
-          }
-          return null;
-        };
 
-        let saveOut = null;
-        if (!isTvFallback) {
-          try {
-            stage = 'clear';
-            await quarkClearDir({ pdirFid: toPdirFid, cookie });
-          } catch (e) {
-            const msg = ((e && e.message) || String(e)).slice(0, 400);
-            panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
-            reply.code(502);
-            return { ok: false, message: msg };
-          }
+        try {
+          stage = 'clear';
+          await quarkClearDir({ pdirFid: toPdirFid, cookie });
+        } catch (e) {
+          const msg = ((e && e.message) || String(e)).slice(0, 400);
+          panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
+          reply.code(502);
+          return { ok: false, message: msg };
+        }
 
-          try {
-            stage = 'save';
-            saveOut = await quarkShareSave({
-              shareId: parsed.shareId,
-              stoken: parsed.stoken,
-              fid: parsed.fid,
-              fidToken: parsed.fidToken,
-              toPdirFid,
-              cookie,
-            });
-          } catch (e) {
-            const msg = ((e && e.message) || String(e)).slice(0, 400);
-            panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
-            reply.code(502);
-            return { ok: false, message: msg };
-          }
-
-          if (isTvPrepare) {
-            stage = 'list_saved';
-            const picked = await waitForFirstFileInDir();
-            const pickedFid = picked ? String(picked.fid || picked.file_id || picked.id || '').trim() : '';
-            if (!pickedFid) {
-              panLog(`quark play failed id=${reqId}`, { stage: 'empty', ms: Date.now() - tStart, message: 'destination folder is empty' });
-              reply.code(502);
-              return { ok: false, message: 'destination folder is empty' };
-            }
-            panLog(`quark play done id=${reqId}`, { stage: 'saved', ms: Date.now() - tStart, toPdirFid: maskForLog(toPdirFid) });
-            return {
-              ok: true,
-              parse: 0,
-              url: '',
-            };
-          }
+        try {
+          stage = 'save';
+          await quarkShareSave({
+            shareId: parsed.shareId,
+            stoken: parsed.stoken,
+            fid: parsed.fid,
+            fidToken: parsed.fidToken,
+            toPdirFid,
+            cookie,
+          });
+        } catch (e) {
+          const msg = ((e && e.message) || String(e)).slice(0, 400);
+          panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
+          reply.code(502);
+          return { ok: false, message: msg };
         }
 
         // List destination folder and request a direct url for the first saved file.
@@ -1490,29 +1455,6 @@ const apiPlugins = [
           panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
           reply.code(502);
           return { ok: false, message: msg };
-        }
-
-        // In fallback mode (quark_tv=0), we expect the file to already exist from a previous quark_tv=1 call.
-        // If it's empty, best-effort try a save once (without clearing) and list again.
-        if (!picked && isTvFallback) {
-          try {
-            stage = 'save_fallback';
-            saveOut = await quarkShareSave({
-              shareId: parsed.shareId,
-              stoken: parsed.stoken,
-              fid: parsed.fid,
-              fidToken: parsed.fidToken,
-              toPdirFid,
-              cookie,
-            });
-          } catch (e) {
-            // ignore; will report empty folder below
-            saveOut = null;
-          }
-          try {
-            stage = 'list_fallback';
-            picked = await pickFirstFileInDir();
-          } catch (_) {}
         }
 
         const pickedFid = picked ? String(picked.fid || picked.file_id || picked.id || '').trim() : '';
