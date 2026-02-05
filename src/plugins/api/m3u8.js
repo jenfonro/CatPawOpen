@@ -286,7 +286,17 @@ function normalizeGoProxyApiBase(input) {
 
 function resolveGoProxyBases(request, cfg) {
   const root = cfg && typeof cfg === 'object' && !Array.isArray(cfg) ? cfg : {};
-  const api = normalizeGoProxyApiBase(root.goProxyApi);
+  const q = request && request.query && typeof request.query === 'object' ? request.query : {};
+  // Allow per-request override for GoProxy base (useful when multiple GoProxy servers exist).
+  // This is intentionally scoped to m3u8 proxy endpoints only.
+  const overrideRaw =
+    safeTrim(q.__tv_go) ||
+    safeTrim(q.tv_go) ||
+    safeTrim(q.goproxy) ||
+    safeTrim(q.goProxy) ||
+    '';
+  const override = normalizeGoProxyApiBase(overrideRaw);
+  const api = override || normalizeGoProxyApiBase(root.goProxyApi);
   if (!api) return { enabled: false, internalBase: '', publicBase: '' };
 
   if (/^https?:\/\//i.test(api)) {
@@ -566,14 +576,15 @@ const apiPlugins = [
 
         const token = crypto.randomBytes(12).toString('hex');
         const createdAt = nowMs();
-        store.set(token, {
-          token,
-          upstreamUrl,
-          headers,
-          createdAt,
-          expiresAt: createdAt + ttlSeconds * 1000,
-          goProxyToken: '',
-        });
+          store.set(token, {
+            token,
+            upstreamUrl,
+            headers,
+            createdAt,
+            expiresAt: createdAt + ttlSeconds * 1000,
+            goProxyToken: '',
+            goProxyBase: '',
+          });
 
         return {
           ok: true,
@@ -611,6 +622,10 @@ const apiPlugins = [
         try {
           reply.header('X-GoProxy-Enabled', go.enabled ? '1' : '0');
         } catch {}
+        if (go.enabled && session.goProxyBase && session.goProxyBase !== go.internalBase) {
+          session.goProxyToken = '';
+        }
+        session.goProxyBase = go.enabled ? String(go.internalBase || '') : '';
         if (go.enabled && !session.goProxyToken) {
           try {
             fastify.log.info(
@@ -662,6 +677,10 @@ const apiPlugins = [
         try {
           reply.header('X-GoProxy-Enabled', go.enabled ? '1' : '0');
         } catch {}
+        if (go.enabled && session.goProxyBase && session.goProxyBase !== go.internalBase) {
+          session.goProxyToken = '';
+        }
+        session.goProxyBase = go.enabled ? String(go.internalBase || '') : '';
         if (go.enabled && !session.goProxyToken) {
           try {
             fastify.log.info(

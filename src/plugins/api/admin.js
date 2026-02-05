@@ -833,8 +833,8 @@ export const apiPlugins = [
                         continue;
                     }
 
-                    // Builtin baidu/quark credentials are read from config.json; online scripts still use db.json.
-                    if (key === 'baidu' || key === 'quark') {
+                    // Builtin baidu/quark/uc credentials are read from config.json; online scripts still use db.json.
+                    if (key === 'baidu' || key === 'quark' || key === 'uc') {
                         const hasCredential = !!((username && password) || cookie);
                         if (!hasCredential) {
                             results.push({ key, ok: true, skipped: true, message: 'empty credential' });
@@ -860,10 +860,10 @@ export const apiPlugins = [
                     let lastErr = '';
                     let saved = false;
 
-                    // For builtin baidu/quark: persist to config.json, but still sync to website for db.json.
+                    // For builtin baidu/quark/uc: persist to config.json, but still sync to website for db.json.
                     let configOk = true;
                     let configErr = '';
-                    if (key === 'baidu' || key === 'quark') {
+                    if (key === 'baidu' || key === 'quark' || key === 'uc') {
                         try {
                             savePanCredentialToConfig(resolveRuntimeRootDir(), key, { cookie, username, password });
                         } catch (e) {
