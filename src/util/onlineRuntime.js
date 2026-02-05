@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import http from 'node:http';
 import { findAvailablePortInRange } from './tool.js';
 
 const children = new Map(); // id -> { child, entry, port }
@@ -96,13 +97,58 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
         if (prev && prev.child && !prev.child.killed) prev.child.kill();
     } catch (_) {}
 
-			const bootstrap = `
-			(() => {
-			  const __send = (m) => { try { if (typeof process.send === 'function') process.send(m); } catch (_) {} };
-			  // Exit when parent process disappears.
-			  // This is important on Windows (and some service managers) where child processes
-			  // can outlive the parent if the parent is force-killed.
-			  try {
+				const bootstrap = `
+					(() => {
+					  const __send = (m) => { try { if (typeof process.send === 'function') process.send(m); } catch (_) {} };
+					  const __dbg = String(process.env.CATPAW_DEBUG || '').trim() === '1';
+					  let __logToFile = null;
+					  const __early = [];
+					  const __stringify = (v) => {
+					    try {
+					      if (typeof v === 'string') return v;
+					      if (v == null) return '';
+					      if (v instanceof Error) return v.stack ? String(v.stack) : String(v.message || v);
+					      if (typeof v === 'object') return JSON.stringify(v);
+					      return String(v);
+					    } catch (_) {
+					      try { return String(v); } catch (_) { return ''; }
+					    }
+						  };
+						  const __log = (...args) => {
+						    try {
+						      if (!__dbg) return;
+						      const line = ['[online-child]'].concat(args.map(__stringify)).join(' ');
+						      try { console.error(line); } catch (_) {}
+						      try {
+						        if (__logToFile) __logToFile(line);
+						        else if (__early.length < 200) __early.push(line);
+						      } catch (_) {}
+						    } catch (_) {}
+						  };
+						  const __stage = (s) => { try { const v = String(s || '').trim(); if (!v) return; __send({ type: 'stage', stage: v, t: Date.now() }); __log('stage', v); } catch (_) {} };
+						  try {
+						    globalThis.__catpaw_online_send = __send;
+						    globalThis.__catpaw_online_log = __log;
+						    globalThis.__catpaw_online_stage = __stage;
+						  } catch (_) {}
+
+				  try {
+				    process.on('uncaughtException', (e) => {
+				      try { __log('uncaughtException', e && e.stack ? e.stack : String(e)); } catch (_) {}
+				      try { __send({ type: 'fatal', kind: 'uncaughtException', message: e && e.message ? String(e.message) : String(e), stack: e && e.stack ? String(e.stack) : '' }); } catch (_) {}
+				      try { process.exit(1); } catch (_) {}
+				    });
+				    process.on('unhandledRejection', (e) => {
+				      try { __log('unhandledRejection', e && e.stack ? e.stack : String(e)); } catch (_) {}
+				      try { __send({ type: 'fatal', kind: 'unhandledRejection', message: e && e.message ? String(e.message) : String(e), stack: e && e.stack ? String(e.stack) : '' }); } catch (_) {}
+				    });
+				  } catch (_) {}
+
+				  __stage('boot');
+				  // Exit when parent process disappears.
+				  // This is important on Windows (and some service managers) where child processes
+				  // can outlive the parent if the parent is force-killed.
+				  try {
 			    if (process.stdin && typeof process.stdin.on === 'function') {
 			      process.stdin.resume();
 			      const exitIfClosed = () => {
@@ -114,22 +160,39 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			    }
 			  } catch (_) {}
 
-			  const http = require('http');
-			  const https = require('https');
-			  const fs = require('fs');
-			  const path = require('path');
-			  const Module = require('module');
-		  const nodeCrypto = require('crypto');
-		  let CryptoJS = null;
-		  try { CryptoJS = require('crypto-js'); } catch (_) { CryptoJS = null; }
-		  const vm = require('vm');
+				  const http = require('http');
+					  const https = require('https');
+					  const fs = require('fs');
+					  const path = require('path');
+					  const Module = require('module');
+				  const nodeCrypto = require('crypto');
+				  let CryptoJS = null;
+				  try { CryptoJS = require('crypto-js'); } catch (_) { CryptoJS = null; }
+				  const vm = require('vm');
 
-		  try { if (process.env.ONLINE_CWD) process.chdir(process.env.ONLINE_CWD); } catch (_) {}
+				  try {
+					    const lp = String(process.env.CATPAW_DEBUG_LOG || '').trim();
+				    if (__dbg && lp) {
+				      __logToFile = (line) => {
+				        try {
+				          fs.appendFileSync(lp, String(line || '') + String.fromCharCode(10));
+				        } catch (_) {}
+				      };
+				      try {
+				        for (const l of __early.splice(0, __early.length)) __logToFile(l);
+				      } catch (_) {}
+				      __log('debug log file', lp);
+				    }
+				  } catch (_) {}
 
-		  // Some bundled spiders expect CryptoJS-style helpers on crypto (e.g. crypto.MD5),
-		  // while others expect Node crypto (e.g. crypto.createHash). Provide a compatible object
-		  // for require('crypto') and also ensure globalThis.crypto has MD5/SHA* while preserving WebCrypto methods.
-		  try {
+				  try { if (process.env.ONLINE_CWD) process.chdir(process.env.ONLINE_CWD); } catch (_) {}
+				  __log('node', process.version, 'cwd', process.cwd());
+				  __log('env ports', { DEV_HTTP_PORT: process.env.DEV_HTTP_PORT, PORT: process.env.PORT, HTTP_PORT: process.env.HTTP_PORT });
+
+			  // Some bundled spiders expect CryptoJS-style helpers on crypto (e.g. crypto.MD5),
+			  // while others expect Node crypto (e.g. crypto.createHash). Provide a compatible object
+			  // for require('crypto') and also ensure globalThis.crypto has MD5/SHA* while preserving WebCrypto methods.
+			  try {
 		    const webcrypto = (() => {
 		      try {
 		        const c = globalThis && globalThis.crypto;
@@ -261,41 +324,46 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		      };
 		    } catch (_) {}
 		  } catch (_) {}
-			  globalThis.catServerFactory = (handle) => {
-			    const srv = http.createServer((req, res) => handle(req, res));
-			    try {
-			      srv.on('listening', () => {
-			        try {
-			          const a = srv.address && typeof srv.address === 'function' ? srv.address() : null;
-			          __send({ type: 'listening', port: a && a.port ? a.port : 0 });
-			        } catch (_) {}
-			      });
-			    } catch (_) {}
-			    try {
-			      srv.on('error', (e) => {
-			        try {
-			          __send({
-			            type: 'listen_error',
-			            code: e && e.code ? String(e.code) : '',
-			            message: e && e.message ? String(e.message) : '',
-			          });
-			        } catch (_) {}
-			        try { process.exit(1); } catch (_) {}
-			      });
-			    } catch (_) {}
-			    return srv;
-			  };
-			  globalThis.catDartServerPort = () => 0;
+				  globalThis.catServerFactory = (handle) => {
+				    const srv = http.createServer((req, res) => handle(req, res));
+				    __stage('server_factory');
+				    try {
+				      srv.on('listening', () => {
+				        try {
+				          const a = srv.address && typeof srv.address === 'function' ? srv.address() : null;
+				          __log('listening', a);
+				          __send({ type: 'listening', port: a && a.port ? a.port : 0 });
+				        } catch (_) {}
+				      });
+				    } catch (_) {}
+				    try {
+				      srv.on('error', (e) => {
+				        try {
+				          __log('listen_error', e && e.stack ? e.stack : String(e));
+				          __send({
+				            type: 'listen_error',
+				            code: e && e.code ? String(e.code) : '',
+				            message: e && e.message ? String(e.message) : '',
+				          });
+				        } catch (_) {}
+				        try { process.exit(1); } catch (_) {}
+				      });
+				    } catch (_) {}
+				    return srv;
+				  };
+				  globalThis.catDartServerPort = () => 0;
 
-  const entry = process.env.ONLINE_ENTRY;
-  if (!entry) throw new Error('missing ONLINE_ENTRY');
+	  const entry = process.env.ONLINE_ENTRY;
+	  if (!entry) throw new Error('missing ONLINE_ENTRY');
+	  __log('entry', entry);
+	  __stage('entry_loaded');
 
-  globalThis.module = globalThis.module && typeof globalThis.module === 'object' ? globalThis.module : { exports: {} };
-  globalThis.exports = globalThis.module.exports;
-  globalThis.require = typeof globalThis.require === 'function' ? globalThis.require : require;
-  globalThis.__filename = entry;
-  const __onlineCwd = (typeof process.env.ONLINE_CWD === 'string' && process.env.ONLINE_CWD.trim()) ? process.env.ONLINE_CWD.trim() : process.cwd();
-  globalThis.__dirname = path.resolve(__onlineCwd);
+	  globalThis.module = globalThis.module && typeof globalThis.module === 'object' ? globalThis.module : { exports: {} };
+	  globalThis.exports = globalThis.module.exports;
+	  globalThis.require = typeof globalThis.require === 'function' ? globalThis.require : require;
+	  globalThis.__filename = entry;
+	  const __onlineCwd = (typeof process.env.ONLINE_CWD === 'string' && process.env.ONLINE_CWD.trim()) ? process.env.ONLINE_CWD.trim() : process.cwd();
+	  globalThis.__dirname = path.resolve(__onlineCwd);
 
   try {
     const md5hex = (s) => nodeCrypto.createHash('md5').update(String(s || ''), 'utf8').digest('hex');
@@ -361,17 +429,29 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
         return orig.call(mod, options, cb);
       };
     };
-    patch(http);
-    patch(https);
-  } catch (_) {}
+	    patch(http);
+	    patch(https);
+	  } catch (_) {}
 
-  vm.runInThisContext(fs.readFileSync(entry, 'utf8'), { filename: entry });
-})();
+	  __stage('vm_eval_start');
+	  try {
+	    vm.runInThisContext(fs.readFileSync(entry, 'utf8'), { filename: entry });
+	  } catch (e) {
+	    __log('vm_eval_failed', e && e.stack ? e.stack : String(e));
+	    __send({ type: 'fatal', kind: 'vm_eval', message: e && e.message ? String(e.message) : String(e), stack: e && e.stack ? String(e.stack) : '' });
+	    throw e;
+	  }
+	  __stage('vm_eval_done');
+	})();
 
-(async () => {
-  const ensureConfigDefaults = (srv) => {
-    try {
-      if (!srv || typeof srv !== 'object') return;
+		(async () => {
+		  const __send = (globalThis && globalThis.__catpaw_online_send) || (() => {});
+		  const __log = (globalThis && globalThis.__catpaw_online_log) || (() => {});
+		  const __stage = (globalThis && globalThis.__catpaw_online_stage) || (() => {});
+		  __stage('runtime_start');
+		  const ensureConfigDefaults = (srv) => {
+		    try {
+		      if (!srv || typeof srv !== 'object') return;
 	      if (!srv.config || typeof srv.config !== 'object' || Array.isArray(srv.config)) srv.config = {};
 	      const ensureObj = (k) => {
 	        const cur = srv.config[k];
@@ -485,16 +565,30 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
     }
 	  };
 
-  if (typeof globalThis.Ndr === 'function') {
-	    // Some handlers expect request.body.data.cookie; normalize body shape up-front.
-	    patchBodyShape(globalThis.xn);
-	    const baseCfg = (() => {
-	      return { sites: { list: [] }, pans: { list: [] }, color: [] };
-	    })();
-	    // Let the script's own JsonDB load persisted data from db.json.
-	    await globalThis.Ndr(baseCfg);
-	    patchBodyShape(globalThis.xn);
-	    ensureConfigDefaults(globalThis.xn);
+	  if (typeof globalThis.Ndr === 'function') {
+		    __stage('ndr_found');
+		    // Some handlers expect request.body.data.cookie; normalize body shape up-front.
+		    patchBodyShape(globalThis.xn);
+		    const baseCfg = (() => {
+		      return { sites: { list: [] }, pans: { list: [] }, color: [] };
+		    })();
+		    // Let the script's own JsonDB load persisted data from db.json.
+		    const startedAt = Date.now();
+		    const warnT = setInterval(() => {
+		      try {
+		        const ms = Date.now() - startedAt;
+			        if (ms >= 5000) __log('ndr still running', String(ms) + 'ms');
+		      } catch (_) {}
+		    }, 1000);
+		    try {
+		      __stage('ndr_call');
+		      await globalThis.Ndr(baseCfg);
+		      __stage('ndr_done');
+		    } finally {
+		      try { clearInterval(warnT); } catch (_) {}
+		    }
+		    patchBodyShape(globalThis.xn);
+		    ensureConfigDefaults(globalThis.xn);
 	    // Guard against accidental credential wipe:
 	    // Some bundled scripts may push('/uc/<hash>', '') during unrelated flows (e.g. category probe),
 	    // which overwrites a previously saved UC cookie with empty string.
@@ -540,11 +634,12 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 	      }
 	    } catch (_) {}
 
-    return;
-  }
-  throw new Error('Ndr() not found on globalThis');
-})().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
-`.trim();
+	    return;
+	  }
+	  __log('Ndr() not found on globalThis');
+	  throw new Error('Ndr() not found on globalThis');
+	})().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
+	`.trim();
 
     // `pkg` executables don't reliably support `-e/--eval` for running an inline script.
     // Write a small bootstrap file to the online directory and execute it.
@@ -558,86 +653,228 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
         throw new Error(`write bootstrap failed: ${msg}`);
     }
 
-	    // In pkg builds, keep the online runtime quiet by default to avoid excessive IO.
-	    const hasDevLogFile =
-	        !isPkg && typeof process.env.CATPAW_LOG_FILE === 'string' && process.env.CATPAW_LOG_FILE.trim();
+				    // In pkg builds, keep the online runtime quiet by default to avoid excessive IO.
+				    // Enable child stdout/stderr by setting `CATPAW_DEBUG=1`.
+				    const wantDebug = String(process.env.CATPAW_DEBUG || '').trim() === '1';
+			    const hasDevLogFile =
+			        !isPkg && typeof process.env.CATPAW_LOG_FILE === 'string' && process.env.CATPAW_LOG_FILE.trim();
     // Keep stdin as a pipe so the child can detect parent exit via stdin close (see bootstrap above),
     // and open an IPC channel so we can confirm "listening" (and detect EADDRINUSE) reliably.
-    const stdio = isPkg
-        ? ['pipe', 'ignore', 'ignore', 'ipc']
+	    const stdio = isPkg
+	        ? wantDebug
+	            ? ['pipe', 'pipe', 'pipe', 'ipc']
+	            : ['pipe', 'ignore', 'ignore', 'ipc']
         : hasDevLogFile
           ? ['pipe', 'pipe', 'pipe', 'ipc']
           : ['pipe', 'inherit', 'inherit', 'ipc'];
 
-    const waitForReady = (childProc, expectedPort) =>
-        new Promise((resolve) => {
-            let done = false;
-            const finish = (v) => {
-                if (done) return;
-                done = true;
-                try {
-                    clearTimeout(timer);
-                } catch (_) {}
-                try {
-                    childProc.off('exit', onExit);
-                } catch (_) {}
-                try {
-                    childProc.off('message', onMsg);
-                } catch (_) {}
-                resolve(v);
-            };
-            const onExit = (code, signal) => finish({ ok: false, code, signal, port: expectedPort });
-            const onMsg = (msg) => {
-                if (!msg || typeof msg !== 'object') return;
-                if (msg.type === 'listening') {
-                    const lp = Number.isFinite(Number(msg.port)) ? Math.max(1, Math.trunc(Number(msg.port))) : expectedPort;
-                    finish({ ok: true, port: lp });
-                    return;
-                }
-                if (msg.type === 'listen_error') {
-                    const code = typeof msg.code === 'string' ? msg.code.trim() : '';
-                    finish({ ok: false, listenError: { code, message: msg.message || '' }, port: expectedPort });
-                }
-            };
-            childProc.on('exit', onExit);
-            childProc.on('message', onMsg);
-            const timer = setTimeout(() => finish({ ok: false, timeout: true, port: expectedPort }), 8000);
-        });
+	    const waitForReady = (childProc, expectedPort) =>
+	        new Promise((resolve) => {
+	            let done = false;
+	            let lastStage = '';
+	            let lastFatal = null;
+	            const withMeta = (v) => {
+	                try {
+	                    const out = v && typeof v === 'object' ? { ...v } : v;
+	                    if (out && typeof out === 'object') {
+	                        if (lastStage && !out.lastStage) out.lastStage = lastStage;
+	                        if (lastFatal && !out.fatal) out.fatal = lastFatal;
+	                    }
+	                    return out;
+	                } catch (_) {
+	                    return v;
+	                }
+	            };
+	            const finish = (v) => {
+	                if (done) return;
+	                done = true;
+	                try {
+	                    clearTimeout(timer);
+	                } catch (_) {}
+	                try {
+	                    clearInterval(pollTimer);
+	                } catch (_) {}
+		                try {
+		                    childProc.off('exit', onExit);
+		                } catch (_) {}
+		                try {
+		                    childProc.off('error', onErr);
+		                } catch (_) {}
+		                try {
+		                    childProc.off('message', onMsg);
+		                } catch (_) {}
+	                resolve(withMeta(v));
+	            };
+		            const onExit = (code, signal) => finish({ ok: false, code, signal, port: expectedPort });
+		            const onErr = (err) => {
+		                try {
+		                    finish({
+		                        ok: false,
+		                        spawnError: {
+		                            message: err && err.message ? String(err.message) : String(err),
+		                            code: err && err.code ? String(err.code) : '',
+		                        },
+		                        port: expectedPort,
+		                    });
+		                } catch (_) {
+		                    finish({ ok: false, port: expectedPort });
+		                }
+		            };
+	            const onMsg = (msg) => {
+	                if (!msg || typeof msg !== 'object') return;
+	                if (msg.type === 'stage') {
+	                    const st = typeof msg.stage === 'string' ? msg.stage.trim() : '';
+	                    if (st) lastStage = st;
+	                    return;
+	                }
+	                if (msg.type === 'fatal') {
+	                    lastFatal = msg;
+	                    return;
+	                }
+	                if (msg.type === 'listening') {
+	                    const lp = Number.isFinite(Number(msg.port)) ? Math.max(1, Math.trunc(Number(msg.port))) : expectedPort;
+	                    finish({ ok: true, port: lp });
+	                    return;
+	                }
+	                if (msg.type === 'listen_error') {
+	                    const code = typeof msg.code === 'string' ? msg.code.trim() : '';
+	                    finish({ ok: false, listenError: { code, message: msg.message || '' }, port: expectedPort });
+	                }
+	            };
 
-    let chosenPort = p;
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-        const child = spawn(process.execPath, [bootstrapPath], {
-            stdio,
-            cwd: rootDir,
-            env: {
-                ...process.env,
-                DEV_HTTP_PORT: String(chosenPort),
-                ONLINE_ENTRY: entry,
-                ONLINE_CWD: rootDir,
-                NODE_PATH: rootDir,
-            },
-        });
-        children.set(key, { child, entry, port: chosenPort });
+		            // Fallback readiness probe (for some pkg/Linux builds where IPC messages may not arrive reliably):
+		            // poll any HTTP response on the expected port (even 404).
+		            const probeOnce = () =>
+		                new Promise((r) => {
+		                    try {
+		                        const req = http.request(
+		                            { method: 'HEAD', hostname: '127.0.0.1', port: expectedPort, path: '/', timeout: 700 },
+		                            (res) => {
+		                                try {
+		                                    const st = res ? Number(res.statusCode || 0) : 0;
+		                                    res.resume();
+		                                    r(st >= 100);
+		                                } catch (_) {
+		                                    r(false);
+		                                }
+		                            }
+		                        );
+	                        req.on('timeout', () => {
+	                            try {
+	                                req.destroy(new Error('timeout'));
+	                            } catch (_) {}
+	                            r(false);
+	                        });
+	                        req.on('error', () => r(false));
+	                        req.end();
+	                    } catch (_) {
+	                        r(false);
+	                    }
+	                });
 
-    if (!isPkg && child && (child.stdout || child.stderr) && typeof process.env.CATPAW_LOG_FILE === 'string' && process.env.CATPAW_LOG_FILE.trim()) {
-        try {
-            if (child.stdout) child.stdout.on('data', (d) => process.stdout.write(d));
-        } catch (_) {}
-        try {
-            if (child.stderr) child.stderr.on('data', (d) => process.stderr.write(d));
-        } catch (_) {}
-    }
+	            const pollTimer = setInterval(async () => {
+	                try {
+	                    if (done) return;
+	                    const ok = await probeOnce();
+	                    if (ok) finish({ ok: true, port: expectedPort, via: 'http_probe' });
+	                } catch (_) {}
+	            }, 250);
 
-    try {
-        // eslint-disable-next-line no-console
-        console.log(`${logPrefix} runtime spawning: id=${key} entry=${path.basename(entry)} port=${chosenPort}`);
-    } catch (_) {}
+		            childProc.on('exit', onExit);
+		            childProc.on('error', onErr);
+		            childProc.on('message', onMsg);
+		            const timeoutMsRaw = String(process.env.CATPAW_ONLINE_READY_TIMEOUT_MS || '').trim();
+		            const timeoutMs = timeoutMsRaw ? Math.max(500, Math.trunc(Number(timeoutMsRaw))) : 30000;
+		            const timer = setTimeout(() => finish({ ok: false, timeout: true, port: expectedPort }), timeoutMs);
+		        });
 
-    child.on('exit', (code, signal) => {
-        const cur = children.get(key);
-        if (cur && cur.child && cur.child.pid) {
-            try {
-                // eslint-disable-next-line no-console
+	    const onlineLogPath = wantDebug ? path.resolve(rootDir, `online-runtime.${key}.log`) : '';
+	    let chosenPort = p;
+		    for (let attempt = 0; attempt < 6; attempt += 1) {
+		        const child = spawn(process.execPath, [bootstrapPath], {
+		            stdio,
+		            cwd: rootDir,
+		            env: {
+		                ...process.env,
+		                DEV_HTTP_PORT: String(chosenPort),
+		                PORT: String(chosenPort),
+		                HTTP_PORT: String(chosenPort),
+		                ONLINE_ENTRY: entry,
+		                ONLINE_CWD: rootDir,
+		                CATPAW_DEBUG_LOG: onlineLogPath,
+		                NODE_PATH: rootDir,
+		            },
+		        });
+		        children.set(key, { child, entry, port: chosenPort });
+
+	    // When debugging online runtimes, capture child output:
+	    // - dev: if CATPAW_LOG_FILE is set, forward to parent stdout/stderr (which are already redirected to file in dev.js)
+		    // - pkg: if CATPAW_DEBUG=1, also write to `online-runtime.<id>.log` under runtime root.
+		    let onlineLogStream = null;
+		    if (wantDebug && onlineLogPath) {
+		        try {
+		            onlineLogStream = fs.createWriteStream(onlineLogPath, { flags: 'a' });
+		            onlineLogStream.on('error', () => {});
+	            onlineLogStream.write(
+	                `\n${logPrefix} ---- spawn id=${key} pid=${child.pid || 0} entry=${path.basename(entry)} port=${chosenPort} at=${new Date().toISOString()} ----\n`
+	            );
+	        } catch (_) {
+	            onlineLogStream = null;
+	        }
+	    }
+
+	    const forwardChunk = (target, chunk) => {
+	        try {
+	            if (chunk == null) return;
+	            if (onlineLogStream) onlineLogStream.write(chunk);
+	        } catch (_) {}
+	        try {
+	            if (target && typeof target.write === 'function') target.write(chunk);
+	        } catch (_) {}
+	    };
+
+		    if (!isPkg && child && (child.stdout || child.stderr) && typeof process.env.CATPAW_LOG_FILE === 'string' && process.env.CATPAW_LOG_FILE.trim()) {
+		        try {
+		            if (child.stdout) child.stdout.on('data', (d) => forwardChunk(process.stdout, d));
+		        } catch (_) {}
+		        try {
+		            if (child.stderr) child.stderr.on('data', (d) => forwardChunk(process.stderr, d));
+		        } catch (_) {}
+		    }
+		    if (isPkg && wantDebug && child && (child.stdout || child.stderr)) {
+		        try {
+		            if (child.stdout) child.stdout.on('data', (d) => forwardChunk(process.stdout, d));
+		        } catch (_) {}
+		        try {
+		            if (child.stderr) child.stderr.on('data', (d) => forwardChunk(process.stderr, d));
+		        } catch (_) {}
+		    }
+
+		    try {
+		        // eslint-disable-next-line no-console
+		        console.log(`${logPrefix} runtime spawning: id=${key} entry=${path.basename(entry)} port=${chosenPort}`);
+		        if (isPkg && wantDebug && onlineLogPath) {
+		            // eslint-disable-next-line no-console
+		            console.log(`${logPrefix} debug enabled: id=${key} log=${onlineLogPath}`);
+		        }
+		    } catch (_) {}
+
+	    child.on('exit', (code, signal) => {
+	        try {
+	            if (onlineLogStream) {
+	                onlineLogStream.write(
+	                    `\n${logPrefix} ---- exit id=${key} pid=${child.pid || 0} code=${code} signal=${signal || ''} at=${new Date().toISOString()} ----\n`
+	                );
+	            }
+	        } catch (_) {}
+	        try {
+	            if (onlineLogStream) onlineLogStream.end();
+	        } catch (_) {}
+	        onlineLogStream = null;
+	        const cur = children.get(key);
+	        if (cur && cur.child && cur.child.pid) {
+	            try {
+	                // eslint-disable-next-line no-console
                 console.log(`${logPrefix} runtime exited: id=${key} pid=${cur.child.pid} code=${code} signal=${signal || ''}`);
             } catch (_) {}
         }
@@ -645,21 +882,60 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
         if (latest && latest.child === child) children.delete(key);
     });
 
-        const ready = await waitForReady(child, chosenPort);
-        if (ready && ready.ok) {
-            const cur = children.get(key);
-            if (cur && cur.child === child) cur.port = ready.port;
+	        const ready = await waitForReady(child, chosenPort);
+	        if (ready && ready.ok) {
+	            const cur = children.get(key);
+	            if (cur && cur.child === child) cur.port = ready.port;
             try {
                 // eslint-disable-next-line no-console
                 console.log(`${logPrefix} runtime ready: id=${key} entry=${path.basename(entry)} port=${ready.port}`);
             } catch (_) {}
-            return { started: true, port: ready.port, entry, reused: false, id: key };
-        }
+	            return { started: true, port: ready.port, entry, reused: false, id: key };
+	        }
 
-        // If failed, clean up.
-        try {
-            if (child && !child.killed) child.kill();
-        } catch (_) {}
+		        try {
+		            const reason =
+		                ready && ready.spawnError && ready.spawnError.code
+		                    ? `spawn_error:${String(ready.spawnError.code)}`
+		                    : ready && ready.spawnError && ready.spawnError.message
+		                      ? 'spawn_error'
+		                      : 
+		                ready && ready.listenError && ready.listenError.code
+		                    ? `listen_error:${String(ready.listenError.code)}`
+		                    : ready && ready.timeout
+		                      ? 'timeout'
+		                      : ready && typeof ready.code === 'number'
+		                        ? `exit:${String(ready.code)}`
+		                        : ready && ready.signal
+		                          ? `signal:${String(ready.signal)}`
+		                        : 'unknown';
+	            // eslint-disable-next-line no-console
+	            console.error(
+	                `${logPrefix} runtime not ready: id=${key} entry=${path.basename(entry)} port=${chosenPort} reason=${reason}` +
+	                    (ready && ready.lastStage ? ` lastStage=${String(ready.lastStage)}` : '')
+	            );
+		            if (ready && ready.listenError && ready.listenError.message) {
+		                // eslint-disable-next-line no-console
+		                console.error(`${logPrefix} runtime listen_error: ${String(ready.listenError.message).slice(0, 600)}`);
+		            }
+		            if (ready && ready.spawnError && ready.spawnError.message) {
+		                // eslint-disable-next-line no-console
+		                console.error(`${logPrefix} runtime spawn_error: ${String(ready.spawnError.message).slice(0, 600)}`);
+		            }
+		            if (ready && ready.fatal && ready.fatal.message) {
+		                // eslint-disable-next-line no-console
+		                console.error(`${logPrefix} runtime fatal: ${String(ready.fatal.kind || 'fatal')} ${String(ready.fatal.message).slice(0, 600)}`);
+		            }
+		            if (isPkg && wantDebug && onlineLogPath) {
+		                // eslint-disable-next-line no-console
+		                console.error(`${logPrefix} check child log: ${onlineLogPath}`);
+		            }
+	        } catch (_) {}
+
+	        // If failed, clean up.
+	        try {
+	            if (child && !child.killed) child.kill();
+	        } catch (_) {}
 
         const cur = children.get(key);
         if (cur && cur.child === child) children.delete(key);
