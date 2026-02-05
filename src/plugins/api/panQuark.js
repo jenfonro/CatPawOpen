@@ -22,6 +22,41 @@ function maskForLog(value, head = 6, tail = 4) {
   return `${s.slice(0, head)}...${s.slice(-tail)}`;
 }
 
+// 1-minute in-memory cache for `/api/quark/play` resolved URLs.
+// Rationale: Quark clear/save/list is async/eventually-consistent; recently resolved direct URLs can remain valid
+// even if the transferred file is deleted shortly after.
+const QUARK_PLAY_URL_CACHE_TTL_MS = 60_000;
+const quarkPlayUrlCache = new Map(); // key -> { exp, value }
+
+function getQuarkPlayUrlCache(key) {
+  const k = String(key || '');
+  const hit = quarkPlayUrlCache.get(k);
+  if (!hit) return null;
+  if (Date.now() >= hit.exp) {
+    quarkPlayUrlCache.delete(k);
+    return null;
+  }
+  return hit.value || null;
+}
+
+function setQuarkPlayUrlCache(key, value) {
+  const k = String(key || '');
+  if (!k) return;
+  quarkPlayUrlCache.set(k, { exp: Date.now() + QUARK_PLAY_URL_CACHE_TTL_MS, value });
+  // Best-effort cleanup to avoid unbounded growth.
+  if (quarkPlayUrlCache.size > 2000) {
+    const now = Date.now();
+    for (const [ck, cv] of quarkPlayUrlCache.entries()) {
+      if (!cv || now >= cv.exp) quarkPlayUrlCache.delete(ck);
+    }
+    while (quarkPlayUrlCache.size > 2000) {
+      const firstKey = quarkPlayUrlCache.keys().next().value;
+      if (!firstKey) break;
+      quarkPlayUrlCache.delete(firstKey);
+    }
+  }
+}
+
 async function readDbRoot(server) {
   try {
     const _ = server;
@@ -951,13 +986,25 @@ const apiPlugins = [
         const quarkTv = String(query.quark_tv == null ? '' : query.quark_tv).trim();
         const isTvPrepare = quarkTv === '1';
         const isTvFallback = quarkTv === '0';
+        const want = String(body.want || query.want || 'download_url').trim() || 'download_url';
+        const tvUserForCache = getTvUserFromReq(req) || '';
         panLog(`quark play recv id=${reqId}`, {
           idLen: rawId.length,
           shareId: maskForLog(parsed.shareId, 4, 4),
           fid: maskForLog(parsed.fid),
-          tvUser: getTvUserFromReq(req) || '',
+          tvUser: tvUserForCache,
           quark_tv: quarkTv || undefined,
         });
+
+        // Cache only resolved URLs (not prepare stage).
+        if (!isTvPrepare && tvUserForCache) {
+          const cacheKey = `v1|${tvUserForCache}|${want}|${rawId}`;
+          const cached = getQuarkPlayUrlCache(cacheKey);
+          if (cached && cached.url && cached.header) {
+            panLog(`quark play cache hit id=${reqId}`, { ms: Date.now() - tStart, want });
+            return { ok: true, url: cached.url, parse: 0, header: cached.header };
+          }
+        }
 
         // Ensure per-user dir: MeowFilm/<X-TV-User>
         let ensured;
@@ -1097,7 +1144,6 @@ const apiPlugins = [
           return { ok: false, message: 'destination folder is empty' };
         }
 
-        const want = String(body.want || query.want || 'download_url').trim() || 'download_url';
         try {
           stage = 'download';
           const out = await quarkDirectDownload({ fid: pickedFid, fidToken: pickedToken, cookie, want });
@@ -1117,6 +1163,11 @@ const apiPlugins = [
               }
             })(),
           });
+
+          if (tvUserForCache && url) {
+            const cacheKey = `v1|${tvUserForCache}|${want}|${rawId}`;
+            setQuarkPlayUrlCache(cacheKey, { url, header: playHeader });
+          }
           return {
             ok: true,
             url,
