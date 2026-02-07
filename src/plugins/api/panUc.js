@@ -1160,18 +1160,33 @@ const apiPlugins = [
           return { ok: false, message: 'missing uc cookie' };
         }
         try {
-          const want = String(body.want || 'download_url').trim() || 'download_url';
-          const out = await ucDirectDownload({
+          const fidToken = body.fidToken || body.fid_token;
+          const outPlay = await ucDirectDownload({
             fid,
-            fidToken: body.fidToken || body.fid_token,
+            fidToken,
             cookie,
-            want,
+            want: 'play_url',
           });
+          const cookieAfterPlay = outPlay.cookie || cookie;
+          const outDl = await ucDirectDownload({
+            fid,
+            fidToken,
+            cookie: cookieAfterPlay,
+            want: 'download_url',
+          });
+          const cookieAfter = outDl.cookie || cookieAfterPlay || cookie;
           return {
             ok: true,
-            url: out.url,
+            url: outPlay.url || outDl.url,
+            playUrl: outPlay.url || '',
+            downloadUrl: outDl.url || '',
+            header: {
+              Cookie: cookieAfter,
+              Referer: UC_REFERER,
+              'User-Agent': UC_UA,
+            },
             headers: {
-              Cookie: out.cookie || cookie,
+              Cookie: cookieAfter,
               Referer: UC_REFERER,
               'User-Agent': UC_UA,
             },
@@ -1449,33 +1464,55 @@ const apiPlugins = [
           const tvAcc = getUcTvAccountFromDbRoot(root);
           const hasTvCred = !!(tvAcc && tvAcc.refreshToken && tvAcc.deviceId);
 
-          let url = '';
-          let headerOut = { Cookie: cookie, Referer: UC_REFERER, 'User-Agent': UC_UA };
+          let playUrl = '';
+          let downloadUrl = '';
+          let headerOut = null;
+          let downloadHeaderOut = null;
 
           if (hasTvCred) {
             try {
-              const tvOut = await ucTvLinkByFid({ fid: savedFid, rootDir: resolveRuntimeRootDir(), method });
-              url = tvOut.url;
-              headerOut = null;
+              const tvOut = await ucTvLinkByFid({ fid: savedFid, rootDir: resolveRuntimeRootDir(), method: 'streaming' });
+              playUrl = tvOut.url || '';
             } catch {
-              try {
-                const tvOut2 = await ucTvLinkByFid({ fid: savedFid, rootDir: resolveRuntimeRootDir(), method: method === 'download' ? 'streaming' : 'download' });
-                url = tvOut2.url;
-                headerOut = null;
-              } catch {
-                url = '';
-              }
+              playUrl = '';
+            }
+            try {
+              const tvOut2 = await ucTvLinkByFid({ fid: savedFid, rootDir: resolveRuntimeRootDir(), method: 'download' });
+              downloadUrl = tvOut2.url || '';
+            } catch {
+              downloadUrl = '';
             }
           }
 
-          if (!url) {
-            const out2 = await ucDirectDownload({ fid: savedFid, fidToken: '', cookie, want });
-            cookie = out2.cookie || cookie;
-            url = out2.url;
-            headerOut = { Cookie: cookie, Referer: UC_REFERER, 'User-Agent': UC_UA };
+          if (!playUrl || !downloadUrl) {
+            // Fallback to cookie-based urls (may require headers).
+            if (!playUrl) {
+              const outPlay = await ucDirectDownload({ fid: savedFid, fidToken: '', cookie, want: 'play_url' });
+              cookie = outPlay.cookie || cookie;
+              playUrl = outPlay.url;
+              headerOut = { Cookie: cookie, Referer: UC_REFERER, 'User-Agent': UC_UA };
+            }
+            if (!downloadUrl) {
+              const outDl = await ucDirectDownload({ fid: savedFid, fidToken: '', cookie, want: 'download_url' });
+              cookie = outDl.cookie || cookie;
+              downloadUrl = outDl.url;
+              downloadHeaderOut = { Cookie: cookie, Referer: UC_REFERER, 'User-Agent': UC_UA };
+            }
           }
 
-          return { ok: true, url, fid: savedFid, toPdirFid: dest.fid, task: out.task || null, parse: 0, ...(headerOut ? { header: headerOut } : {}) };
+          const url = playUrl || downloadUrl || '';
+          return {
+            ok: true,
+            url,
+            playUrl,
+            downloadUrl,
+            fid: savedFid,
+            toPdirFid: dest.fid,
+            task: out.task || null,
+            parse: 0,
+            ...(headerOut ? { header: headerOut } : {}),
+            ...(downloadHeaderOut ? { downloadHeader: downloadHeaderOut } : {}),
+          };
         } catch (e) {
           const msg = (e && e.message) || String(e);
           reply.code(502);
@@ -1560,20 +1597,51 @@ const apiPlugins = [
             cookie = getUcCookieFromDbRoot(root);
           }
 
-          try {
-            const out = await ucTvLinkByFid({ fid: finalFid, rootDir: resolveRuntimeRootDir(), method });
-            return { ok: true, url: out.url, method: out.method, fid: finalFid, task, parse: 0, header: {} };
-          } catch (eTv) {
-            // Fall back to cookie-based direct link (requires headers) when open-api fails.
-            if (!cookie) throw eTv;
-            const out2 = await ucDirectDownload({ fid: finalFid, fidToken: '', cookie, want });
-            const headerOut = {
-              Cookie: out2.cookie || cookie,
-              Referer: UC_REFERER,
-              'User-Agent': UC_UA,
-            };
-            return { ok: true, url: out2.url, method: 'cookie', fid: finalFid, task, parse: 0, header: headerOut };
-          }
+          const resolveOne = async (m) => {
+            try {
+              const out = await ucTvLinkByFid({ fid: finalFid, rootDir: resolveRuntimeRootDir(), method: m });
+              return { ok: true, url: out.url || '', method: out.method || m, header: null };
+            } catch (eTv) {
+              if (!cookie) throw eTv;
+              const out2 = await ucDirectDownload({ fid: finalFid, fidToken: '', cookie, want: m === 'download' ? 'download_url' : 'play_url' });
+              const headerOut = {
+                Cookie: out2.cookie || cookie,
+                Referer: UC_REFERER,
+                'User-Agent': UC_UA,
+              };
+              return { ok: true, url: out2.url || '', method: 'cookie', header: headerOut };
+            }
+          };
+
+          let playUrl = '';
+          let downloadUrl = '';
+          let headerOut = null;
+          let downloadHeaderOut = null;
+
+          const playRes = await resolveOne('streaming');
+          playUrl = playRes.url || '';
+          headerOut = playRes.header;
+
+          const dlRes = await resolveOne('download');
+          downloadUrl = dlRes.url || '';
+          downloadHeaderOut = dlRes.header;
+
+          // Keep legacy `url` according to requested method.
+          const url = method === 'download' ? (downloadUrl || playUrl) : (playUrl || downloadUrl);
+          const legacyHeader = method === 'download' ? (downloadHeaderOut || headerOut) : (headerOut || downloadHeaderOut);
+
+          return {
+            ok: true,
+            url,
+            playUrl,
+            downloadUrl,
+            method,
+            fid: finalFid,
+            task,
+            parse: 0,
+            ...(legacyHeader ? { header: legacyHeader } : { header: {} }),
+            ...(downloadHeaderOut ? { downloadHeader: downloadHeaderOut } : {}),
+          };
         } catch (e) {
           const msg = (e && e.message) || String(e);
           reply.code(502);

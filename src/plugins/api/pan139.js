@@ -374,7 +374,7 @@ export const apiPlugins = [
                             raw: out.rawText || '',
                         };
                     }
-                    return { ok: true, parse: 0, url: out.url };
+                    return { ok: true, parse: 0, url: out.url, playUrl: out.url, downloadUrl: out.url };
                 } catch (e) {
                     reply.code(502);
                     return { ok: false, message: (e && e.message) || String(e) };

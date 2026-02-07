@@ -1316,14 +1316,23 @@ const apiPlugins = [
           reply.code(400);
           return { ok: false, message: 'missing fid' };
         }
-        const want = String(body.want || 'download_url').trim() || 'download_url';
         try {
-          const out = await quarkDirectDownload({ fid, fidToken, cookie, want });
+          const outPlay = await quarkDirectDownload({ fid, fidToken, cookie, want: 'play_url' });
+          const cookieAfterPlay = outPlay.cookie || cookie;
+          const outDl = await quarkDirectDownload({ fid, fidToken, cookie: cookieAfterPlay, want: 'download_url' });
+          const cookieAfter = outDl.cookie || cookieAfterPlay || cookie;
           return {
             ok: true,
-            url: out.url,
+            url: outPlay.url || outDl.url,
+            playUrl: outPlay.url || '',
+            downloadUrl: outDl.url || '',
+            header: {
+              Cookie: cookieAfter,
+              Referer: QUARK_REFERER,
+              'User-Agent': QUARK_UA,
+            },
             headers: {
-              Cookie: out.cookie || cookie,
+              Cookie: cookieAfter,
               Referer: QUARK_REFERER,
               'User-Agent': QUARK_UA,
             },
@@ -1395,13 +1404,21 @@ const apiPlugins = [
           tvUser: tvUserForCache,
         });
 
-        // Cache only resolved URLs.
+        // Cache only resolved URLs (play_url + download_url).
         if (tvUserForCache) {
-          const cacheKey = `v1|${tvUserForCache}|${want}|${rawId}`;
+          const cacheKey = `v2|${tvUserForCache}|${rawId}`;
           const cached = getQuarkPlayUrlCache(cacheKey);
-          if (cached && cached.url) {
-            panLog(`quark play cache hit id=${reqId}`, { ms: Date.now() - tStart, want });
-            return { ok: true, url: cached.url, parse: 0, ...(cached.header ? { header: cached.header } : {}) };
+          if (cached && (cached.playUrl || cached.downloadUrl || cached.url)) {
+            panLog(`quark play cache hit id=${reqId}`, { ms: Date.now() - tStart });
+            return {
+              ok: true,
+              url: cached.playUrl || cached.url || cached.downloadUrl || '',
+              playUrl: cached.playUrl || '',
+              downloadUrl: cached.downloadUrl || '',
+              parse: 0,
+              ...(cached.header ? { header: cached.header } : {}),
+              ...(cached.downloadHeader ? { downloadHeader: cached.downloadHeader } : {}),
+            };
           }
         }
 
@@ -1498,52 +1515,67 @@ const apiPlugins = [
           const tvAcc = getQuarkTvAccountFromDbRoot(root);
           const hasTvCred = !!(tvAcc && tvAcc.refreshToken && tvAcc.deviceId);
 
-          let url = '';
-          let headerOut = playHeader;
+          let playUrl = '';
+          let downloadUrl = '';
+          let headerOut = null;
+          let downloadHeaderOut = null;
 
           if (hasTvCred) {
+            // Prefer QuarkTV urls (no cookie headers required).
             try {
-              // Prefer QuarkTV streaming (matches OpenList `link_method=streaming` behavior for videos).
-              stage = 'download_tv_streaming';
+              stage = 'tv_streaming';
               const tvOut = await quarkTvLinkByFid({
                 fid: pickedFid,
                 root,
                 rootDir: resolveRuntimeRootDir(),
                 method: 'streaming',
               });
-              url = tvOut.url;
-              headerOut = null;
+              playUrl = tvOut.url || '';
             } catch (e) {
-              // If QuarkTV fails to refresh access_token (e.g., refresh_token expired), fall back to the original cookie-based resolver.
-              // Also fall back for non-video files (streaming url not found) by trying download once.
               const msg = (e && e.message) || String(e);
               panLog(`quark play tv streaming failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: String(msg).slice(0, 240) });
-              try {
-                stage = 'download_tv_download';
-                const tvOut2 = await quarkTvLinkByFid({
-                  fid: pickedFid,
-                  root,
-                  rootDir: resolveRuntimeRootDir(),
-                  method: 'download',
-                });
-                url = tvOut2.url;
-                headerOut = null;
-              } catch (e2) {
-                const msg2 = (e2 && e2.message) || String(e2);
-                panLog(`quark play tv download failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: String(msg2).slice(0, 240) });
-                url = '';
-              }
+              playUrl = '';
+            }
+            try {
+              stage = 'tv_download';
+              const tvOut2 = await quarkTvLinkByFid({
+                fid: pickedFid,
+                root,
+                rootDir: resolveRuntimeRootDir(),
+                method: 'download',
+              });
+              downloadUrl = tvOut2.url || '';
+            } catch (e2) {
+              const msg2 = (e2 && e2.message) || String(e2);
+              panLog(`quark play tv download failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: String(msg2).slice(0, 240) });
+              downloadUrl = '';
             }
           }
 
-          if (!url) {
-            stage = 'download';
-            const out = await quarkDirectDownload({ fid: pickedFid, fidToken: pickedToken, cookie, want });
-            playCookie = out.cookie || playCookie;
-            playHeader.Cookie = playCookie;
-            url = out.url;
+          if (!playUrl || !downloadUrl) {
+            // Fallback to cookie-based resolver. Some environments require headers.
             headerOut = playHeader;
+            downloadHeaderOut = playHeader;
+            if (!playUrl) {
+              stage = 'cookie_play_url';
+              const outPlay = await quarkDirectDownload({ fid: pickedFid, fidToken: pickedToken, cookie, want: 'play_url' });
+              playCookie = outPlay.cookie || playCookie;
+              playHeader.Cookie = playCookie;
+              playUrl = outPlay.url;
+              headerOut = { ...playHeader };
+            }
+            if (!downloadUrl) {
+              stage = 'cookie_download_url';
+              const outDl = await quarkDirectDownload({ fid: pickedFid, fidToken: pickedToken, cookie: playCookie, want: 'download_url' });
+              playCookie = outDl.cookie || playCookie;
+              playHeader.Cookie = playCookie;
+              downloadUrl = outDl.url;
+              downloadHeaderOut = { ...playHeader };
+            }
           }
+
+          // Legacy field: keep `url` as the primary play url when available.
+          const url = playUrl || downloadUrl || '';
 
           panLog(`quark play done id=${reqId}`, {
             ms: Date.now() - tStart,
@@ -1560,11 +1592,19 @@ const apiPlugins = [
             })(),
           });
 
-          if (tvUserForCache && url) {
-            const cacheKey = `v1|${tvUserForCache}|${want}|${rawId}`;
-            setQuarkPlayUrlCache(cacheKey, { url, header: headerOut });
+          if (tvUserForCache && (playUrl || downloadUrl || url)) {
+            const cacheKey = `v2|${tvUserForCache}|${rawId}`;
+            setQuarkPlayUrlCache(cacheKey, { url, playUrl, downloadUrl, header: headerOut, downloadHeader: downloadHeaderOut });
           }
-          return { ok: true, url, parse: 0, ...(headerOut ? { header: headerOut } : {}) };
+          return {
+            ok: true,
+            url,
+            playUrl,
+            downloadUrl,
+            parse: 0,
+            ...(headerOut ? { header: headerOut } : {}),
+            ...(downloadHeaderOut ? { downloadHeader: downloadHeaderOut } : {}),
+          };
         } catch (e) {
           const msg = ((e && e.message) || String(e)).slice(0, 400);
           panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });

@@ -1067,7 +1067,7 @@ const apiPlugins = [
             })(),
           });
           panLog(`baidu play done id=${reqId}`, { ms: Date.now() - tStart });
-          return { ok: true, parse: 0, url: finalUrl, header: { 'User-Agent': BAIDU_PLAY_UA } };
+          return { ok: true, parse: 0, url: finalUrl, playUrl: finalUrl, downloadUrl: finalUrl, header: { 'User-Agent': BAIDU_PLAY_UA } };
         } catch (e) {
           const message = (e && e.message) || String(e);
           panLog(`baidu play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: message.slice(0, 400) });
